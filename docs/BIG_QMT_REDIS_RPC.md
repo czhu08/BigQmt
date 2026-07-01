@@ -35,6 +35,8 @@ RPC 服务端会把以下 MiniQMT 常用方法名映射到大 QMT 适配器：
 
 `order_stock` 参数兼容 `stock_code`、`order_type`、`order_volume`、`price_type`、`price`、`strategy_name`、`order_remark`。其中 `order_type=23/STOCK_BUY` 映射为买入，`order_type=24/STOCK_SELL` 映射为卖出。
 
+`get_full_tick/get_ticks` 的 `codes` 参数支持两种写法：传合约代码如 `["600000.SH", "000001.SZ"]` 查询指定标的；传市场代码如 `["SH", "SZ"]` 查询全市场全推快照。
+
 ## 实现文件
 
 - `src/bigqmt_signal_trader/redis_rpc.py`：RPC 协议、订阅服务、外部客户端 helper。

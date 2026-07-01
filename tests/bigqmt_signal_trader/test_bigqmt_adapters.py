@@ -45,6 +45,14 @@ class BigQmtAdaptersTest(unittest.TestCase):
         self.assertEqual(context.instrument_codes, ["000001.SZ"])
         self.assertEqual(instrument["InstrumentStatus"], 0)
 
+    def test_market_provider_passes_market_codes_to_full_tick(self):
+        context = FakeContext()
+        provider = BigQmtMarketDataProvider(context)
+
+        provider.get_ticks(["SH", "sz"])
+
+        self.assertEqual(context.tick_codes, [["SH", "SZ"]])
+
     def test_position_provider_maps_qmt_position_objects(self):
         calls = []
 
