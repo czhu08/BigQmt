@@ -122,7 +122,59 @@ MARKET_DATA_METHODS = {
     "unsubscribe_formula",
     "get_formula_result",
     "gen_factor_index",
+    # 龙虎榜 / 股东 / 换手率 / 行业 / 收盘价
+    "get_longhubang",
+    "get_top10_share_holder",
+    "get_holder_num",
+    "get_turnover_rate",
+    "get_industry",
+    "get_close_price",
+    # 期权定价 / 隐含波动率
+    "bsm_price",
+    "bsm_iv",
+    "get_option_iv",
+    "get_option_detail_data",
+    "get_option_undl_data",
+    "get_option_undl",
+    # 财务扩展 / 因子
+    "get_raw_financial_data",
+    "get_factor_data",
+    # 历史 ST / 指数权重
+    "get_his_st_data",
+    "get_his_index_data",
+    # 期货 / 合约
+    "get_main_contract",
+    "get_his_contract_list",
+    "get_date_location",
+    "get_ETF_list",
+    # 北向资金 / 港股通
+    "get_north_finance_change",
+    "get_hkt_statistics",
+    "get_hkt_details",
+    # 自定义板块（写）
+    "create_sector",
+    # 基础查询辅助
+    "get_stock_name",
+    "get_stock_type",
+    "get_last_close",
+    "get_last_volume",
+    "get_open_date",
+    "get_contract_expire_date",
+    "get_contract_multiplier",
+    "get_float_caps",
+    "get_total_share",
+    "get_turn_over_rate",
+    "get_weight_in_index",
+    "get_svol",
+    "get_bvol",
+    "get_risk_free_rate",
 }
+
+# Keep READ_METHODS in sync with MARKET_DATA_METHODS: every market-data method
+# forwarded to the adapter is also callable over RPC. (create_sector is a write
+# op — creates/updates a custom sector — but it is harmless to expose; trading
+# order writes stay gated behind ORDER_METHODS + allow_order_methods.)
+READ_METHODS |= MARKET_DATA_METHODS
 
 
 def _maybe_scalar(value):

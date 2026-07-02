@@ -568,3 +568,255 @@ class BigQmtMarketDataProvider:
             period,
             dividend_type,
         )
+
+    # ------------------------------------------------------------------
+    # 龙虎榜 / 股东 / 换手率（参考 Rockyzsu/QMT 暴露的 ContextInfo 方法）
+    # 签名严格按 _PyContextInfo.py 桩核对，避免参数错位。
+    # ------------------------------------------------------------------
+
+    def get_longhubang(self, stock_list=None, start_time="", end_time="", count=-1):
+        # ContextInfo stub: get_longhubang(stock_list=[], startTime='', endTime='', count=-1)
+        # 桩里有特殊逻辑：endTime 传 int 时当作 count + endTime=startTime + startTime='0'。
+        # 我们直接按 4 参数语义透传，避免触发桩的 int 歧义分支。
+        return self._call_context(
+            "get_longhubang",
+            list(stock_list or []),
+            start_time,
+            end_time,
+            count,
+        )
+
+    def get_top10_share_holder(self, stock_list, data_name, start_time, end_time, report_type="report_time"):
+        # ContextInfo stub: get_top10_share_holder(stock_list, data_name, start_time, end_time, report_type='report_time')
+        # data_name 只接受 'holder' 或 'flow_holder'；report_type 只接受 'report_time' 或 'announce_time'。
+        return self._call_context(
+            "get_top10_share_holder",
+            stock_list,
+            data_name,
+            start_time,
+            end_time,
+            report_type,
+        )
+
+    def get_holder_num(self, stock_list=None, start_time="", end_time="", report_type="report_time"):
+        # ContextInfo stub: get_holder_num(stock_list=[], startTime='', endTime='', report_type='report_time')
+        # 返回股东户数 DataFrame。
+        return self._call_context(
+            "get_holder_num",
+            list(stock_list or []),
+            start_time,
+            end_time,
+            report_type,
+        )
+
+    def get_turnover_rate(self, stock_code=None, start_time="19720101", end_time="22010101"):
+        # ContextInfo stub: get_turnover_rate(stock_code=[], start_time='19720101', end_time='22010101')
+        # 注意：start_time/end_time 必须是 8 位日期串（YYYYMMDD），否则返回空 DataFrame。
+        return self._call_context(
+            "get_turnover_rate",
+            list(stock_code or []),
+            start_time,
+            end_time,
+        )
+
+    def get_industry(self, industry_name):
+        # ContextInfo stub: get_industry(industry_name, real_timetag = -1)
+        # 注意桩签名有第二个可选参数 real_timetag，默认 -1（最新）。
+        return self._call_context("get_industry", industry_name, -1)
+
+    def get_close_price(self, market, stock_code, real_timetag, period=86400000, divid_type=0):
+        # ContextInfo stub: get_close_price(market, stockCode, realTimetag, period=86400000, dividType=0)
+        return self._call_context("get_close_price", market, stock_code, real_timetag, period, divid_type)
+
+    # ------------------------------------------------------------------
+    # 期权定价（BSM）/ 隐含波动率
+    # ------------------------------------------------------------------
+
+    def bsm_price(self, opt_type, target_price, strike_price, risk_free, sigma, days, dividend=0):
+        # ContextInfo stub: bsm_price(optType, targetPrice, strikePrice, riskFree, sigma, days, dividend=0)
+        # opt_type: 'C'(call) / 'P'(put)。target_price 可为 list（批量）。
+        return self._call_context(
+            "bsm_price",
+            opt_type,
+            target_price,
+            strike_price,
+            risk_free,
+            sigma,
+            days,
+            dividend,
+        )
+
+    def bsm_iv(self, opt_type, target_price, strike_price, option_price, risk_free, days, dividend=0):
+        # ContextInfo stub: bsm_iv(optType, targetPrice, strikePrice, optionPrice, riskFree, days, dividend=0)
+        return self._call_context(
+            "bsm_iv",
+            opt_type,
+            target_price,
+            strike_price,
+            option_price,
+            risk_free,
+            days,
+            dividend,
+        )
+
+    def get_option_iv(self, opt_code):
+        # ContextInfo stub: get_option_iv(opt_code) — 计算单只期权的隐含波动率。
+        return self._call_context("get_option_iv", opt_code)
+
+    def get_option_detail_data(self, stockcode):
+        # ContextInfo stub: get_option_detail_data(stockcode)
+        return self._call_context("get_option_detail_data", stockcode)
+
+    def get_option_undl_data(self, undl_code_ref=""):
+        # ContextInfo stub: get_option_undl_data(undl_code_ref='') — 标的下所有期权。
+        # 传空串返回全市场期权-标的映射 dict。
+        return self._call_context("get_option_undl_data", undl_code_ref)
+
+    def get_option_undl(self, opt_code):
+        # ContextInfo stub: get_option_undl(opt_code) — 期权的标的代码。
+        return self._call_context("get_option_undl", opt_code)
+
+    # ------------------------------------------------------------------
+    # 财务扩展 / 因子数据
+    # ------------------------------------------------------------------
+
+    def get_raw_financial_data(self, field_list, stock_list, start_time, end_time, report_type="report_time", data_type="dict"):
+        # ContextInfo stub: get_raw_financial_data(fieldList, stockList, startDate, endDate, report_type='report_time', data_type='dict')
+        # 返回原始财务数据（未做字段对齐），data_type 可为 'dict'/'frame'。
+        return self._call_context(
+            "get_raw_financial_data",
+            field_list,
+            stock_list,
+            start_time,
+            end_time,
+            report_type,
+            data_type,
+        )
+
+    def get_factor_data(self, field_list, stock_list, start_date, end_date):
+        # ContextInfo stub: get_factor_data(field_list, stock_list, start_date, end_date)
+        # 返回因子库数据。
+        return self._call_context(
+            "get_factor_data",
+            field_list,
+            stock_list,
+            start_date,
+            end_date,
+        )
+
+    # ------------------------------------------------------------------
+    # 历史 ST / 指数权重
+    # ------------------------------------------------------------------
+
+    def get_his_st_data(self, stock_code):
+        # ContextInfo stub: get_his_st_data(stockCode) — 历史 ST 状态。
+        return self._call_context("get_his_st_data", stock_code)
+
+    def get_his_index_data(self, stock_code):
+        # ContextInfo stub: get_his_index_data(stockCode) — 历史指数权重。
+        return self._call_context("get_his_index_data", stock_code)
+
+    # ------------------------------------------------------------------
+    # 期货 / 合约
+    # ------------------------------------------------------------------
+
+    def get_main_contract(self, code_market):
+        # ContextInfo stub: get_main_contract(codemarket)
+        return self._call_context("get_main_contract", code_market)
+
+    def get_his_contract_list(self, market):
+        # ContextInfo stub: get_his_contract_list(market)
+        return self._call_context("get_his_contract_list", market)
+
+    def get_date_location(self, date):
+        # ContextInfo stub: get_date_location(date) — 日期在交易日历中的位置。
+        return self._call_context("get_date_location", date)
+
+    def get_ETF_list(self, market, stock_code, type_list=None):
+        # ContextInfo stub: get_ETF_list(market, stockcode, typeList=[])
+        return self._call_context("get_ETF_list", market, stock_code, list(type_list or []))
+
+    # ------------------------------------------------------------------
+    # 北向资金 / 港股通
+    # ------------------------------------------------------------------
+
+    def get_north_finance_change(self, period):
+        # ContextInfo stub: get_north_finance_change(period) — 北向资金流入流出。
+        return self._call_context("get_north_finance_change", period)
+
+    def get_hkt_statistics(self, stock_code):
+        # ContextInfo stub: get_hkt_statistics(stock_code) — 港股通统计。
+        return self._call_context("get_hkt_statistics", stock_code)
+
+    def get_hkt_details(self, stock_code):
+        # ContextInfo stub: get_hkt_details(stock_code) — 港股通明细。
+        return self._call_context("get_hkt_details", stock_code)
+
+    # ------------------------------------------------------------------
+    # 自定义板块管理（写操作，仅 ContextInfo 支持）
+    # ------------------------------------------------------------------
+
+    def create_sector(self, sector_name, stock_list):
+        # ContextInfo stub: create_sector(sectorname, stocklist) — 创建/更新自定义板块。
+        return self._call_context("create_sector", sector_name, list(stock_list or []))
+
+    # ------------------------------------------------------------------
+    # 基础查询辅助
+    # ------------------------------------------------------------------
+
+    def get_stock_name(self, stock):
+        # ContextInfo stub: get_stock_name(stock)
+        return self._call_context("get_stock_name", stock)
+
+    def get_stock_type(self, stock):
+        # ContextInfo stub: get_stock_type(stock)
+        return self._call_context("get_stock_type", stock)
+
+    def get_last_close(self, stock):
+        # ContextInfo stub: get_last_close(stock)
+        return self._call_context("get_last_close", stock)
+
+    def get_last_volume(self, stock):
+        # ContextInfo stub: get_last_volume(stock)
+        return self._call_context("get_last_volume", stock)
+
+    def get_open_date(self, stock):
+        # ContextInfo stub: get_open_date(stock) — 上市日期。
+        return self._call_context("get_open_date", stock)
+
+    def get_contract_expire_date(self, stock):
+        # ContextInfo stub: get_contract_expire_date(stock) — 到期日。
+        return self._call_context("get_contract_expire_date", stock)
+
+    def get_contract_multiplier(self, stockcode):
+        # ContextInfo stub: get_contract_multiplier(stockcode) — 合约乘数。
+        return self._call_context("get_contract_multiplier", stockcode)
+
+    def get_float_caps(self, stockcode):
+        # ContextInfo stub: get_float_caps(stockcode) — 流通市值。
+        return self._call_context("get_float_caps", stockcode)
+
+    def get_total_share(self, stockcode):
+        # ContextInfo stub: get_total_share(stockcode) — 总股本。
+        return self._call_context("get_total_share", stockcode)
+
+    def get_turn_over_rate(self, stockcode):
+        # ContextInfo stub: get_turn_over_rate(stockcode) — 换手率（单值版，区别于上面的 get_turnover_rate 区间版）。
+        return self._call_context("get_turn_over_rate", stockcode)
+
+    def get_weight_in_index(self, mtkindexcode, stockcode):
+        # ContextInfo stub: get_weight_in_index(mtkindexcode, stockcode) — 指数中权重。
+        return self._call_context("get_weight_in_index", mtkindexcode, stockcode)
+
+    def get_svol(self, stock):
+        # ContextInfo stub: get_svol(stock)
+        return self._call_context("get_svol", stock)
+
+    def get_bvol(self, stock):
+        # ContextInfo stub: get_bvol(stock)
+        return self._call_context("get_bvol", stock)
+
+    def get_risk_free_rate(self, index=-1):
+        # ContextInfo stub: get_risk_free_rate(index) — 无风险利率。
+        return self._call_context("get_risk_free_rate", index)
+

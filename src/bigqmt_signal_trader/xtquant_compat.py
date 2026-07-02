@@ -782,6 +782,156 @@ class BigQmtXtData:
             dividend_type=dividend_type,
         )
 
+    # ------------------------------------------------------------------
+    # 扩展行情/基本面方法（对应 ContextInfo 方法，走 RPC 白名单）。
+    # 仅对最常用的显式声明签名；其余通过 __getattr__ 自动转发。
+    # ------------------------------------------------------------------
+
+    def get_longhubang(self, stock_list=None, start_time="", end_time="", count=-1):
+        return self._call(
+            "get_longhubang",
+            stock_list=list(stock_list or []),
+            start_time=start_time,
+            end_time=end_time,
+            count=count,
+        )
+
+    def get_top10_share_holder(self, stock_list, data_name, start_time, end_time, report_type="report_time"):
+        return self._call(
+            "get_top10_share_holder",
+            stock_list=list(stock_list or []),
+            data_name=data_name,
+            start_time=start_time,
+            end_time=end_time,
+            report_type=report_type,
+        )
+
+    def get_holder_num(self, stock_list=None, start_time="", end_time="", report_type="report_time"):
+        return self._call(
+            "get_holder_num",
+            stock_list=list(stock_list or []),
+            start_time=start_time,
+            end_time=end_time,
+            report_type=report_type,
+        )
+
+    def get_turnover_rate(self, stock_code=None, start_time="19720101", end_time="22010101"):
+        return self._call(
+            "get_turnover_rate",
+            stock_code=list(stock_code or []),
+            start_time=start_time,
+            end_time=end_time,
+        )
+
+    def get_industry(self, industry_name):
+        return self._call("get_industry", industry_name=industry_name)
+
+    def bsm_price(self, opt_type, target_price, strike_price, risk_free, sigma, days, dividend=0):
+        return self._call(
+            "bsm_price",
+            opt_type=opt_type,
+            target_price=target_price,
+            strike_price=strike_price,
+            risk_free=risk_free,
+            sigma=sigma,
+            days=days,
+            dividend=dividend,
+        )
+
+    def bsm_iv(self, opt_type, target_price, strike_price, option_price, risk_free, days, dividend=0):
+        return self._call(
+            "bsm_iv",
+            opt_type=opt_type,
+            target_price=target_price,
+            strike_price=strike_price,
+            option_price=option_price,
+            risk_free=risk_free,
+            days=days,
+            dividend=dividend,
+        )
+
+    def get_option_iv(self, opt_code):
+        return self._call("get_option_iv", opt_code=opt_code)
+
+    def get_option_detail_data(self, stockcode):
+        return self._call("get_option_detail_data", stockcode=stockcode)
+
+    def get_option_undl_data(self, undl_code_ref=""):
+        return self._call("get_option_undl_data", undl_code_ref=undl_code_ref)
+
+    def get_option_undl(self, opt_code):
+        return self._call("get_option_undl", opt_code=opt_code)
+
+    def get_raw_financial_data(self, field_list, stock_list, start_time, end_time, report_type="report_time", data_type="dict"):
+        return self._call(
+            "get_raw_financial_data",
+            field_list=list(field_list or []),
+            stock_list=list(stock_list or []),
+            start_time=start_time,
+            end_time=end_time,
+            report_type=report_type,
+            data_type=data_type,
+        )
+
+    def get_factor_data(self, field_list, stock_list, start_date, end_date):
+        return self._call(
+            "get_factor_data",
+            field_list=list(field_list or []),
+            stock_list=list(stock_list or []),
+            start_date=start_date,
+            end_date=end_date,
+        )
+
+    def get_north_finance_change(self, period):
+        return self._call("get_north_finance_change", period=period)
+
+    def get_hkt_statistics(self, stock_code):
+        return self._call("get_hkt_statistics", stock_code=stock_code)
+
+    def get_hkt_details(self, stock_code):
+        return self._call("get_hkt_details", stock_code=stock_code)
+
+    def create_sector(self, sector_name, stock_list):
+        return self._call("create_sector", sector_name=sector_name, stock_list=list(stock_list or []))
+
+    def get_stock_name(self, stock):
+        return self._call("get_stock_name", stock=stock)
+
+    def get_close_price(self, market, stock_code, real_timetag, period=86400000, divid_type=0):
+        return self._call(
+            "get_close_price",
+            market=market,
+            stock_code=stock_code,
+            real_timetag=real_timetag,
+            period=period,
+            divid_type=divid_type,
+        )
+
+    def get_main_contract(self, code_market):
+        return self._call("get_main_contract", code_market=code_market)
+
+    def get_his_contract_list(self, market):
+        return self._call("get_his_contract_list", market=market)
+
+    def get_date_location(self, date):
+        return self._call("get_date_location", date=date)
+
+    def get_his_st_data(self, stock_code):
+        return self._call("get_his_st_data", stock_code=stock_code)
+
+    def get_his_index_data(self, stock_code):
+        return self._call("get_his_index_data", stock_code=stock_code)
+
+    def call_method(self, method, **params):
+        """Generic escape hatch: call any RPC market-data method by name.
+
+        Use this for ContextInfo methods that don't have an explicit wrapper
+        above (e.g. ``xtdata.call_method("get_last_close", stock="000001.SZ")``,
+        ``xtdata.call_method("get_float_caps", stockcode="000001.SZ")``). The
+        full list of callable methods is in ``MARKET_DATA_METHODS``.
+        """
+        return self._call(method, **params)
+
 
 class BigQmtXtTrader:
     def __init__(
