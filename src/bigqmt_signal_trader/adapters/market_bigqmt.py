@@ -332,7 +332,14 @@ class BigQmtMarketDataProvider:
         return self._call_first_supported(shapes)
 
     def get_divid_factors(self, stock_code, start_time="", end_time=""):
-        return self._call_context("get_divid_factors", stock_code, start_time, end_time)
+        # ContextInfo stub: get_divid_factors(marketAndStock, date='') — only 2
+        # positional args (code + a single date). The xtdata SDK has the same
+        # 2-arg shape. We accept start_time/end_time for API compatibility but
+        # pass end_time (or start_time) as the single date when supplied.
+        date = end_time or start_time
+        if date:
+            return self._call_context("get_divid_factors", stock_code, date)
+        return self._call_context("get_divid_factors", stock_code)
 
     def download_history_data(self, stock_code, period, start_time="", end_time="", incrementally=None):
         kwargs = {"stock_code": stock_code, "period": period, "start_time": start_time, "end_time": end_time}
