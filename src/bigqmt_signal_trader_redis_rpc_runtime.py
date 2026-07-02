@@ -213,11 +213,13 @@ def configure_runtime_redis(redis_config):
     _apply_config(ACCOUNT_ID)
 
 
-def bind_runtime_api(passorder_func=None, cancel_func=None, get_trade_detail_data_func=None):
+def bind_runtime_api(passorder_func=None, cancel_func=None, get_trade_detail_data_func=None,
+                     extra_funcs=None):
     bind_qmt_api(
         passorder_func=passorder_func,
         cancel_func=cancel_func,
         get_trade_detail_data_func=get_trade_detail_data_func,
+        extra_funcs=extra_funcs,
     )
 
 

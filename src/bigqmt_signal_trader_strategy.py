@@ -49,13 +49,21 @@ def configure(**kwargs):
     _config.update(kwargs)
 
 
-def bind_qmt_api(passorder_func=None, cancel_func=None, get_trade_detail_data_func=None):
+def bind_qmt_api(passorder_func=None, cancel_func=None, get_trade_detail_data_func=None,
+                 extra_funcs=None):
     if passorder_func is not None:
         _qmt_api["passorder"] = passorder_func
     if cancel_func is not None:
         _qmt_api["cancel"] = cancel_func
     if get_trade_detail_data_func is not None:
         _qmt_api["get_trade_detail_data"] = get_trade_detail_data_func
+    # 捕获 QMT 运行时注入的额外全局函数（融资融券查询、IPO、期权持仓等）。
+    # 这些函数和 passorder 一样由 Big QMT 进程在运行时注入到全局命名空间，
+    # 不在 _PyContextInfo.py 桩里，需在 DRYRUN 入口捕获后传入。
+    if extra_funcs:
+        for name, func in extra_funcs.items():
+            if func is not None:
+                _qmt_api[name] = func
 
 
 def reset_app():
@@ -124,6 +132,27 @@ def _detect_account_id(context_info=None):
     return ""
 
 
+# Official Big QMT runtime-injected global functions (like passorder) that we
+# expose over RPC. These are not ContextInfo methods and not in the IDE stub;
+# QMT injects them into the process global namespace at startup. We resolve
+# them lazily so the module imports cleanly outside QMT (tests/dev).
+_EXTRA_QMT_GLOBAL_FUNCS = (
+    "get_history_trade_detail_data",  # 历史成交明细
+    "get_value_by_order_id",          # 按 order_id 查委托详情
+    "get_last_order_id",              # 最近委托号
+    "get_ipo_data",                   # 新股数据
+    "get_new_purchase_limit",         # 新股申购额度
+    "get_assure_contract",            # 融资标的（担保品）合约
+    "get_enable_short_contract",      # 融券标的合约
+    "get_unclosed_compacts",          # 未平仓合约（负债）
+    "get_closed_compacts",            # 已平仓合约
+    "get_debt_contract",              # 负债合约
+    "get_option_subject_position",    # 期权标的持仓
+    "get_comb_option",                # 组合期权
+    "get_hkt_exchange_rate",          # 港股通汇率
+)
+
+
 def _build_config():
     config = dict(_config)
     if _account_id:
@@ -132,6 +161,9 @@ def _build_config():
     qmt_api.setdefault("passorder", _resolve_runtime_name("passorder"))
     qmt_api.setdefault("cancel", _resolve_runtime_name("cancel"))
     qmt_api.setdefault("get_trade_detail_data", _resolve_runtime_name("get_trade_detail_data"))
+    # 解析其余官方全局函数（存在则注入，不存在保持 None）。
+    for name in _EXTRA_QMT_GLOBAL_FUNCS:
+        qmt_api.setdefault(name, _resolve_runtime_name(name))
     config["qmt_api"] = qmt_api
     return config
 
@@ -198,6 +230,7 @@ def _build_rpc_service(context_info, app, config):
         position_sync_sink=getattr(app, "position_sync_sink", None),
         allow_order_methods=allow_order_methods,
         allowed_methods=rpc_config.get("allowed_methods"),
+        qmt_api=qmt_api,
     )
     process_in_listener = _config_bool(rpc_config.get("process_in_listener"), True)
     listener_methods = rpc_config.get("listener_methods") or ("*",)

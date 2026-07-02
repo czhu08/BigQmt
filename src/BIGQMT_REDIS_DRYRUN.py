@@ -104,11 +104,26 @@ except Exception as _account_cfg_err:
             pass
         _runtime.configure_runtime_account(_account_id)
 
+# 捕获 QMT 运行时注入的全局函数（同 passorder，不在 _PyContextInfo 桩里）。
+# 官方交易函数文档列出的查询类函数，按名捕获，缺失的跳过（普通账户没两融权限）。
 try:
+    _qmt_extra = {}
+    for _fn in (
+        "get_history_trade_detail_data", "get_value_by_order_id", "get_last_order_id",
+        "get_ipo_data", "get_new_purchase_limit",
+        "get_assure_contract", "get_enable_short_contract",
+        "get_unclosed_compacts", "get_closed_compacts", "get_debt_contract",
+        "get_option_subject_position", "get_comb_option", "get_hkt_exchange_rate",
+    ):
+        try:
+            _qmt_extra[_fn] = globals()[_fn]
+        except KeyError:
+            pass
     _runtime.bind_runtime_api(
         passorder_func=passorder,
         cancel_func=cancel,
         get_trade_detail_data_func=get_trade_detail_data,
+        extra_funcs=_qmt_extra or None,
     )
 except NameError:
     pass

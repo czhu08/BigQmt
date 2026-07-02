@@ -60,7 +60,7 @@ READ_METHODS = {
     "query_trades",
     "query_stock_position",
     "sync_positions",
-    # 账户 / 融资融券扩展查询（经 get_trade_detail_data，需相应权限）
+    # 账户 / 融资融券 / 交易扩展查询（官方全局函数 + detail types）
     "query_account_infos",
     "query_account_status",
     "query_credit_detail",
@@ -72,6 +72,20 @@ READ_METHODS = {
     "query_smt_secu_info",
     "query_smt_secu_rate",
     "smt_appointment",
+    # 官方交易查询函数（直接暴露，运行时注入的全局函数）
+    "get_value_by_order_id",
+    "get_last_order_id",
+    "get_ipo_data",
+    "get_new_purchase_limit",
+    "get_history_trade_detail_data",
+    "get_assure_contract",
+    "get_enable_short_contract",
+    "get_unclosed_compacts",
+    "get_closed_compacts",
+    "get_debt_contract",
+    "get_option_subject_position",
+    "get_comb_option",
+    "get_hkt_exchange_rate",
 }
 
 ORDER_METHODS = {
@@ -285,6 +299,7 @@ class BigQmtRpcHandlers:
         position_sync_sink=None,
         allow_order_methods=False,
         allowed_methods=None,
+        qmt_api=None,
     ):
         self.account_id = str(account_id or "")
         self.market_data = market_data
@@ -292,6 +307,9 @@ class BigQmtRpcHandlers:
         self.order_gateway = order_gateway
         self.position_sync_sink = position_sync_sink
         self.allow_order_methods = bool(allow_order_methods)
+        # QMT runtime-injected global functions (passorder/get_trade_detail_data/
+        # 融资融券查询等)。由 strategy._build_config 解析注入。
+        self.qmt_api = dict(qmt_api or {})
         if allowed_methods is None:
             allowed = set(READ_METHODS)
             if self.allow_order_methods:
@@ -411,13 +429,35 @@ class BigQmtRpcHandlers:
         return snapshot
 
     # ------------------------------------------------------------------
-    # 账户 / 融资融券扩展查询
-    # 这些在 MiniQMT 里走 XtQuantServer RPC；在 Big QMT 里只能通过
-    # get_trade_detail_data(account, type, <detail_type>) 查询，且需相应
-    # 账户权限（两融账户等）。无权限/上下文未绑定时降级为空。
+    # 账户 / 融资融券 / 交易扩展查询
+    # 这些是 Big QMT 运行时注入的全局函数（同 passorder），不在 ContextInfo 桩里。
+    # 函数名严格按官方文档（trading_function.html），通过 self.qmt_api 调用。
+    # 无该权限/函数未注入时降级为空列表。
     # ------------------------------------------------------------------
 
+    def _call_qmt_global(self, func_name, *args, **kwargs):
+        """Call a QMT runtime-injected global function, returning [] on failure.
+
+        These functions (get_assure_contract / get_unclosed_compacts / ...)
+        are injected by QMT into the process global namespace, same as
+        passorder. When unavailable (no margin account, function not bound)
+        we degrade to [] rather than crashing the RPC.
+        """
+        func = self.qmt_api.get(func_name)
+        if func is None:
+            return []
+        try:
+            return _normalize_detail_rows(func(*args, **kwargs))
+        except Exception:
+            return []
+
     def _query_trade_detail(self, params, detail_type, strategy_name=""):
+        """get_trade_detail_data with one of the 6 official detail types.
+
+        Official strDatatype values: ACCOUNT / POSITION / POSITION_STATISTICS /
+        ORDER / DEAL / TASK. Other strings (CREDIT etc.) are NOT supported by
+        this API — use the dedicated functions below for margin queries.
+        """
         account_id = self._request_account_id(params)
         gateway = self.order_gateway
         if gateway is None or gateway.get_trade_detail_data is None:
@@ -426,42 +466,101 @@ class BigQmtRpcHandlers:
             rows = gateway.get_trade_detail_data(account_id, gateway.account_type, detail_type, strategy_name)
             return _normalize_detail_rows(rows)
         except Exception:
-            # Big QMT 在无对应权限或上下文未绑定时会抛错，降级为空列表。
             return []
 
     def _handle_query_account_infos(self, params):
+        # 账户信息 — get_trade_detail_data(ACCOUNT)
         return self._query_trade_detail(params, "ACCOUNT")
 
     def _handle_query_account_status(self, params):
-        return self._query_trade_detail(params, "ACCOUNT_STATUS")
+        # 账户状态 — 用 TASK detail type 近似（委托任务状态）
+        return self._query_trade_detail(params, "TASK")
 
     def _handle_query_credit_detail(self, params):
-        return self._query_trade_detail(params, "CREDIT")
+        # 融资融券账户明细 — 官方独立函数 get_debt_contract
+        return self._call_qmt_global("get_debt_contract", self._request_account_id(params))
 
     def _handle_query_stk_compacts(self, params):
-        return self._query_trade_detail(params, "COMPACT")
+        # 未平仓合约（负债）— 官方 get_unclosed_compacts
+        return self._call_qmt_global("get_unclosed_compacts", self._request_account_id(params))
 
     def _handle_query_credit_subjects(self, params):
-        return self._query_trade_detail(params, "CREDIT_SUBJECT")
+        # 融资标的（担保品）— 官方 get_assure_contract
+        return self._call_qmt_global("get_assure_contract", self._request_account_id(params))
 
     def _handle_query_credit_slo_code(self, params):
-        return self._query_trade_detail(params, "CREDIT_SLO")
+        # 融券标的 — 官方 get_enable_short_contract
+        return self._call_qmt_global("get_enable_short_contract", self._request_account_id(params))
 
     def _handle_query_credit_assure(self, params):
-        return self._query_trade_detail(params, "CREDIT_ASSURE")
+        # 担保品合约 — 同 query_credit_subjects（get_assure_contract）
+        return self._call_qmt_global("get_assure_contract", self._request_account_id(params))
 
     def _handle_query_appointment_info(self, params):
-        return self._query_trade_detail(params, "APPOINTMENT")
+        # 新股数据 — 官方 get_ipo_data
+        return self._call_qmt_global("get_ipo_data", self._request_account_id(params))
 
     def _handle_query_smt_secu_info(self, params):
-        return self._query_trade_detail(params, "SMT_SECU")
+        # 期权标的持仓 — 官方 get_option_subject_position
+        return self._call_qmt_global("get_option_subject_position", self._request_account_id(params))
 
     def _handle_query_smt_secu_rate(self, params):
-        return self._query_trade_detail(params, "SMT_RATE")
+        # 组合期权 — 官方 get_comb_option
+        return self._call_qmt_global("get_comb_option", self._request_account_id(params))
 
     def _handle_smt_appointment(self, params):
-        # SMB/预约打新属于交易类，需要下单通道；当前不支持，返回未实现。
+        # SMB/预约打新属于交易类，需要下单通道；当前不支持。
         raise NotImplementedError("smt_appointment is not supported via Big QMT RPC")
+
+    # 官方交易查询函数（直接暴露）
+    def _handle_get_value_by_order_id(self, params):
+        order_id = str(params.get("order_id") or params.get("order_sysid") or "")
+        if not order_id:
+            raise ValueError("order_id is required")
+        return self._call_qmt_global("get_value_by_order_id", order_id)
+
+    def _handle_get_last_order_id(self, params):
+        return self._call_qmt_global("get_last_order_id", self._request_account_id(params))
+
+    def _handle_get_ipo_data(self, params):
+        return self._call_qmt_global("get_ipo_data", self._request_account_id(params))
+
+    def _handle_get_new_purchase_limit(self, params):
+        return self._call_qmt_global("get_new_purchase_limit", self._request_account_id(params))
+
+    def _handle_get_history_trade_detail_data(self, params):
+        account_id = self._request_account_id(params)
+        detail_type = str(params.get("detail_type") or params.get("datatype") or "DEAL")
+        start_date = str(params.get("start_date") or params.get("start_time") or "")
+        end_date = str(params.get("end_date") or params.get("end_time") or "")
+        result = self._call_qmt_global(
+            "get_history_trade_detail_data", account_id, detail_type, start_date, end_date
+        )
+        return result
+
+    def _handle_get_assure_contract(self, params):
+        return self._call_qmt_global("get_assure_contract", self._request_account_id(params))
+
+    def _handle_get_enable_short_contract(self, params):
+        return self._call_qmt_global("get_enable_short_contract", self._request_account_id(params))
+
+    def _handle_get_unclosed_compacts(self, params):
+        return self._call_qmt_global("get_unclosed_compacts", self._request_account_id(params))
+
+    def _handle_get_closed_compacts(self, params):
+        return self._call_qmt_global("get_closed_compacts", self._request_account_id(params))
+
+    def _handle_get_debt_contract(self, params):
+        return self._call_qmt_global("get_debt_contract", self._request_account_id(params))
+
+    def _handle_get_option_subject_position(self, params):
+        return self._call_qmt_global("get_option_subject_position", self._request_account_id(params))
+
+    def _handle_get_comb_option(self, params):
+        return self._call_qmt_global("get_comb_option", self._request_account_id(params))
+
+    def _handle_get_hkt_exchange_rate(self, params):
+        return self._call_qmt_global("get_hkt_exchange_rate")
 
     def _order_action_from_params(self, params):
         action = str(params.get("action") or "").upper()
