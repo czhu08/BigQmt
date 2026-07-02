@@ -136,10 +136,10 @@ BIGQMT_REDIS_CONFIG = {
 
     # === 传输选择（默认 redis，生产推荐）===
     # "transport": "redis",              # 不写就是 redis
-    # 切 zmq: 需装 pyzmq + 设 background_threads=True
+    # 切 zmq（同机低延迟，实测 p50~0.3ms）：装了 pyzmq 后只需这一行。
+    #   非 redis 传输会自动开 background_threads；端口按账号派生 127.0.0.1:1556x。
     # "transport": "zmq",
-    # "zmq": {"host": "127.0.0.1"},
-    # 切 mysql: 需装 pymysql+DBUtils + 设 background_threads=True
+    # 切 mysql（兼容兜底）：需装 pymysql+DBUtils，同样自动开 background_threads。
     # "transport": "mysql",
     # "mysql": {"driver":"pymysql","host":"...","port":3306,"user":"root",
     #           "password":"...","database":"bigqmt_rpc","charset":"utf8mb4"},

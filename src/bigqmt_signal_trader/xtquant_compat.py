@@ -8,11 +8,19 @@ The Big QMT process remains the only place that touches QMT runtime APIs.
 import os
 import json
 import time
+import uuid
+import threading
 import importlib
 from typing import Any, Dict, Iterable, List, Optional
 
 from .full_tick_cache import request_full_tick_cache, wait_full_tick_cache
+from .local_cache import LocalMarketCache
 from .redis_rpc import call_redis_rpc
+
+
+# Default OHLCV fields pulled + cached by download_history_data*.
+DEFAULT_DOWNLOAD_FIELDS = ["open", "high", "low", "close", "volume", "amount"]
+_TIME_COL_NAMES = ("stime", "time", "index", "date", "datetime", "timetag")
 
 
 STOCK_BUY = 23
@@ -149,12 +157,17 @@ def load_client_config(module_name=None):
         ):
             if key in redis_config:
                 full_tick_cache_config[key] = redis_config[key]
+        local_cache_config = dict(getattr(module, "BIGQMT_LOCAL_CACHE_CONFIG", {}) or {})
+        for key in ("local_cache_enabled", "local_cache_dir", "local_cache_fallback_rpc", "local_cache_format"):
+            if key in redis_config:
+                local_cache_config[key.replace("local_cache_", "")] = redis_config[key]
         return {
             "module": candidate,
             "account_id": account_id,
             "redis_config": redis_config,
             "timeout_seconds": timeout_seconds,
             "full_tick_cache_config": full_tick_cache_config,
+            "local_cache_config": local_cache_config,
         }
     return {}
 
@@ -314,6 +327,32 @@ class BigQmtRpcClient:
                 or _env_float("BIGQMT_FULL_TICK_POLL_INTERVAL_SECONDS", 0.2)
             ),
         }
+        # Client-side local market-data cache. download_history_data* pulls bars
+        # over RPC once and persists them here; get_local_data then reads them with
+        # no RPC. fallback_rpc=True lets get_local_data fetch+cache a cache miss.
+        local_cache_config = dict(client_config.get("local_cache_config") or {})
+        self.local_cache_config = {
+            "enabled": _bool_value(
+                local_cache_config.get("enabled", merged_redis_config.get("local_cache_enabled")),
+                _env_bool("BIGQMT_LOCAL_CACHE_ENABLED", True),
+            ),
+            "dir": (
+                local_cache_config.get("dir")
+                or merged_redis_config.get("local_cache_dir")
+                or os.environ.get("BIGQMT_LOCAL_CACHE_DIR")
+                or None
+            ),
+            "fallback_rpc": _bool_value(
+                local_cache_config.get("fallback_rpc", merged_redis_config.get("local_cache_fallback_rpc")),
+                _env_bool("BIGQMT_LOCAL_CACHE_FALLBACK_RPC", False),
+            ),
+            "format": str(
+                local_cache_config.get("format")
+                or merged_redis_config.get("local_cache_format")
+                or os.environ.get("BIGQMT_LOCAL_CACHE_FORMAT")
+                or "auto"  # parquet if pyarrow is available, else pickle
+            ),
+        }
         # Transport selection. Default "redis" keeps the legacy call_redis_rpc
         # path (so existing client configs are unchanged). Setting transport to
         # "zmq"/"mysql"/"shm" (via config or constructor) routes calls through
@@ -375,7 +414,7 @@ class BigQmtRpcClient:
             # envelope the same way call_redis_rpc does.
             request = {
                 "schema_version": 1,
-                "request_id": __import__("uuid").uuid.uuid4().hex,
+                "request_id": uuid.uuid4().hex,
                 "account_id": target_account,
                 "method": method,
                 "params": params or {},
@@ -436,10 +475,19 @@ class BigQmtXtData:
     def __init__(self, client):
         self.client = client
         self._subscribe_seq = int(time.time() * 1000)
+        self._cache_obj = None
 
     def _next_seq(self):
         self._subscribe_seq += 1
         return self._subscribe_seq
+
+    def _local_cache(self):
+        cfg = dict(getattr(self.client, "local_cache_config", {}) or {})
+        if not _bool_value(cfg.get("enabled"), True):
+            return None
+        if self._cache_obj is None:
+            self._cache_obj = LocalMarketCache(cache_dir=cfg.get("dir"), fmt=cfg.get("format", "auto"))
+        return self._cache_obj
 
     def _call(self, method, **params):
         return self.client.call(method, params)
@@ -534,7 +582,10 @@ class BigQmtXtData:
         dividend_type="none",
         fill_data=True,
     ):
-        return self._call(
+        # Live pull over RPC. Cache-through: whatever we fetch is written to the
+        # local cache (keyed by dividend_type), so it stays the latest — important
+        # for 前复权 (front-adjusted) data, whose history re-scales on each dividend.
+        data = self._call(
             "get_market_data_ex",
             field_list=list(field_list or []),
             stock_list=list(stock_list or []),
@@ -545,6 +596,14 @@ class BigQmtXtData:
             dividend_type=dividend_type,
             fill_data=fill_data,
         )
+        cache = self._local_cache()
+        if cache is not None and isinstance(data, dict):
+            for code, df in data.items():
+                try:
+                    cache.write(code, period, df, dividend_type=dividend_type)
+                except Exception:
+                    pass
+        return data
 
     def get_local_data(
         self,
@@ -558,18 +617,72 @@ class BigQmtXtData:
         fill_data=True,
         data_dir=None,
     ):
-        return self._call(
-            "get_local_data",
-            field_list=list(field_list or []),
-            stock_list=list(stock_list or []),
+        """Read bars from the CLIENT-side local cache — no RPC to Big QMT.
+
+        Populate the cache first with download_history_data2(...). Returns a dict
+        {code: DataFrame}. A cache-missed code is omitted, unless
+        local_cache_fallback_rpc is enabled (then it is fetched + cached).
+        """
+        codes = [str(c) for c in (stock_list or []) if str(c or "").strip()]
+        cache = self._local_cache()
+        if cache is None:
+            # Cache disabled -> behave like a plain RPC local-data read.
+            return self._call(
+                "get_local_data",
+                field_list=list(field_list or []),
+                stock_list=codes,
+                period=period,
+                start_time=start_time,
+                end_time=end_time,
+                count=count,
+                dividend_type=dividend_type,
+                fill_data=fill_data,
+                data_dir=data_dir,
+            )
+        fields = list(field_list or [])
+        result = {}
+        missing = []
+        for code in codes:
+            df = cache.read(code, period, start_time, end_time, count, dividend_type=dividend_type)
+            if df is not None and getattr(df, "shape", (0,))[0] > 0:
+                result[code] = self._select_fields(df, fields)
+            else:
+                missing.append(code)
+        if missing and _bool_value(self.client.local_cache_config.get("fallback_rpc"), False):
+            fetched = self._pull_and_cache(missing, period, start_time, end_time, count, dividend_type)
+            for code in missing:
+                df = fetched.get(code)
+                if df is not None and getattr(df, "shape", (0,))[0] > 0:
+                    result[code] = self._select_fields(df, fields)
+        return result
+
+    @staticmethod
+    def _select_fields(df, fields):
+        if not fields:
+            return df
+        try:
+            keep = [c for c in df.columns if c in fields or c in _TIME_COL_NAMES]
+            return df[keep] if keep else df
+        except Exception:
+            return df
+
+    def _pull_and_cache(self, codes, period, start_time, end_time, count, dividend_type="none"):
+        """Fetch codes over RPC (get_market_data_ex already caches them)."""
+        data = self.get_market_data_ex(
+            field_list=DEFAULT_DOWNLOAD_FIELDS,
+            stock_list=list(codes),
             period=period,
             start_time=start_time,
             end_time=end_time,
             count=count,
             dividend_type=dividend_type,
-            fill_data=fill_data,
-            data_dir=data_dir,
         )
+        out = {}
+        for code in codes:
+            df = data.get(code) if isinstance(data, dict) else None
+            if df is not None and getattr(df, "shape", (0,))[0] > 0:
+                out[code] = df
+        return out
 
     def subscribe_quote(self, stock_code, period="1d", start_time="", end_time="", count=0, callback=None):
         seq = self._next_seq()
@@ -633,28 +746,53 @@ class BigQmtXtData:
     def get_divid_factors(self, stock_code, start_time="", end_time=""):
         return self._call("get_divid_factors", stock_code=stock_code, start_time=start_time, end_time=end_time)
 
-    def download_history_data(self, stock_code, period, start_time="", end_time="", incrementally=None):
-        return self._call(
-            "download_history_data",
-            stock_code=stock_code,
-            period=period,
-            start_time=start_time,
-            end_time=end_time,
-            incrementally=incrementally,
-        )
+    def download_history_data2(self, stock_list, period, start_time="", end_time="", callback=None, incrementally=None, dividend_type="none", chunk_size=None):
+        """Pull bars from Big QMT over RPC and cache them locally, in batches.
 
-    def download_history_data2(self, stock_list, period, start_time="", end_time="", callback=None, incrementally=None):
-        result = self._call(
-            "download_history_data2",
-            stock_list=list(stock_list or []),
-            period=period,
-            start_time=start_time,
-            end_time=end_time,
-            incrementally=incrementally,
-        )
-        if callback is not None:
-            callback(result)
-        return result
+        Mirrors xtdata.download_history_data2: after this, get_local_data(..., the
+        same dividend_type) reads the data locally with no further RPC. Each batch
+        re-pulls live, so re-running keeps the cache latest — needed for 前复权
+        (front-adjusted) data. ``callback`` (optional) is invoked once per stock with
+        {finished, total, stockcode} — xtdata-style. Returns {finished, total}.
+        """
+        codes = [str(c) for c in (stock_list or []) if str(c or "").strip()]
+        if not codes:
+            return {"finished": 0, "total": 0}
+        if self._local_cache() is None:
+            raise RuntimeError("local cache is disabled (set local_cache_enabled=True to download)")
+        total = len(codes)
+        step = int(chunk_size or 300)
+        if step <= 0:
+            step = 300
+        finished = 0
+        for i in range(0, total, step):
+            batch = codes[i:i + step]
+            # get_market_data_ex is cache-through: it writes each code to the cache.
+            self.get_market_data_ex(
+                field_list=DEFAULT_DOWNLOAD_FIELDS,
+                stock_list=batch,
+                period=period,
+                start_time=start_time,
+                end_time=end_time,
+                count=-1,
+                dividend_type=dividend_type,
+            )
+            for code in batch:
+                finished += 1
+                if callback is not None:
+                    try:
+                        callback({"finished": finished, "total": total, "stockcode": code})
+                    except Exception:
+                        pass
+        return {"finished": finished, "total": total}
+
+    def download_history_data(self, stock_code, period, start_time="", end_time="", incrementally=None, dividend_type="none"):
+        return self.download_history_data2([stock_code], period, start_time, end_time, dividend_type=dividend_type)
+
+    def local_cache_stats(self):
+        """Return (cached files, periods) for the client-side local cache."""
+        cache = self._local_cache()
+        return cache.stats() if cache is not None else (0, [])
 
     def get_trading_dates(self, market, start_time="", end_time="", count=-1):
         return self._call("get_trading_dates", market=market, start_time=start_time, end_time=end_time, count=count)
@@ -1022,6 +1160,8 @@ class BigQmtXtTrader:
             timeout_seconds=timeout_seconds,
         )
         self.callback = None
+        self._event_thread = None
+        self._event_running = False
 
     def _cached_position_snapshot(self, account_id):
         key = "bigqmt:positions:%s" % str(account_id or self.client.account_id or "")
@@ -1055,6 +1195,9 @@ class BigQmtXtTrader:
         return 0
 
     def start(self):
+        # Launch the real-time execution-event listener so a registered callback's
+        # on_stock_order / on_stock_trade fire as soon as Big QMT pushes them.
+        self._start_event_listener()
         return 0
 
     def connect(self):
@@ -1065,10 +1208,72 @@ class BigQmtXtTrader:
     def subscribe(self, account):
         if not self.client.account_id:
             self.client.account_id = _account_id(account)
+        # (Re)start the listener now that the account is known; the loop resubscribes
+        # to the account's channels within ~1s if the account changed.
+        self._start_event_listener()
         return 0
 
     def stop(self):
+        self._event_running = False
+        thread = self._event_thread
+        if thread is not None and thread.is_alive():
+            thread.join(1.0)
+        self._event_thread = None
         return 0
+
+    def _start_event_listener(self):
+        if self._event_thread is not None and self._event_thread.is_alive():
+            return
+        self._event_running = True
+        self._event_thread = threading.Thread(
+            target=self._event_loop, name="bigqmt-exec-events", daemon=True
+        )
+        self._event_thread.start()
+
+    def _event_loop(self):
+        from .exec_events import order_channel, trade_channel
+
+        while self._event_running:
+            account_id = str(self.client.account_id or "")
+            pubsub = None
+            try:
+                pubsub = self.client._redis().pubsub(ignore_subscribe_messages=True)
+                pubsub.subscribe(order_channel(account_id), trade_channel(account_id))
+                while self._event_running:
+                    if str(self.client.account_id or "") != account_id:
+                        break  # account changed -> reconnect and resubscribe
+                    message = pubsub.get_message(timeout=1.0)
+                    if not message or message.get("type") != "message":
+                        continue
+                    self._dispatch_event(message.get("data"))
+            except Exception:
+                time.sleep(1.0)
+            finally:
+                try:
+                    if pubsub is not None:
+                        pubsub.close()
+                except Exception:
+                    pass
+
+    def _dispatch_event(self, raw):
+        callback = self.callback
+        if callback is None:
+            return
+        try:
+            text = raw.decode("utf-8") if isinstance(raw, (bytes, bytearray)) else str(raw)
+            event = json.loads(text)
+        except Exception:
+            return
+        if not isinstance(event, dict):
+            return
+        account_id = str(event.get("account_id") or self.client.account_id or "")
+        try:
+            if event.get("event_type") == "trade":
+                callback.on_stock_trade(self._trade_from_dict(account_id, event))
+            elif event.get("event_type") == "order":
+                callback.on_stock_order(self._order_from_dict(account_id, event))
+        except Exception:
+            pass
 
     def run_forever(self):
         while True:

@@ -295,12 +295,6 @@ class ZmqTransport(RpcTransport):
             except Exception:
                 pass
             self._router = None
-            # Deliver to the registered callback. The callback (service) is
-            # responsible for calling send_response, which routes via identity.
-            try:
-                self.deliver(request)
-            except Exception as exc:
-                print("%s zmq deliver failed: %s" % (self.print_prefix, exc))
 
     def send_response(self, request, response):
         if self._router is None:

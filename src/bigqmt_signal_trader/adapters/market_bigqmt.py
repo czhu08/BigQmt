@@ -68,50 +68,45 @@ def _load_native_xtdata():
         return _NATIVE_XTDATA
     try:
         import os
+        import sys
 
-        rel = os.path.join("bin.x64", "Lib", "site-packages", "xtquant", "xtdata.py")
-        # Walk up from this file looking for the QMT install root (the dir that
-        # contains bin.x64/). Robust to wherever the package happens to live
-        # (python/bigqmt_signal_trader/adapters/ in QMT, src/... in the repo).
+        # Locate <qmt_root>/bin.x64/{lib,Lib}/site-packages that holds the REAL
+        # xtquant package. Walk up from this file (works whether we live under
+        # python/bigqmt_signal_trader/adapters/ in QMT or src/... in the repo).
+        real_sp = None
         start = os.path.abspath(__file__)
-        loaded = None
         for _ in range(8):
             parent = os.path.dirname(start)
             if parent == start:
                 break
-            candidate = os.path.join(parent, rel)
-            if os.path.isfile(candidate):
-                spec = importlib.util.spec_from_file_location(
-                    "bigqmt_native_xtdata", candidate
-                )
-                module = importlib.util.module_from_spec(spec)
-                spec.loader.exec_module(module)
-                loaded = module
+            for libdir in ("lib", "Lib"):
+                candidate = os.path.join(parent, "bin.x64", libdir, "site-packages")
+                if os.path.isdir(os.path.join(candidate, "xtquant")):
+                    real_sp = candidate
+                    break
+            if real_sp:
                 break
             start = parent
-        if loaded is None:
-            # Fall back to whatever ``xtquant.xtdata`` resolves to, as long as
-            # it is the real SDK. Our RPC shim (python/xtquant/xtdata.py and the
-            # repo's src/xtquant/xtdata.py) also exposes get_sector_list but only
-            # forwards back over RPC — using it here would recurse. Reject any
-            # module whose file lives under a "python" or "src" dir.
+
+        loaded = None
+        if real_sp:
+            # Import the real xtquant PACKAGE (not xtdata.py standalone) so its
+            # package-relative imports (xtbson etc.) resolve. Un-shadow our RPC
+            # shim (python/xtquant, src/xtquant) which otherwise wins on sys.path:
+            # put the real site-packages first and drop any already-imported shim
+            # xtquant modules (their __file__ is not under bin.x64/).
+            if real_sp not in sys.path:
+                sys.path.insert(0, real_sp)
+            for name in [n for n in list(sys.modules) if n == "xtquant" or n.startswith("xtquant.")]:
+                mod_file = getattr(sys.modules.get(name), "__file__", "") or ""
+                if "bin.x64" not in mod_file:
+                    del sys.modules[name]
             try:
-                candidate = importlib.import_module("xtquant.xtdata")
+                module = importlib.import_module("xtquant.xtdata")
+                if "bin.x64" in (getattr(module, "__file__", "") or ""):
+                    loaded = module
             except Exception:
-                candidate = None
-            cand_file = getattr(candidate, "__file__", "") or ""
-            is_shim = (
-                candidate is not None
-                and hasattr(candidate, "get_sector_list")
-                and (
-                    candidate.__name__ == "bigqmt_native_xtdata"
-                    or candidate.__name__.endswith("xtquant_compat")
-                    or os.sep + "python" + os.sep in cand_file
-                    or os.sep + "src" + os.sep in cand_file
-                )
-            )
-            if candidate is not None and hasattr(candidate, "get_sector_list") and not is_shim:
-                loaded = candidate
+                loaded = None
         _NATIVE_XTDATA = loaded if loaded is not None else _NATIVE_XTDATA_UNAVAILABLE
     except Exception:
         _NATIVE_XTDATA = _NATIVE_XTDATA_UNAVAILABLE
@@ -341,17 +336,53 @@ class BigQmtMarketDataProvider:
             return self._call_context("get_divid_factors", stock_code, date)
         return self._call_context("get_divid_factors", stock_code)
 
+    def _download(self, func_name, sdk_args, sdk_kwargs, ctx_call):
+        """Download history via the xtdata SDK (its natural home), falling back to
+        ContextInfo. If neither works, raise with the REAL native reason so the
+        failure is diagnosable instead of a bare 'ContextInfo has no ...'."""
+        module = self._native()
+        if module is None:
+            native_err = "xtdata SDK not importable"
+        else:
+            fn = getattr(module, func_name, None)
+            if fn is None:
+                native_err = "xtdata SDK has no %s" % func_name
+            else:
+                try:
+                    return fn(*sdk_args, **sdk_kwargs)
+                except Exception as exc:
+                    native_err = "%s: %s" % (exc.__class__.__name__, exc)
+        if getattr(self.context_info, func_name, None) is not None:
+            return ctx_call()
+        raise NotImplementedError(
+            "%s unavailable (native xtdata -> %s; ContextInfo has no %s)" % (func_name, native_err, func_name)
+        )
+
     def download_history_data(self, stock_code, period, start_time="", end_time="", incrementally=None):
-        kwargs = {"stock_code": stock_code, "period": period, "start_time": start_time, "end_time": end_time}
-        if incrementally is not None:
-            kwargs["incrementally"] = incrementally
-        return self._call_context("download_history_data", **kwargs)
+        def _via_context():
+            kwargs = {"stock_code": stock_code, "period": period, "start_time": start_time, "end_time": end_time}
+            if incrementally is not None:
+                kwargs["incrementally"] = incrementally
+            return self._call_context("download_history_data", **kwargs)
+
+        sdk_kwargs = {"incrementally": incrementally} if incrementally is not None else {}
+        return self._download(
+            "download_history_data", (stock_code, period, start_time, end_time), sdk_kwargs, _via_context
+        )
 
     def download_history_data2(self, stock_list, period, start_time="", end_time="", incrementally=None):
-        kwargs = {"stock_list": stock_list, "period": period, "start_time": start_time, "end_time": end_time}
-        if incrementally is not None:
-            kwargs["incrementally"] = incrementally
-        return self._call_context("download_history_data2", **kwargs)
+        stock_list = list(stock_list or [])
+
+        def _via_context():
+            kwargs = {"stock_list": stock_list, "period": period, "start_time": start_time, "end_time": end_time}
+            if incrementally is not None:
+                kwargs["incrementally"] = incrementally
+            return self._call_context("download_history_data2", **kwargs)
+
+        sdk_kwargs = {"incrementally": incrementally} if incrementally is not None else {}
+        return self._download(
+            "download_history_data2", (stock_list, period, start_time, end_time), sdk_kwargs, _via_context
+        )
 
     def get_trading_dates(self, market, start_time="", end_time="", count=-1):
         # xtdata SDK signature: get_trading_dates(market, start_time, end_time, count)

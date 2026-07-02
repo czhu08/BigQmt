@@ -246,6 +246,63 @@ bigqmt:full_tick:cache:{account_id}:{request_id}
 
 快照 Redis key 的 TTL 默认是 10 秒；客户端还会校验 `updated_at_ts`，超过 `cache_ttl_seconds` 的快照不会返回。第一次调用如果还没有快照，客户端默认最多等待 `3.5s` 等下一轮大 QMT 刷新；**个股列表**仍然没有新快照时回退一次 live RPC(`get_full_tick`)以避免冷启动硬停；**市场代码**(`SH/SZ/BJ/HK`)则抛出超时、不回退 live 拉全市场。
 
+### 异步下载任务（download jobs）
+
+`download_history_data` / `download_history_data2` 是耗时的长调用：如果走同步 RPC，服务端会在**策略线程**上一直下载，冻结整个 RPC pump（且客户端 6s 就超时崩）。因此这两个方法改为**异步分块任务**：客户端把任务写入 Redis 队列立即返回，大 QMT 的策略线程每个 tick 只下载 `download_job_chunk_size` 只（受 `download_job_max_wall_seconds` 墙钟预算约束），永不长时间阻塞。
+
+Redis 布局（按账户）：
+
+```text
+bigqmt:download:queue:{account_id}          # 待处理 job_id 列表（RPUSH/LPOP）
+bigqmt:download:job:{account_id}:{job_id}    # job JSON（含 state/done/total/error 进度）
+bigqmt:download:current:{account_id}         # 当前正在处理的 job_id（串行，一次一个）
+```
+
+job 状态：`pending → running → done | failed`。历史 K 线下载到**大 QMT 机器**的本地库；客户端随后用 `get_local_data` / `get_market_data` 快读取回。
+
+客户端用法：
+
+```python
+# 非阻塞：提交后轮询
+job = xtdata.submit_download_history_data2(["600000.SH", "000001.SZ"], "1d")
+status = xtdata.get_download_status(job["job_id"])   # {state, done, total, error}
+status = xtdata.wait_download(job["job_id"])          # 阻塞轮询到 done/failed（仅客户端阻塞）
+
+# 兼容：download_history_data2(...) 仍可直接调用 = 提交 + 等待（默认最多 1800s）；
+# 超时会抛 TimeoutError（任务在服务端继续跑，可继续轮询）。大批量建议用 submit + 轮询。
+```
+
+服务端开关：`download_jobs_enabled`、`download_job_chunk_size`（默认 10，每 tick 最小下载块）、`download_job_max_wall_seconds`（默认 0.5s，每 tick 墙钟预算）、`download_job_ttl_seconds`（默认 3600）。
+
+### 实时成交/委托回调推送（exec events）
+
+大 QMT 的 `order_callback(ContextInfo, orderInfo)` / `deal_callback(ContextInfo, dealInfo)` 在策略进程内触发。服务端把 QMT 对象的 ThinkTrader `m_*` 字段规范化后 publish 到 Redis，客户端后台线程订阅并回调 —— 无需轮询即可**实时**拿到成交/委托。
+
+Redis 频道（同名 stream，xadd + publish，供短时回放）：
+
+```text
+bigqmt:order_events:{account_id}
+bigqmt:trade_events:{account_id}
+```
+
+成交事件字段（由 `deal_callback` 的 `m_*` 映射）：`stock_code`(`m_strInstrumentID`)、`trade_id`(`m_strTradeID`)、`order_sys_id`(`m_strOrderSysID`)、`volume`(`m_nVolume`)、`price`(`m_dPrice`)、`amount`(`m_dTradeAmount`)、`commission`(`m_dComssion`)、`direction`(`m_nDirection`) 及 `action`(尽力映射 BUY/SELL)、`traded_at`(`m_strTradeTime`)。委托事件类似（`m_nOrderStatus`→`status`、`m_nVolumeTotal`→`order_volume`、`m_nVolumeTraded`→`traded_volume`、`m_dLimitPrice`→`price`）。
+
+客户端用法（MiniQMT 风格，回调实时触发）：
+
+```python
+class MyCallback(XtQuantTraderCallback):
+    def on_stock_trade(self, trade):   # 成交实时回调
+        print(trade.stock_code, trade.trade_id, trade.traded_volume, trade.traded_price)
+    def on_stock_order(self, order):   # 委托状态实时回调
+        print(order.stock_code, order.order_status, order.traded_volume)
+
+xt_trader.register_callback(MyCallback())
+xt_trader.start()          # 启动后台监听线程（订阅上面两个频道）
+xt_trader.subscribe(acc)   # 账号确定后会自动重订阅到该账号频道
+```
+
+服务端开关：`exec_events_enabled`（默认 True）。`action` 由 `m_nDirection` 尽力映射（48/23→BUY，49/24→SELL），未知时为空但 `direction` 原值始终保留。
+
 ## 外部调用示例
 
 ```python

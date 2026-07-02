@@ -42,4 +42,19 @@ BIGQMT_REDIS_CONFIG = {
     # strategy thread (the in-flight demand always completes).
     "full_tick_refresh_max_wall_seconds": 0.3,
     "full_tick_max_requests": 8,
+    # Async download jobs: clients submit download_history_data(2) as a job; the
+    # strategy thread downloads download_job_chunk_size symbols per tick (capped by
+    # download_job_max_wall_seconds), so a long download never blocks the RPC pump.
+    # chunk_size is the smallest per-tick block — keep it modest if downloads are slow.
+    # Disabled: the full terminal's xtdata SDK can't reach a data service to
+    # download. Supplement history via the terminal's 数据管理/补充数据 UI, then read
+    # it over RPC (get_market_data_ex/get_local_data). Enable only where a
+    # MiniQMT/xtdata data service is connectable.
+    "download_jobs_enabled": False,
+    "download_job_chunk_size": 10,
+    "download_job_max_wall_seconds": 0.5,
+    "download_job_ttl_seconds": 3600,
+    # Push order_callback/deal_callback details to Redis so clients get real-time
+    # on_stock_order / on_stock_trade callbacks (MiniQMT style) instead of polling.
+    "exec_events_enabled": True,
 }

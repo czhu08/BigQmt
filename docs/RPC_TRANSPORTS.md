@@ -43,14 +43,23 @@
 
 ### 服务端（QMT 进程）
 
-在 `bigqmt_signal_trader_local_config.py` 的 `BIGQMT_REDIS_CONFIG` 里加 `transport` 字段：
+在 `bigqmt_signal_trader_local_config.py` 的 `BIGQMT_REDIS_CONFIG` 里加 `transport` 字段，**只改这一行即可**：
 
 ```python
 BIGQMT_REDIS_CONFIG = {
     "transport": "zmq",          # 默认 "redis"。可选: redis/zmq/mysql/shm
     # ... 其他现有字段不变 (host/port/db/password, rpc_*, full_tick_*)
+```
 
-    # transport=zmq 时生效：
+> **注意（zmq/mysql/shm）**：非 redis 传输自带接收线程、没有 QMT adjust 兜底排空，
+> 必须跑后台线程才能收到请求。`_build_rpc_service` 会在 `transport != redis` 时
+> **自动把 `rpc_background_threads` 置 True**（启动日志打印
+> `transport=zmq -> background_threads auto-enabled`），所以你**不用**再手动配它。
+> 端口不写时按账号自动派生 `tcp://127.0.0.1:{15560 + 账号%100}`（同机回环）。
+> 需要自定义绑定地址时再加 `zmq` 块：
+
+```python
+    # 可选：仅当要覆盖自动派生的地址时才写
     "zmq": {
         "bind_address": "tcp://127.0.0.1:5560",   # 同机最快用 tcp 回环
         # Windows 不支持 ipc://, 用 tcp
@@ -100,10 +109,22 @@ BIGQMT_REDIS_CONFIG = {
 - 用 ZMQ 原生 identity 路由（`reply_*` 字段忽略）
 - Windows 用 `tcp://127.0.0.1:port`（ZMQ 在 Windows 不支持 `ipc://`）
 - Linux 同机可用 `ipc://` 更快（绕过 TCP 栈）
-- 实测同机 tcp 回环：**p50 = 0.2ms**（比 Redis 快 ~60 倍）
+- 实测同机 tcp 回环：**p50 = 0.2ms**（比 Redis 快 ~60 倍）；
+  在大 QMT 全终端进程内实测 ping **p50 ≈ 0.3ms**（20 次 0 个 >50ms）。
 
 注意：ZMQ transport 的 `stop()` 由 ROUTER 接收线程自己关闭 socket（Windows
 上跨线程 close socket 会触发 signaler 断言）。
+
+> **⚠️ 在大 QMT 进程内跑 zmq 的两个必要条件（都已自动处理，勿手动关）：**
+>
+> 1. **`background_threads` 必须为 True** —— ZMQ 的 ROUTER 只有在后台线程里才
+>    起接收循环；否则只 bind 不收包，客户端全部超时。`_build_rpc_service` 已对
+>    非 redis 传输**自动置 True**，无需在 config 里写。
+> 2. **`schedule_adjust` 必须保持开** —— 它不是「RPC 排空开销」，而是 QMT 回调的
+>    **节流器**：`run_time("adjust", 500ms)` 让 adjust 按 500ms 触发；一旦不注册,
+>    QMT 会以 **~2500 次/秒**空转 adjust，占满 GIL 把 ROUTER 后台线程饿死，RPC
+>    直接超时。所以即便 zmq 自带接收线程，也**不能**关 schedule_adjust。
+>    （曾误以为它是纯开销去关掉 → 全部超时；这是嵌入式单 GIL 环境的坑。）
 
 ### MySQL（`transport: mysql`，兼容兜底）
 
@@ -142,9 +163,13 @@ zmq      n=100  min=0.15   p50=0.21   p90=0.33   p99=20.62   avg=0.43 ms
 ## 切换检查清单
 
 1. 服务端和客户端的 `transport` 字段**必须一致**
-2. zmq：客户端 `connect_address` 指向服务端 `bind_address`
-3. mysql：两端连同一个数据库，schema 自动创建
-4. 切回 redis：删掉 `transport` 字段或设为 `"redis"`，无需改其他配置
+2. zmq：不写 `zmq` 块时端口按账号自动派生 `tcp://127.0.0.1:{15560+账号%100}`，
+   两端一致；要跨机或自定义端口时才写 `connect_address`/`bind_address`
+3. zmq/mysql：`background_threads` 由 `_build_rpc_service` 自动开，**不用手动配**
+4. zmq（大 QMT 进程内）：**保持 `schedule_adjust` 开**（默认就是开），否则 adjust
+   空转占满 GIL 饿死接收线程 → RPC 超时
+5. mysql：两端连同一个数据库，schema 自动创建
+6. 切回 redis：删掉 `transport` 字段或设为 `"redis"`，无需改其他配置
 
 ## 文件结构
 

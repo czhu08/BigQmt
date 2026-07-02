@@ -5,6 +5,9 @@ import sys
 
 
 def _known_qmt_python_dir():
+    # Best-effort fallback only; the real path comes from __file__ below. Uses the
+    # stock install name (no machine-specific suffix). Keep this file pure ASCII:
+    # it is declared #coding:gbk, so build the CJK dir name from code points.
     root = "".join(chr(value) for value in (0x56fd, 0x91d1, 0x8bc1, 0x5238))
     suffix = "".join(chr(value) for value in (0x4ea4, 0x6613, 0x7aef))
     return "D:\\" + root + "QMT" + suffix + "\\python"
@@ -104,8 +107,9 @@ except Exception as _account_cfg_err:
             pass
         _runtime.configure_runtime_account(_account_id)
 
-# 捕获 QMT 运行时注入的全局函数（同 passorder，不在 _PyContextInfo 桩里）。
-# 官方交易函数文档列出的查询类函数，按名捕获，缺失的跳过（普通账户没两融权限）。
+# Capture QMT runtime-injected globals (like passorder) not present in the
+# _PyContextInfo stub. Bind the official trade-query functions by name; skip any
+# that are missing (a plain account has no margin/credit permission).
 try:
     _qmt_extra = {}
     for _fn in (

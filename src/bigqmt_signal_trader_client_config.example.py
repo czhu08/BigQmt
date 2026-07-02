@@ -28,3 +28,20 @@ BIGQMT_FULL_TICK_CACHE_CONFIG = {
     "wait_seconds": 3.5,
     "poll_interval_seconds": 0.2,
 }
+
+# Client-side LOCAL market-data cache.
+#   download_history_data2(codes, period, start_time, ..., callback) pulls bars
+#   over RPC once and persists them under `dir`; get_local_data(...) then reads
+#   them locally with NO RPC to Big QMT (for offline / repeated local analysis).
+#   - dir: cache folder (default ~/.bigqmt_cache), one pickle per (period, code).
+#   - fallback_rpc: if True, get_local_data auto-fetches+caches a cache miss;
+#     if False (default), a cache-missed code is simply omitted (download first).
+BIGQMT_LOCAL_CACHE_CONFIG = {
+    "enabled": True,
+    "dir": None,            # None -> ~/.bigqmt_cache
+    "fallback_rpc": False,
+    # Storage format: "auto" (parquet if pyarrow installed, else pickle),
+    # "parquet" (columnar/compressed/cross-language — recommended), or "pkl".
+    # One file per (period, dividend_type, code); switching format auto-migrates.
+    "format": "auto",
+}

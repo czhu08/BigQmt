@@ -182,6 +182,27 @@ def _config_bool(value, default=False):
     return str(value).strip().lower() in ("1", "true", "yes", "y", "on")
 
 
+_REDIS_TRANSPORT_NAMES = ("redis", "", "default")
+
+
+def _is_redis_transport(transport_name):
+    return str(transport_name or "redis").lower() in _REDIS_TRANSPORT_NAMES
+
+
+def _resolve_background_threads(transport_name, configured):
+    """Decide whether the RPC service runs its own background receive threads.
+
+    Non-redis transports (zmq/mysql/shm) own their receive threads and have no
+    QMT adjust-drain fallback, so they MUST run background threads or they bind
+    but never receive. Force it on so switching transport is a one-liner
+    (``transport: "zmq"``) — the user needn't also set rpc_background_threads.
+    Redis keeps the configured value (default False = adjust-drain path).
+    """
+    if not _is_redis_transport(transport_name):
+        return True
+    return bool(configured)
+
+
 def _build_rpc_service(context_info, app, config):
     rpc_config = dict(config.get("rpc") or {})
     enabled = _config_bool(config.get("enable_rpc"), False) or _config_bool(rpc_config.get("enabled"), False)
@@ -199,6 +220,18 @@ def _build_rpc_service(context_info, app, config):
     _redis_common = importlib.reload(_redis_common)
     _market_bigqmt = importlib.reload(_market_bigqmt)
     _position_bigqmt = importlib.reload(_position_bigqmt)
+    # Reload the lazily-imported helper modules too, so edits to them take effect on
+    # an editor rerun (QMT persists sys.modules across reruns; a plain lazy import
+    # would otherwise keep the stale cached version).
+    for _mod_name in (
+        "bigqmt_signal_trader.full_tick_cache",
+        "bigqmt_signal_trader.download_jobs",
+        "bigqmt_signal_trader.exec_events",
+    ):
+        try:
+            importlib.reload(importlib.import_module(_mod_name))
+        except Exception as _reload_err:
+            print("[bigqmt_rpc] reload %s failed: %s" % (_mod_name, _reload_err))
     build_redis_client = _redis_common.build_redis_client
     BigQmtMarketDataProvider = _market_bigqmt.BigQmtMarketDataProvider
     BigQmtPositionProvider = _position_bigqmt.BigQmtPositionProvider
@@ -234,8 +267,11 @@ def _build_rpc_service(context_info, app, config):
     )
     process_in_listener = _config_bool(rpc_config.get("process_in_listener"), True)
     listener_methods = rpc_config.get("listener_methods") or ("*",)
-    background_threads = _config_bool(rpc_config.get("background_threads"), False)
     transport_name = str(rpc_config.get("transport") or "redis").lower()
+    configured_bg = _config_bool(rpc_config.get("background_threads"), False)
+    background_threads = _resolve_background_threads(transport_name, configured_bg)
+    if background_threads and not configured_bg:
+        print("[bigqmt_rpc] transport=%s -> background_threads auto-enabled" % transport_name)
     # Build the transport. Redis is the default and reuses the existing clients/
     # templates (zero behavior change). zmq/mysql/shm go through the factory and
     # bypass the Redis clients entirely.
@@ -322,12 +358,15 @@ def _refresh_full_tick_cache(context_info, config):
     demand_ttl = float(cache_config.get("demand_ttl_seconds") or 10)
     cache_ttl = float(cache_config.get("cache_ttl_seconds") or 10)
     max_requests = int(cache_config.get("max_requests") or 8)
-    refreshed = 0
-    try:
-        from bigqmt_signal_trader.full_tick_cache import refresh_full_tick_cache
+    from bigqmt_signal_trader.full_tick_cache import refresh_full_tick_cache
 
-        if do_symbol:
-            _last_full_tick_refresh_at = now
+    refreshed = 0
+    # Symbol and market refreshes are throttled independently, so each advances its
+    # own timestamp and runs in its own try: a symbol-refresh error must not starve
+    # the market refresh nor leave it retrying every fast tick (unthrottled).
+    if do_symbol:
+        _last_full_tick_refresh_at = now
+        try:
             refreshed += refresh_full_tick_cache(
                 redis_client,
                 context_info,
@@ -338,8 +377,11 @@ def _refresh_full_tick_cache(context_info, config):
                 kind="symbol",
                 max_wall_seconds=max_wall,
             )
-        if do_market:
-            _last_full_tick_market_refresh_at = now
+        except Exception as exc:
+            print("[bigqmt_full_tick_cache] symbol refresh failed: %s" % exc)
+    if do_market:
+        _last_full_tick_market_refresh_at = now
+        try:
             refreshed += refresh_full_tick_cache(
                 redis_client,
                 context_info,
@@ -350,8 +392,8 @@ def _refresh_full_tick_cache(context_info, config):
                 kind="market",
                 max_wall_seconds=max_wall,
             )
-    except Exception as exc:
-        print("[bigqmt_full_tick_cache] refresh failed: %s" % exc)
+        except Exception as exc:
+            print("[bigqmt_full_tick_cache] market refresh failed: %s" % exc)
     return refreshed
 
 
@@ -421,12 +463,50 @@ def init(ContextInfo):
     return app
 
 
+def _pump_download_jobs(context_info, config):
+    """Advance any queued async download job by a bounded slice on this thread."""
+    job_config = dict(config.get("download_jobs") or {})
+    if not _config_bool(job_config.get("enabled"), True):
+        return None
+    account_id = str(job_config.get("account_id") or config.get("account_id") or _account_id or "")
+    if not account_id:
+        return None
+    redis_client = getattr(_rpc_service, "redis", None)
+    if redis_client is None:
+        redis_config = dict(config.get("redis") or {})
+        if not redis_config:
+            return None
+        from bigqmt_signal_trader.adapters.redis_common import build_redis_client
+
+        redis_client = build_redis_client(redis_config)
+    market_data = getattr(getattr(_rpc_service, "handlers", None), "market_data", None)
+    if market_data is None:
+        from bigqmt_signal_trader.adapters.market_bigqmt import BigQmtMarketDataProvider
+
+        market_data = BigQmtMarketDataProvider(context_info)
+    try:
+        from bigqmt_signal_trader.download_jobs import pump_download_jobs
+
+        return pump_download_jobs(
+            redis_client,
+            market_data,
+            account_id,
+            chunk_size=int(job_config.get("chunk_size") or 10),
+            max_wall_seconds=float(job_config.get("max_wall_seconds") or 0.5),
+            job_ttl_seconds=int(job_config.get("job_ttl_seconds") or 3600),
+        )
+    except Exception as exc:
+        print("[bigqmt_download_jobs] pump failed: %s" % exc)
+        return None
+
+
 def adjust(ContextInfo):
     global _adjust_logged
     _record_adjust_tick()
     config = _build_config()
     _drain_rpc_service(config)
     _refresh_full_tick_cache(ContextInfo, config)
+    _pump_download_jobs(ContextInfo, config)
     if hasattr(ContextInfo, "is_last_bar") and not ContextInfo.is_last_bar():
         return None
     if not _adjust_logged:
@@ -440,11 +520,45 @@ def handlebar(ContextInfo):
     return adjust(ContextInfo)
 
 
+def _publish_exec_event(kind, obj):
+    """Push a normalized order/trade event to Redis for real-time client callbacks."""
+    config = _build_config()
+    event_config = dict(config.get("exec_events") or {})
+    if not _config_bool(event_config.get("enabled"), True):
+        return
+    account_id = str(event_config.get("account_id") or config.get("account_id") or _account_id or "")
+    if not account_id:
+        return
+    redis_client = getattr(_rpc_service, "redis", None)
+    if redis_client is None:
+        redis_config = dict(config.get("redis") or {})
+        if not redis_config:
+            return
+        from bigqmt_signal_trader.adapters.redis_common import build_redis_client
+
+        redis_client = build_redis_client(redis_config)
+    try:
+        from bigqmt_signal_trader import exec_events
+
+        if kind == "trade":
+            exec_events.publish_trade_event(
+                redis_client, account_id, exec_events.normalize_trade_event(obj, account_id)
+            )
+        else:
+            exec_events.publish_order_event(
+                redis_client, account_id, exec_events.normalize_order_event(obj, account_id)
+            )
+    except Exception as exc:
+        print("[bigqmt_exec_events] publish %s failed: %s" % (kind, exc))
+
+
 def on_order(ContextInfo, order):
+    _publish_exec_event("order", order)
     return forward_order_event(BigQmtRuntimeAdapter.to_order_event(order))
 
 
 def on_trade(ContextInfo, trade):
+    _publish_exec_event("trade", trade)
     return forward_trade_event(BigQmtRuntimeAdapter.to_trade_event(trade))
 
 

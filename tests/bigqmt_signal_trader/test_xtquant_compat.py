@@ -421,6 +421,33 @@ class XtquantCompatTest(unittest.TestCase):
         self.assertEqual(positions[0].can_use_volume, 80)
         self.assertEqual(single.stock_name, "cached")
 
+    def test_client_call_via_transport_builds_valid_request(self):
+        # Regression: the swappable-transport path in BigQmtRpcClient.call() built
+        # request_id with __import__("uuid").uuid.uuid4() (AttributeError), crashing
+        # every non-redis transport on first call. This path had no coverage.
+        captured = {}
+
+        class _FakeTransport:
+            def send_request(self, request, timeout_seconds):
+                captured["request"] = request
+                captured["timeout"] = timeout_seconds
+                return {"ok": True, "data": {"pong": True}}
+
+        client = BigQmtRpcClient(account_id="acct", redis_config={"host": "127.0.0.1"})
+        client.transport_name = "zmq"
+        client._transport_instance = _FakeTransport()
+
+        result = client.call("ping", {"x": 1})
+
+        self.assertEqual(result, {"pong": True})
+        request = captured["request"]
+        self.assertEqual(request["method"], "ping")
+        self.assertEqual(request["account_id"], "acct")
+        self.assertEqual(request["params"], {"x": 1})
+        # request_id must be a real 32-char uuid hex, not a crash.
+        self.assertEqual(len(request["request_id"]), 32)
+        int(request["request_id"], 16)
+
 
 if __name__ == "__main__":
     unittest.main()

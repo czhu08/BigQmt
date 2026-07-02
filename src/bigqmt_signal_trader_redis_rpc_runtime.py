@@ -77,6 +77,22 @@ FULL_TICK_MARKET_REFRESH_INTERVAL_SECONDS = 3.0
 # Wall-clock budget for one refresh round to avoid stalling the strategy thread.
 FULL_TICK_REFRESH_MAX_WALL_SECONDS = 0.3
 FULL_TICK_MAX_REQUESTS = 8
+# Async download jobs: the strategy thread drains one queued job at a time,
+# downloading DOWNLOAD_JOB_CHUNK_SIZE symbols per tick (capped by the wall-clock
+# budget), so a long download never blocks the RPC pump. chunk_size is the
+# smallest per-tick block, so keep it modest if per-symbol downloads are slow.
+# DISABLED by default: the full Big QMT terminal's embedded xtdata SDK has no
+# reachable data service to download through (raises "无法连接行情服务"). Supplement
+# history via the terminal's 数据管理/补充数据 UI, then read it over RPC with
+# get_market_data_ex / get_local_data. Re-enable only where a MiniQMT/xtdata data
+# service is connectable (set download_jobs_enabled=True in the local config).
+DOWNLOAD_JOBS_ENABLED = False
+DOWNLOAD_JOB_CHUNK_SIZE = 10
+DOWNLOAD_JOB_MAX_WALL_SECONDS = 0.5
+DOWNLOAD_JOB_TTL_SECONDS = 3600
+# Push order_callback/deal_callback details to Redis so clients get real-time
+# on_stock_order/on_stock_trade callbacks (MiniQMT style) instead of polling.
+EXEC_EVENTS_ENABLED = True
 
 try:
     from bigqmt_signal_trader_local_config import BIGQMT_ACCOUNT_ID, BIGQMT_REDIS_CONFIG
@@ -117,6 +133,13 @@ FULL_TICK_REFRESH_MAX_WALL_SECONDS = float(
     BIGQMT_REDIS_CONFIG.get("full_tick_refresh_max_wall_seconds", FULL_TICK_REFRESH_MAX_WALL_SECONDS)
 )
 FULL_TICK_MAX_REQUESTS = int(BIGQMT_REDIS_CONFIG.get("full_tick_max_requests", FULL_TICK_MAX_REQUESTS))
+DOWNLOAD_JOBS_ENABLED = bool(BIGQMT_REDIS_CONFIG.get("download_jobs_enabled", DOWNLOAD_JOBS_ENABLED))
+DOWNLOAD_JOB_CHUNK_SIZE = int(BIGQMT_REDIS_CONFIG.get("download_job_chunk_size", DOWNLOAD_JOB_CHUNK_SIZE))
+DOWNLOAD_JOB_MAX_WALL_SECONDS = float(
+    BIGQMT_REDIS_CONFIG.get("download_job_max_wall_seconds", DOWNLOAD_JOB_MAX_WALL_SECONDS)
+)
+DOWNLOAD_JOB_TTL_SECONDS = int(BIGQMT_REDIS_CONFIG.get("download_job_ttl_seconds", DOWNLOAD_JOB_TTL_SECONDS))
+EXEC_EVENTS_ENABLED = bool(BIGQMT_REDIS_CONFIG.get("exec_events_enabled", EXEC_EVENTS_ENABLED))
 
 
 def _apply_config(account_id):
@@ -167,6 +190,17 @@ def _apply_config(account_id):
             "refresh_max_wall_seconds": FULL_TICK_REFRESH_MAX_WALL_SECONDS,
             "max_requests": FULL_TICK_MAX_REQUESTS,
         },
+        download_jobs={
+            "enabled": DOWNLOAD_JOBS_ENABLED,
+            "account_id": account_id,
+            "chunk_size": DOWNLOAD_JOB_CHUNK_SIZE,
+            "max_wall_seconds": DOWNLOAD_JOB_MAX_WALL_SECONDS,
+            "job_ttl_seconds": DOWNLOAD_JOB_TTL_SECONDS,
+        },
+        exec_events={
+            "enabled": EXEC_EVENTS_ENABLED,
+            "account_id": account_id,
+        },
     )
 
 
@@ -175,7 +209,7 @@ def configure_runtime_account(account_id):
 
 
 def configure_runtime_redis(redis_config):
-    global REDIS_HOST, REDIS_PORT, REDIS_DB, REDIS_USERNAME, REDIS_PASSWORD, RPC_ALLOW_ORDER_METHODS, RPC_PROCESS_IN_LISTENER, RPC_BACKGROUND_THREADS, RPC_LISTENER_METHODS, SCHEDULE_ADJUST_ENABLED, SCHEDULE_ADJUST_INTERVAL, FULL_TICK_CACHE_ENABLED, FULL_TICK_DEMAND_TTL_SECONDS, FULL_TICK_CACHE_TTL_SECONDS, FULL_TICK_REFRESH_INTERVAL_SECONDS, FULL_TICK_MARKET_REFRESH_INTERVAL_SECONDS, FULL_TICK_REFRESH_MAX_WALL_SECONDS, FULL_TICK_MAX_REQUESTS, RPC_TRANSPORT, RPC_ZMQ_CONFIG, RPC_MYSQL_CONFIG
+    global REDIS_HOST, REDIS_PORT, REDIS_DB, REDIS_USERNAME, REDIS_PASSWORD, RPC_ALLOW_ORDER_METHODS, RPC_PROCESS_IN_LISTENER, RPC_BACKGROUND_THREADS, RPC_LISTENER_METHODS, SCHEDULE_ADJUST_ENABLED, SCHEDULE_ADJUST_INTERVAL, FULL_TICK_CACHE_ENABLED, FULL_TICK_DEMAND_TTL_SECONDS, FULL_TICK_CACHE_TTL_SECONDS, FULL_TICK_REFRESH_INTERVAL_SECONDS, FULL_TICK_MARKET_REFRESH_INTERVAL_SECONDS, FULL_TICK_REFRESH_MAX_WALL_SECONDS, FULL_TICK_MAX_REQUESTS, RPC_TRANSPORT, RPC_ZMQ_CONFIG, RPC_MYSQL_CONFIG, DOWNLOAD_JOBS_ENABLED, DOWNLOAD_JOB_CHUNK_SIZE, DOWNLOAD_JOB_MAX_WALL_SECONDS, DOWNLOAD_JOB_TTL_SECONDS, EXEC_EVENTS_ENABLED
     redis_config = dict(redis_config or {})
     REDIS_HOST = redis_config.get("host", REDIS_HOST)
     REDIS_PORT = int(redis_config.get("port", REDIS_PORT))
@@ -191,6 +225,13 @@ def configure_runtime_redis(redis_config):
     RPC_TRANSPORT = str(redis_config.get("transport", RPC_TRANSPORT)).lower()
     RPC_ZMQ_CONFIG = dict(redis_config.get("zmq", RPC_ZMQ_CONFIG))
     RPC_MYSQL_CONFIG = dict(redis_config.get("mysql", RPC_MYSQL_CONFIG))
+    # schedule_adjust must stay ON for ALL transports — including zmq.
+    # run_time("adjust", interval) is what THROTTLES QMT's strategy callback: with
+    # it, adjust fires on the configured cadence (e.g. 500ms); WITHOUT it QMT calls
+    # adjust in a hot loop (~2500/s) that pegs the GIL and starves the zmq ROUTER
+    # background thread (RPC then times out entirely). It also sets the GIL-release
+    # rhythm the background transport threads rely on. So keep the original rule:
+    # honor an explicit value, default on, and force on when not background-threaded.
     SCHEDULE_ADJUST_ENABLED = bool(redis_config.get("schedule_adjust", SCHEDULE_ADJUST_ENABLED))
     if not RPC_BACKGROUND_THREADS:
         SCHEDULE_ADJUST_ENABLED = True
@@ -210,6 +251,13 @@ def configure_runtime_redis(redis_config):
         redis_config.get("full_tick_refresh_max_wall_seconds", FULL_TICK_REFRESH_MAX_WALL_SECONDS)
     )
     FULL_TICK_MAX_REQUESTS = int(redis_config.get("full_tick_max_requests", FULL_TICK_MAX_REQUESTS))
+    DOWNLOAD_JOBS_ENABLED = bool(redis_config.get("download_jobs_enabled", DOWNLOAD_JOBS_ENABLED))
+    DOWNLOAD_JOB_CHUNK_SIZE = int(redis_config.get("download_job_chunk_size", DOWNLOAD_JOB_CHUNK_SIZE))
+    DOWNLOAD_JOB_MAX_WALL_SECONDS = float(
+        redis_config.get("download_job_max_wall_seconds", DOWNLOAD_JOB_MAX_WALL_SECONDS)
+    )
+    DOWNLOAD_JOB_TTL_SECONDS = int(redis_config.get("download_job_ttl_seconds", DOWNLOAD_JOB_TTL_SECONDS))
+    EXEC_EVENTS_ENABLED = bool(redis_config.get("exec_events_enabled", EXEC_EVENTS_ENABLED))
     _apply_config(ACCOUNT_ID)
 
 
