@@ -1,3 +1,5 @@
+#coding=utf-8
+
 from bigqmt_signal_trader.xtquant_compat import (
     FIX_PRICE,
     LATEST_PRICE,
@@ -20,3 +22,20 @@ from bigqmt_signal_trader.xtquant_compat import (
     STOCK_SELL,
     SZ_MARKET,
 )
+
+
+"""
+常量定义模块
+"""
+
+
+"""
+账号类型
+"""
+# 期货
+FUTURE_ACCOUNT = 1
+# 股票
+# SECURITY_ACCOUNT = 2
+SECURITY_ACCOUNT = "STOCK"
+# 信用
+CREDIT_ACCOUNT = 3
