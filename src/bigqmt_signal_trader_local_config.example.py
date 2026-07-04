@@ -11,20 +11,27 @@ Do not commit the real file. It may contain account ids and Redis credentials.
 BIGQMT_ACCOUNT_ID = "YOUR_ACCOUNT_ID"
 
 BIGQMT_REDIS_CONFIG = {
-    "host": "127.0.0.1",
-    "port": 6379,
-    "db": 5,
-    "username": "",
-    "password": "",
+    # "host": "127.0.0.1",
+    # "port": 6379,
+    # "db": 5,
+    # "username": "",
+    # "password": "",
+    "transport": "zmq",
+    "rpc_background_threads": True,        # 必须！
+    "zmq": {
+        "host": "127.0.0.1",              # 默认端口从 account_id 派生
+        # "port": 5560,                   # 可显式指定
+        # 端口冲突时自动找空闲端口 + 通过 Redis 服务发现告知客户端
+    },    
     # Keep order RPC disabled unless you explicitly want remote order/cancel.
-    "rpc_allow_order_methods": False,
+    "rpc_allow_order_methods": True,
     # Big QMT may freeze custom daemon threads after init and its bundled Redis
     # client rejects raw stock-code JSON read from Redis. The default production
     # path therefore uses an encoded Redis list queue and drains it from QMT's
     # official run_time("adjust", ...) callback.
     "rpc_process_in_listener": True,
     "rpc_listener_methods": ("*",),
-    "rpc_background_threads": False,
+    # "rpc_background_threads": False,
     "schedule_adjust": True,
     "schedule_adjust_interval": "500nMilliSecond",
     # The default mode calls get_full_tick through RPC. Enable this cache only

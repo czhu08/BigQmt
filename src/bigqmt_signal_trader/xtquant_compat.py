@@ -11,7 +11,6 @@ import time
 import uuid
 import threading
 import importlib
-from typing import Any, Dict, Iterable, List, Optional
 
 from .full_tick_cache import request_full_tick_cache, wait_full_tick_cache
 from .local_cache import LocalMarketCache
