@@ -34,13 +34,14 @@ def build_redis_client(config=None):
     db = int(config.get("db") or os.environ.get("BIGQMT_REDIS_DB") or 5)
     username = config.get("username") or os.environ.get("BIGQMT_REDIS_USERNAME") or None
     password = config.get("password") or os.environ.get("BIGQMT_REDIS_PASSWORD") or None
+    # protocal = int(config.get("protocol") or os.environ.get("BIGQMT_REDIS_PROTOCOL") or 2)
     return redis.Redis(
         host=host,
         port=port,
         db=db,
         username=username,
         password=password,
-        protocol=int(config.get("protocol") or 2),
+        # protocol=protocal,
         socket_connect_timeout=_float_or_none(config.get("socket_connect_timeout", 1.5), 1.5),
         socket_timeout=_float_or_none(config.get("socket_timeout", 1.5), 1.5),
         health_check_interval=int(config.get("health_check_interval", 30)),
