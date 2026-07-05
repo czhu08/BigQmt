@@ -284,12 +284,16 @@ class BigQmtRpcClient:
             or ""
         )
         self.redis_client = redis_client
+        protocol_value = merged_redis_config.get("protocol")
+        if protocol_value in (None, ""):
+            protocol_value = os.environ.get("BIGQMT_REDIS_PROTOCOL", "2")
         self.redis_config = {
             "host": merged_redis_config.get("host") or os.environ.get("BIGQMT_REDIS_HOST", "127.0.0.1"),
             "port": int(merged_redis_config.get("port") or _env_int("BIGQMT_REDIS_PORT", 6379)),
             "db": int(merged_redis_config.get("db") or _env_int("BIGQMT_REDIS_DB", 5)),
             "username": merged_redis_config.get("username", os.environ.get("BIGQMT_REDIS_USERNAME") or ""),
             "password": merged_redis_config.get("password", os.environ.get("BIGQMT_REDIS_PASSWORD") or ""),
+            "protocol": int(protocol_value or 2),
         }
         config_timeout = client_config.get("timeout_seconds")
         self.timeout_seconds = float(

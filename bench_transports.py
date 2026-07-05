@@ -31,6 +31,7 @@ def _load_redis_config():
         rc.setdefault("host", os.environ.get("BIGQMT_REDIS_HOST", "127.0.0.1"))
         rc.setdefault("port", int(os.environ.get("BIGQMT_REDIS_PORT", "6379")))
         rc.setdefault("db", int(os.environ.get("BIGQMT_REDIS_DB", "5")))
+        rc.setdefault("protocol", int(os.environ.get("BIGQMT_REDIS_PROTOCOL", "2")))
         return {
             "host": rc.get("host"),
             "port": int(rc.get("port")),
@@ -38,6 +39,7 @@ def _load_redis_config():
             "username": rc.get("username") or None,
             "password": rc.get("password") or None,
             "socket_timeout": 8,
+            "protocol": int(rc.get("protocol")),
         }, cfg.get("account_id", "")
     except Exception:
         return {
@@ -45,6 +47,7 @@ def _load_redis_config():
             "port": int(os.environ.get("BIGQMT_REDIS_PORT", "6379")),
             "db": int(os.environ.get("BIGQMT_REDIS_DB", "5")),
             "socket_timeout": 8,
+            "protocol": int(os.environ.get("BIGQMT_REDIS_PROTOCOL", "2")),
         }, cfg.get("account_id", "")
 
 

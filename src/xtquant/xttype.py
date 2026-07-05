@@ -1,4 +1,4 @@
-from bigqmt_signal_trader.xtquant_compat import StockAccount
+from bigqmt_signal_trader.xtquant_compat import CompatObject, StockAccount
 
 __all__ = ["StockAccount"]
 
@@ -11,7 +11,7 @@ from . import xtconstant as _XTCONST_
 """
 
 
-class XtAsset(object):
+class XtAsset(CompatObject):
     """
     迅投股票账号资金结构
     """
@@ -33,7 +33,7 @@ class XtAsset(object):
         self.fetch_balance = fetch_balance
 
 
-class XtOrder(object):
+class XtOrder(CompatObject):
     """
     迅投股票委托结构
     """
@@ -85,7 +85,7 @@ class XtOrder(object):
         self.instrument_name = instrument_name
 
 
-class XtTrade(object):
+class XtTrade(CompatObject):
     """
     迅投股票成交结构
     """
@@ -132,7 +132,7 @@ class XtTrade(object):
         self.instrument_name = instrument_name
 
 
-class XtPosition(object):
+class XtPosition(CompatObject):
     """
     迅投股票持仓结构
     """
@@ -175,7 +175,7 @@ class XtPosition(object):
         self.instrument_name = instrument_name
 
 
-class XtOrderError(object):
+class XtOrderError(CompatObject):
     """
     迅投股票委托失败结构
     """
@@ -199,7 +199,7 @@ class XtOrderError(object):
         self.order_remark = order_remark
 
 
-class XtCancelError(object):
+class XtCancelError(CompatObject):
     """
     迅投股票委托撤单失败结构
     """
@@ -222,7 +222,7 @@ class XtCancelError(object):
         self.error_msg = error_msg
 
 
-class XtOrderResponse(object):
+class XtOrderResponse(CompatObject):
     """
     迅投异步下单接口对应的委托反馈
     """
@@ -242,7 +242,7 @@ class XtOrderResponse(object):
         self.error_msg = error_msg
         self.seq = seq
 
-class XtCancelOrderResponse(object):
+class XtCancelOrderResponse(CompatObject):
     """
     迅投异步委托撤单请求返回结构
     """

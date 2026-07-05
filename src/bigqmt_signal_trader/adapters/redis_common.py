@@ -40,6 +40,7 @@ def build_redis_client(config=None):
         db=db,
         username=username,
         password=password,
+        protocol=int(config.get("protocol") or 2),
         socket_connect_timeout=_float_or_none(config.get("socket_connect_timeout", 1.5), 1.5),
         socket_timeout=_float_or_none(config.get("socket_timeout", 1.5), 1.5),
         health_check_interval=int(config.get("health_check_interval", 30)),
