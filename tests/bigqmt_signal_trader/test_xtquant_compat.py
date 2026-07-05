@@ -106,6 +106,8 @@ class FakeRpcClient:
             return {"InstrumentStatus": 0, "code": params.get("code")}
         if method == "get_market_data_ex":
             return {"600000.SH": {"close": [10.0]}}
+        if method == "download_sector_data":
+            return {"status": "ok", "sectors": ["医药", "金融"]}
         if method == "ping":
             return {"pong": True}
         raise AssertionError("unexpected method: %s" % method)
@@ -269,6 +271,17 @@ class XtquantCompatTest(unittest.TestCase):
         self.assertEqual(detail["InstrumentStatus"], 0)
         self.assertEqual(sector_codes, ["000001.SZ", "300001.SZ", "600000.SH"])
         self.assertEqual(market_data["600000.SH"]["close"], [10.0])
+
+    def test_xtdata_download_sector_data_routes_to_market_adapter(self):
+        xtdata = self._xtdata()
+        provider = types.SimpleNamespace(download_sector_data=lambda: {"status": "ok", "sectors": ["医药", "金融"]})
+        xtdata.client._market_data_provider = provider
+
+        result = xtdata.download_sector_data()
+
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(result["sectors"], ["医药", "金融"])
+        self.assertEqual([call[0] for call in xtdata.client.calls if call[0] == "download_sector_data"], [])
 
     def test_xtdata_full_tick_reads_redis_cache_and_renews_demand(self):
         xtdata = self._xtdata()

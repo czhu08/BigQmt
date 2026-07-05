@@ -147,3 +147,6 @@ def get_formula_result(request_id, start_time="", end_time="", count=-1, timeout
 
 def gen_factor_index(data_name, formula_name, vars, sector_list, start_time="", end_time="", period="1d", dividend_type="none"):
     return _compat.xtdata.gen_factor_index(data_name, formula_name, vars, sector_list, start_time, end_time, period, dividend_type)
+
+
+download_sector_data = _compat.xtdata.download_sector_data

@@ -12,18 +12,18 @@ BIGQMT_ACCOUNT_ID = "YOUR_ACCOUNT_ID"
 BIGQMT_RPC_TIMEOUT_SECONDS = 6.0
 
 BIGQMT_REDIS_CONFIG = {
-    # "host": "YOUR_REDIS_HOST",
-    # "port": 6379,
-    # "db": 5,
-    # "username": "",
-    # "password": "",
-    "transport": "zmq",
-    "rpc_background_threads": True,        # 必须！
-    "zmq": {
-        "host": "127.0.0.1",              # 默认端口从 account_id 派生
-        # "port": 5560,                   # 可显式指定
-        # 端口冲突时自动找空闲端口 + 通过 Redis 服务发现告知客户端
-    },    
+    "host": "127.0.0.1",
+    "port": 6379,
+    "db": 5,
+    "username": "",
+    "password": "",
+    # "transport": "zmq",
+    # "rpc_background_threads": True,        # 必须！
+    # "zmq": {
+    #     "host": "127.0.0.1",              # 默认端口从 account_id 派生
+    #     # "port": 5560,                   # 可显式指定
+    #     # 端口冲突时自动找空闲端口 + 通过 Redis 服务发现告知客户端
+    # },
 }
 
 # Default direct mode calls get_full_tick through RPC. Set enabled=True only when

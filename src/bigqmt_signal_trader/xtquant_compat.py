@@ -363,6 +363,7 @@ class BigQmtRpcClient:
             or "redis"
         ).lower()
         self._transport_instance = None  # lazily built by _transport()
+        self._market_data_provider = None
 
     def _redis(self):
         if self.redis_client is None:
@@ -854,6 +855,15 @@ class BigQmtXtData:
 
     def get_sector_list(self):
         return self._call("get_sector_list")
+
+    def download_sector_data(self):
+        provider = getattr(self.client, "_market_data_provider", None)
+        if provider is not None and hasattr(provider, "download_sector_data"):
+            try:
+                return provider.download_sector_data()
+            except Exception:
+                pass
+        return self._call("download_sector_data")
 
     def get_sector_info(self, sector_name=""):
         return self._call("get_sector_info", sector_name=sector_name)
