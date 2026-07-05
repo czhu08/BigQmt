@@ -32,18 +32,18 @@ def _load_redis_config():
             "username": rc.get("username") or None,
             "password": rc.get("password") or None,
             "socket_timeout": 8,
-        }
+        }, cfg.get("account_id", "")
     except Exception:
         return {
             "host": os.environ.get("BIGQMT_REDIS_HOST", "127.0.0.1"),
             "port": int(os.environ.get("BIGQMT_REDIS_PORT", "6379")),
             "db": int(os.environ.get("BIGQMT_REDIS_DB", "5")),
             "socket_timeout": 8,
-        }
+        }, cfg.get("account_id", "")
 
 
-ACCOUNT = os.environ.get("BIGQMT_ACCOUNT_ID", "")
-REDIS = _load_redis_config()
+# ACCOUNT = os.environ.get("BIGQMT_ACCOUNT_ID", "")
+REDIS, ACCOUNT = _load_redis_config()
 
 
 def bench(r, method, params, n=20, timeout=6):

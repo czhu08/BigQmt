@@ -45,7 +45,7 @@ def _load_redis_config():
             "port": int(os.environ.get("BIGQMT_REDIS_PORT", "6379")),
             "db": int(os.environ.get("BIGQMT_REDIS_DB", "5")),
             "socket_timeout": 8,
-        }
+        }, cfg.get("account_id", "")
 
 
 REDIS, ACCOUNT = _load_redis_config()
