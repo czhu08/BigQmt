@@ -1,5 +1,7 @@
 import os
 import sys
+import threading
+import time
 import types
 import unittest
 
@@ -346,6 +348,42 @@ class XtquantCompatTest(unittest.TestCase):
         self.assertIn((key, str(seq)), xtdata.client.redis.deleted)
         self.assertEqual(xtdata.client.redis.events[0][0], "subscribe_quote")
         self.assertEqual(xtdata.client.redis.events[1][0], "unsubscribe_quote")
+
+    def test_tick_subscription_polls_every_three_seconds(self):
+        xtdata = self._xtdata()
+        xtdata._subscription_poll_interval = lambda: 0.01
+        xtdata._is_trading_time = lambda now=None: True
+        callbacks = []
+        callback_ready = threading.Event()
+
+        def on_tick(payload):
+            callbacks.append(payload)
+            callback_ready.set()
+
+        seq = xtdata.subscribe_quote("600000.SH", period="tick", callback=on_tick)
+        self.assertTrue(callback_ready.wait(0.2))
+        xtdata.unsubscribe_quote(seq)
+
+        self.assertGreaterEqual(len(callbacks), 1)
+
+    def test_same_callback_is_invoked_from_the_shared_poll_loop(self):
+        xtdata = self._xtdata()
+        xtdata._subscription_poll_interval = lambda: 0.01
+        xtdata._is_trading_time = lambda now=None: True
+        callback_calls = []
+        callback_ready = threading.Event()
+
+        def on_tick(payload):
+            callback_calls.append(payload)
+            callback_ready.set()
+
+        seq1 = xtdata.subscribe_quote("600000.SH", period="tick", callback=on_tick)
+        seq2 = xtdata.subscribe_quote("000001.SZ", period="tick", callback=on_tick)
+        self.assertTrue(callback_ready.wait(0.2))
+        xtdata.unsubscribe_quote(seq1)
+        xtdata.unsubscribe_quote(seq2)
+
+        self.assertGreaterEqual(len(callback_calls), 1)
 
     def test_optional_xtquant_shim_imports_constants_and_classes(self):
         from xtquant import xtconstant

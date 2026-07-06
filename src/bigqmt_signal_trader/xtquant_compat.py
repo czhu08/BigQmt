@@ -480,6 +480,10 @@ class BigQmtXtData:
         self.client = client
         self._subscribe_seq = int(time.time() * 1000)
         self._cache_obj = None
+        self._subscription_thread = None
+        self._subscription_stop_event = None
+        self._subscription_codes = []
+        self._subscription_lock = threading.Lock()
 
     def _next_seq(self):
         self._subscribe_seq += 1
@@ -492,6 +496,89 @@ class BigQmtXtData:
         if self._cache_obj is None:
             self._cache_obj = LocalMarketCache(cache_dir=cfg.get("dir"), fmt=cfg.get("format", "auto"))
         return self._cache_obj
+
+    @staticmethod
+    def _is_trading_time(now=None):
+        current = now or time.localtime()
+        hour = current.tm_hour
+        minute = current.tm_min
+        if hour == 9:
+            return minute >= 30
+        if hour == 11:
+            return minute < 30
+        if 13 <= hour < 15 or hour == 10:
+            return True
+        return False
+
+    def _subscription_poll_interval(self):
+        return 3.0
+
+    def _start_subscription_loop(self, callback=None):
+        if self._subscription_thread is not None and self._subscription_thread.is_alive():
+            return
+        self._subscription_stop_event = threading.Event()
+
+        def runner():
+            try:
+                while not self._subscription_stop_event.is_set():
+                    time.sleep(self._subscription_poll_interval())
+                    if self._subscription_stop_event.is_set():
+                        break
+                    if not self._is_trading_time():
+                        continue
+                    with self._subscription_lock:
+                        codes = [code for code in self._subscription_codes if str(code or "").strip()]
+                    if not codes:
+                        continue
+                    try:
+                        payload = self.get_full_tick(codes)
+                    except Exception:
+                        continue
+                    if callback is not None:
+                        try:
+                            callback(payload)
+                        except Exception:
+                            pass
+            finally:
+                self._subscription_thread = None
+                self._subscription_stop_event = None
+
+        self._subscription_thread = threading.Thread(target=runner, name="bigqmt-quote-subscription", daemon=True)
+        self._subscription_thread.start()
+
+    def _stop_subscription_loop(self):
+        stop_event = self._subscription_stop_event
+        if stop_event is not None:
+            stop_event.set()
+        thread = self._subscription_thread
+        if thread is not None and thread.is_alive():
+            thread.join(0.2)
+        self._subscription_thread = None
+        self._subscription_stop_event = None
+
+    def _register_subscription(self, stock_code, callback):
+        if not stock_code:
+            return
+        with self._subscription_lock:
+            code_text = str(stock_code).strip()
+            if code_text not in self._subscription_codes:
+                self._subscription_codes.append(code_text)
+        self._start_subscription_loop(callback)
+
+    def _unregister_subscription(self, stock_code, callback=None):
+        if not stock_code:
+            return
+        with self._subscription_lock:
+            code_text = str(stock_code).strip()
+            if code_text in self._subscription_codes:
+                self._subscription_codes.remove(code_text)
+            if not self._subscription_codes:
+                self._stop_subscription_loop()
+
+    def _snapshot_for_subscription(self, stock_code):
+        if not stock_code:
+            return {}
+        return self.get_full_tick([stock_code])
 
     def _call(self, method, **params):
         return self.client.call(method, params)
@@ -700,11 +787,13 @@ class BigQmtXtData:
         }
         self.client.save_quote_subscription(seq, payload, active=True)
         self.client.publish_event("subscribe_quote", payload)
+
         if callback is not None:
             try:
                 if str(period).lower() in ("tick", "full_tick"):
                     callback(self.get_full_tick([stock_code]))
-                else:
+                    self._register_subscription(stock_code, callback)
+                else:  # history K data
                     callback(
                         self.get_market_data_ex(
                             stock_list=[stock_code],
@@ -716,6 +805,7 @@ class BigQmtXtData:
                     )
             except Exception:
                 pass
+            
         return seq
 
     def subscribe_quote2(self, stock_code, period="1d", start_time="", end_time="", count=0, dividend_type=None, callback=None):
