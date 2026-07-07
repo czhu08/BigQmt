@@ -420,7 +420,7 @@ class BigQmtRpcHandlers:
             raise RuntimeError("order_gateway is not configured")
         orders = self.order_gateway.query_orders(
             self._request_account_id(params),
-            str(params.get("strategy_name") or "bigqmt_signal_trader"),
+            str(params.get("strategy_name")),
         )
         if _bool_value(params.get("cancelable_only"), False):
             return [
@@ -435,7 +435,7 @@ class BigQmtRpcHandlers:
             raise RuntimeError("order_gateway is not configured")
         return self.order_gateway.query_trades(
             self._request_account_id(params),
-            str(params.get("strategy_name") or "bigqmt_signal_trader"),
+            str(params.get("strategy_name")),
         )
 
     def _handle_sync_positions(self, params):

@@ -466,11 +466,11 @@ def _record_adjust_tick():
     stats["min"] = delta if stats["min"] <= 0 else min(stats["min"], delta)
     stats["max"] = max(stats["max"], delta)
     if now - stats["window_start"] >= 10.0 and stats["count"] > 0:
-        avg = stats["sum"] / stats["count"]
-        print(
-            "[bigqmt_signal_trader] adjust cadence: ticks=%d avg=%.3fs min=%.3fs max=%.3fs over %.0fs"
-            % (stats["count"], avg, stats["min"], stats["max"], now - stats["window_start"])
-        )
+        # avg = stats["sum"] / stats["count"]
+        # print(
+        #     "[bigqmt_signal_trader] adjust cadence: ticks=%d avg=%.3fs min=%.3fs max=%.3fs over %.0fs"
+        #     % (stats["count"], avg, stats["min"], stats["max"], now - stats["window_start"])
+        # )
         stats.update({"count": 0, "sum": 0.0, "min": 0.0, "max": 0.0, "window_start": now})
 
 
@@ -494,13 +494,14 @@ def _gil_probe_loop():
         if now - window_start >= 10.0:
             if gaps:
                 gaps.sort()
-                print(
-                    "[gil_probe] over %.0fs: %d stalls>%.0fms  max=%.0fms p50=%.0fms total=%.0fms"
-                    % (now - window_start, len(gaps), _LATENCY_PROBE_THRESHOLD_MS,
-                       gaps[-1], gaps[len(gaps) // 2], sum(gaps))
-                )
+                # print(
+                #     "[gil_probe] over %.0fs: %d stalls>%.0fms  max=%.0fms p50=%.0fms total=%.0fms"
+                #     % (now - window_start, len(gaps), _LATENCY_PROBE_THRESHOLD_MS,
+                #        gaps[-1], gaps[len(gaps) // 2], sum(gaps))
+                # )
             else:
-                print("[gil_probe] over %.0fs: 0 stalls>%.0fms (clean)" % (now - window_start, _LATENCY_PROBE_THRESHOLD_MS))
+                # print("[gil_probe] over %.0fs: 0 stalls>%.0fms (clean)" % (now - window_start, _LATENCY_PROBE_THRESHOLD_MS))
+                pass
             window_start = now
             gaps = []
 

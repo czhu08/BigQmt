@@ -1474,7 +1474,7 @@ class BigQmtXtTrader:
             for item in [data]
         ][0]
 
-    def query_stock_orders(self, account, cancelable_only=False, strategy_name="bigqmt_signal_trader"):
+    def query_stock_orders(self, account, cancelable_only=False, strategy_name=""):
         account_id = _account_id(account, self.client.account_id)
         data = self.client.call(
             "query_stock_orders",
@@ -1494,7 +1494,7 @@ class BigQmtXtTrader:
                 return order
         return None
 
-    def query_stock_trades(self, account, strategy_name="bigqmt_signal_trader"):
+    def query_stock_trades(self, account, strategy_name=""):
         account_id = _account_id(account, self.client.account_id)
         data = self.client.call(
             "query_stock_trades",
@@ -1725,10 +1725,10 @@ class BigQmtXtTrader:
             order_type=order_type,
             order_sysid=order_sysid,
             order_id=order_sysid,
-            trade_id=trade_id,
+            traded_id=trade_id,
             traded_volume=_safe_int(item.get("volume", item.get("traded_volume"))),
             traded_price=_safe_float(item.get("price", item.get("traded_price"))),
-            traded_at=str(item.get("traded_at") or ""),
+            traded_time=str(item.get("traded_at") or ""),
         )
 
 

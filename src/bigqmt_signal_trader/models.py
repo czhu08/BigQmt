@@ -143,7 +143,7 @@ class TradeSignal:
             percentage=percentage,
             price_type=str(payload.get("price_type") or "AUTO_LIMIT").upper(),
             price=_optional_float(payload.get("price")),
-            strategy_name=str(payload.get("strategy_name") or "bigqmt_signal_trader"),
+            strategy_name=str(payload.get("strategy_name")),
             remark=str(payload.get("remark") or ""),
             source=str(payload.get("source") or ""),
             source_type=str(payload.get("source_type") or "auto"),
