@@ -334,34 +334,57 @@ print(response)
 
 ## 延迟模式
 
-默认实盘模式下，客户端把安全编码后的请求写入 Redis list queue；大 QMT 侧通过 `run_time("adjust", ...)` 高频调度 drain 队列，并在 QMT 官方回调线程里同步调用 handler 和写回 Redis 响应。实测 500ms 调度下，连续请求通常会被同一轮 drain 批量处理，ping/持仓/get_full_tick 多数在十几毫秒返回，最坏会碰到一次调度边界。
+### 两档处理模型(重要)
 
-当前推荐配置：
+同一进程只有一个 GIL,方法按处理线程分两档:
 
-```python
-BIGQMT_REDIS_CONFIG = {
-    "rpc_process_in_listener": True,
-    "rpc_background_threads": False,
-    "schedule_adjust": True,
-    "schedule_adjust_interval": "500nMilliSecond",
-}
-```
+- **inline 档(后台接收线程直接处理)**:`ping`、行情类(`get_full_tick`/`get_market_data_ex`/
+  `get_instrument_detail`)、`query_stock_asset`。中位数**亚毫秒**,但会撞上大 QMT 终端占 GIL
+  的尾延迟(见下)。
+- **deferred 档(推迟到主策略线程,经 adjust drain)**:所有走 `get_trade_detail_data` 的**交易
+  查询**——持仓/委托/成交、信用/账户明细,以及下单/撤单。**原因**:`get_trade_detail_data` 在后台
+  线程上返回空(账户实有持仓也查出 0),必须在 QMT 主线程上下文里跑。这些方法登记在
+  `LISTENER_DEFERRED_METHODS`,由 `run_time("adjust", interval)` 每拍 `drain_pending()` 在主
+  线程执行。(`get_asset` 例外,走另一个 QMT 调用,后台线程即可,保持 inline 低延迟。)
 
-不推荐在大 QMT 中启用自建后台线程。实测部分版本会冻结 daemon thread，且内置 Redis 客户端读取包含股票代码的原始 JSON 会触发 `Sensitive Data Detected`；本仓库客户端 helper 已默认对请求做安全编码。
+> `adjust` 不是 QMT 内置回调。QMT 只自动调 `init`/`handlebar`;`handlebar` 里 `return
+> adjust(...)`,加上我们 `run_time("adjust", interval)` 注册的定时器,构成 RPC 队列的 drain 节奏。
 
-### 当前真机延迟
+### 尾延迟 = 大 QMT 终端占 GIL(不是本代码)
 
-最近一次大 QMT 真机测试，`schedule_adjust_interval="500nMilliSecond"`：
+`gil_probe` 探针显示进程周期性被卡 ~490ms,但 `adjust_phase` 每段都 <50ms —— 即**尾延迟来自
+QMT 终端自身的 C++ 主循环占着 GIL**,`setswitchinterval`/精简 adjust 都 preempt 不了。唯一根治
+是把 serving 挪出该进程(sidecar 独立 GIL,见 `shm_transport.py` 预留)。
 
-| 接口 | 成功率 | 平均 | P50 | P90 | 最大 |
-|---|---:|---:|---:|---:|---:|
-| `ping` | 30/30 | 20.2ms | 13.3ms | 13.9ms | 226.4ms |
-| `query_stock_asset` | 10/10 | 37.2ms | 15.0ms | 16.1ms | 237.2ms |
-| `query_stock_positions` | 10/10 | 13.4ms | 13.2ms | 14.5ms | 14.5ms |
-| `get_full_tick(["000001.SZ"])` | 20/20 | 24.9ms | 13.6ms | 14.8ms | 239.4ms |
-| `get_full_tick` 三只票 | 10/10 | 37.5ms | 17.2ms | 18.4ms | 225.2ms |
+### schedule_adjust_interval 调这个数压尾延迟
 
-结论：常态请求多在 12-18ms；偶发 200ms+ 主要来自 500ms 调度边界。队列测试后无残留，QMT 日志无新增 DataError/Traceback。
+`run_time` 间隔 = 后台线程拿到主线程 GIL 窗口的节奏源;间隔越小,inline 尾越低:
+
+| interval | adjust 频率 | inline 尾(p90/max) | CPU | 说明 |
+|---|---|---|---|---|
+| `500nMilliSecond` | ~2.4/s | ~490 / 510ms | 极低 | 默认省电 |
+| `200nMilliSecond` | 折中 | ~200ms 量级 | 中 | **推荐平衡点** |
+| `100nMilliSecond` | ~2150/s(QMT 当"尽快跑"热循环) | ~92 / 108ms | 烧≈1 核 | 尾最低但费 CPU |
+
+**deferred 交易查询恒定 ~1s**(实测 p50 1012~1013ms,与 interval 无关)—— 瓶颈是
+`get_trade_detail_data` 自身的柜台查询开销,调 interval 无效。要低延迟拿持仓,走**客户端 redis
+缓存**(position_sync 已在写)而非每次实时查。
+
+### zmq 真机实测(同机 localhost)
+
+- inline:`ping` p50 **0.4-0.5ms**;`get_market_data_ex` 因 handler 较重几乎必吃满一个尾窗口
+  (500ms 档 p50≈495ms,100ms 档 p50≈96ms)。
+- deferred:持仓/委托/成交 p50 **~1s**。
+- 下单/撤单已在**实盘**验证:`order_stock` 挂单(status=50 已报)→ `query_stock_orders` 拿到
+  sysid → `cancel_order_stock` 成功、无残留。
+
+### 传输与后台线程
+
+- **redis**(默认,跨机):`rpc_process_in_listener=True`。
+- **zmq**(同机低延迟):只加 `transport="zmq"` 一行;非 redis 传输 `_build_rpc_service` 会自动开
+  `background_threads`,端口按账号派生 `tcp://127.0.0.1:1556x`。
+- 内置 Redis 客户端读取含股票代码的原始 JSON 会触发 `Sensitive Data Detected`;客户端 helper 默认
+  对请求做安全编码。
 
 ## 安全约束
 

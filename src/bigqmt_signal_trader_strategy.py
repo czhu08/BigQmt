@@ -7,7 +7,24 @@ header. Business logic stays in the importable package.
 """
 
 import datetime
+import importlib as _importlib
+import sys
+import threading
 import time
+
+# The DRYRUN entry reloads strategy/runtime/redis_rpc/redis_common but NOT the
+# other package submodules. Without this, the "from adapter_factory import build_app"
+# below re-binds the STALE cached module on every strategy re-run, so edits to
+# adapter_factory never take effect until a full terminal restart. Force-reload it
+# (only it -- reloading the adapter classes would break isinstance elsewhere) so a
+# plain strategy re-run picks up build_app fixes. build_app imports the adapter
+# classes lazily, so their identity is preserved.
+_af_mod = sys.modules.get("bigqmt_signal_trader.adapter_factory")
+if _af_mod is not None:
+    try:
+        _importlib.reload(_af_mod)
+    except Exception as _reload_err:
+        print("[bigqmt_signal_trader] reload adapter_factory failed: %s" % _reload_err)
 
 from bigqmt_signal_trader.adapter_factory import build_app as _default_build_app
 from bigqmt_signal_trader.runner import (
@@ -28,6 +45,15 @@ _qmt_api = {}
 _adjust_logged = False
 _rpc_service = None
 _scheduled_adjust = False
+# Latency tuning / diagnostics (server side, in the Big QMT process).
+#  - switch interval: hand the GIL to the background RPC thread ~5x more often
+#    than the 5ms default so it is not starved as long during Python contention.
+#  - GIL probe: a heartbeat thread that measures how long the interpreter was
+#    unable to run it (i.e. the process was stalled), independent of any request.
+_GIL_SWITCH_INTERVAL = 0.001
+_LATENCY_PROBE_ENABLED = True
+_LATENCY_PROBE_THRESHOLD_MS = 50.0
+_latency_probe_started = False
 _last_full_tick_refresh_at = 0.0
 _last_full_tick_market_refresh_at = 0.0
 # Observed adjust cadence, so a mis-scheduled run_time (e.g. clamped to bar
@@ -448,12 +474,63 @@ def _record_adjust_tick():
         stats.update({"count": 0, "sum": 0.0, "min": 0.0, "max": 0.0, "window_start": now})
 
 
+def _gil_probe_loop():
+    """Heartbeat: sleep 5ms in a loop and measure the ACTUAL elapsed time. sleep()
+    releases the GIL; if returning from it takes much longer than 5ms, the thread
+    was starved -- i.e. the interpreter (this whole process) was stalled holding
+    the GIL elsewhere. Summarize gaps over a 10s window so we can see how often /
+    how long the process freezes, independent of any RPC request."""
+    step = 0.005
+    threshold = _LATENCY_PROBE_THRESHOLD_MS / 1000.0
+    window_start = time.time()
+    gaps = []
+    while True:
+        t0 = time.time()
+        time.sleep(step)
+        gap = time.time() - t0 - step
+        if gap > threshold:
+            gaps.append(gap * 1000.0)
+        now = time.time()
+        if now - window_start >= 10.0:
+            if gaps:
+                gaps.sort()
+                print(
+                    "[gil_probe] over %.0fs: %d stalls>%.0fms  max=%.0fms p50=%.0fms total=%.0fms"
+                    % (now - window_start, len(gaps), _LATENCY_PROBE_THRESHOLD_MS,
+                       gaps[-1], gaps[len(gaps) // 2], sum(gaps))
+                )
+            else:
+                print("[gil_probe] over %.0fs: 0 stalls>%.0fms (clean)" % (now - window_start, _LATENCY_PROBE_THRESHOLD_MS))
+            window_start = now
+            gaps = []
+
+
+def _start_latency_probe():
+    global _latency_probe_started
+    if _latency_probe_started or not _LATENCY_PROBE_ENABLED:
+        return
+    _latency_probe_started = True
+    t = threading.Thread(target=_gil_probe_loop, name="bigqmt-gil-probe", daemon=True)
+    t.start()
+    print("[gil_probe] started (threshold=%.0fms)" % _LATENCY_PROBE_THRESHOLD_MS)
+
+
+def _apply_gil_tuning():
+    try:
+        sys.setswitchinterval(_GIL_SWITCH_INTERVAL)
+        print("[bigqmt_signal_trader] gil switch interval set to %.4fs" % _GIL_SWITCH_INTERVAL)
+    except Exception as exc:
+        print("[bigqmt_signal_trader] setswitchinterval failed: %s" % exc)
+
+
 def init(ContextInfo):
     detected_account_id = _detect_account_id(ContextInfo)
     if detected_account_id and not _account_id:
         set_account_id(detected_account_id)
     if _account_id and hasattr(ContextInfo, "set_account"):
         ContextInfo.set_account(_account_id)
+    _apply_gil_tuning()
+    _start_latency_probe()
     config = _build_config()
     runtime = BigQmtRuntimeAdapter(ContextInfo)
     app = init_app(runtime, _build_app)
@@ -500,19 +577,32 @@ def _pump_download_jobs(context_info, config):
         return None
 
 
+def _adjust_phase(name, fn, *args):
+    """Time one adjust phase; log only if it exceeds 50ms. Pinpoints which part of
+    the 500ms adjust cycle holds the GIL (the gil_probe shows the stall exists;
+    this shows WHERE). The finally-log never alters the call's result/exception."""
+    t0 = time.perf_counter()
+    try:
+        return fn(*args)
+    finally:
+        ms = (time.perf_counter() - t0) * 1000.0
+        if ms > 50.0:
+            print("[adjust_phase] %s %.0fms" % (name, ms))
+
+
 def adjust(ContextInfo):
     global _adjust_logged
     _record_adjust_tick()
     config = _build_config()
-    _drain_rpc_service(config)
-    _refresh_full_tick_cache(ContextInfo, config)
-    _pump_download_jobs(ContextInfo, config)
+    _adjust_phase("drain", _drain_rpc_service, config)
+    _adjust_phase("full_tick", _refresh_full_tick_cache, ContextInfo, config)
+    _adjust_phase("download", _pump_download_jobs, ContextInfo, config)
     if hasattr(ContextInfo, "is_last_bar") and not ContextInfo.is_last_bar():
         return None
     if not _adjust_logged:
         print("[bigqmt_signal_trader] adjust ok")
         _adjust_logged = True
-    return tick_app(ContextInfo, datetime.datetime.now())
+    return _adjust_phase("tick_app", tick_app, ContextInfo, datetime.datetime.now())
 
 
 def handlebar(ContextInfo):

@@ -463,7 +463,10 @@ class BigQmtMarketDataProvider:
         return self._call_context("get_ipo_info", start_time, end_time)
 
     def get_etf_info(self):
-        return self._call_context("get_etf_info")
+        # xtdata SDK 函数（SDK 893 行），ContextInfo 无此方法，走 native SDK。
+        def _via_context():
+            return self._raise_unavailable("get_etf_info")
+        return self._native_or_context("get_etf_info", _via_context)
 
     def download_etf_info(self):
         return self._call_context("download_etf_info")
@@ -533,7 +536,10 @@ class BigQmtMarketDataProvider:
         return list(self._FALLBACK_SECTORS)
 
     def get_sector_info(self, sector_name=""):
-        return self._call_context("get_sector_info", sector_name)
+        # xtdata SDK 函数，ContextInfo 无此方法，走 native SDK。
+        def _via_context():
+            return self._raise_unavailable("get_sector_info")
+        return self._native_or_context("get_sector_info", _via_context, sector_name)
 
     def get_markets(self):
         # No such function exists in either ContextInfo or the xtdata SDK.

@@ -130,8 +130,12 @@ def build_app(context_info=None, config=None):
             get_trade_detail_data_func=get_trade_detail_data_func,
             account_type=config.get("account_type", "STOCK"),
         )
+        # passorder / cancel need the RAW QMT ContextInfo as their last arg -- QMT's
+        # injected passorder reads internals off it (e.g. .request_id). Our runtime
+        # wrapper (BigQmtRuntimeAdapter) doesn't have those, so unwrap it here.
+        raw_context_info = getattr(context_info, "context_info", context_info)
         order_gateway = order_gateway or BigQmtOrderGateway(
-            context_info=context_info,
+            context_info=raw_context_info,
             account_id=account_id,
             passorder_func=qmt_api.get("passorder"),
             cancel_func=qmt_api.get("cancel"),

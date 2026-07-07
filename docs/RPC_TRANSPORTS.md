@@ -120,11 +120,12 @@ BIGQMT_REDIS_CONFIG = {
 > 1. **`background_threads` 必须为 True** —— ZMQ 的 ROUTER 只有在后台线程里才
 >    起接收循环；否则只 bind 不收包，客户端全部超时。`_build_rpc_service` 已对
 >    非 redis 传输**自动置 True**，无需在 config 里写。
-> 2. **`schedule_adjust` 必须保持开** —— 它不是「RPC 排空开销」，而是 QMT 回调的
->    **节流器**：`run_time("adjust", 500ms)` 让 adjust 按 500ms 触发；一旦不注册,
->    QMT 会以 **~2500 次/秒**空转 adjust，占满 GIL 把 ROUTER 后台线程饿死，RPC
->    直接超时。所以即便 zmq 自带接收线程，也**不能**关 schedule_adjust。
->    （曾误以为它是纯开销去关掉 → 全部超时；这是嵌入式单 GIL 环境的坑。）
+> 2. **`schedule_adjust` 必须保持开** —— `run_time("adjust", interval)` 是我们注册的
+>    **RPC 队列 drain 定时器**(`adjust` 不是 QMT 内置回调,QMT 只自动调 init/handlebar;
+>    handlebar 里 `return adjust(...)`)。deferred 档的交易查询要靠它在主线程执行;关掉就没
+>    有主线程 drain 点。它也是后台线程拿 GIL 窗口的节奏源:`schedule_adjust_interval` 越小
+>    inline 尾延迟越低(500ms→~490ms,100ms→热循环~100ms 但烧 CPU,**200ms 折中**)。
+>    详见 `docs/BIG_QMT_REDIS_RPC.md` 的「延迟模式」。
 
 ### MySQL（`transport: mysql`，兼容兜底）
 

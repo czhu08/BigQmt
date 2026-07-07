@@ -95,6 +95,29 @@ ORDER_METHODS = {
 
 LISTENER_DEFERRED_METHODS = {
     "sync_positions",
+    # Trade-context queries route through QMT's get_trade_detail_data, which
+    # returns EMPTY when called from the background RPC thread (it needs the main
+    # strategy thread's context). Defer them so the adjust drain runs them on the
+    # main thread -- costs up to one adjust interval (~500ms) but returns REAL
+    # data. NOTE: get_asset is intentionally NOT here; it uses a different QMT
+    # call that works on the background thread, so it stays inline/low-latency.
+    "get_positions",
+    "query_stock_position",
+    "query_orders",
+    "query_trades",
+    "query_account_infos",
+    "query_account_status",
+    "query_credit_detail",
+    "query_stk_compacts",
+    "query_credit_subjects",
+    "query_credit_slo_code",
+    "query_credit_assure",
+    "query_appointment_info",
+    "query_smt_secu_info",
+    "query_smt_secu_rate",
+    "get_value_by_order_id",
+    "get_last_order_id",
+    "get_history_trade_detail_data",
 }
 
 METHOD_ALIASES = {

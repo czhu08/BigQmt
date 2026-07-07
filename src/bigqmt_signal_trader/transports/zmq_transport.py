@@ -281,10 +281,18 @@ class ZmqTransport(RpcTransport):
                 request_id = str(request.get("request_id") or uuid.uuid4().hex)
                 with self._identity_lock:
                     self._pending_identities[request_id] = identity
+                t0 = time.perf_counter()
                 try:
                     self.deliver(request)
                 except Exception as exc:
                     print("%s zmq deliver failed: %s" % (self.print_prefix, exc))
+                handler_ms = (time.perf_counter() - t0) * 1000.0
+                if handler_ms > 50.0:
+                    # Distinguishes a slow handler (real work) from a GIL stall
+                    # (which the gil_probe catches): if handler_ms is small but pings
+                    # still spike, the stall is elsewhere in the process.
+                    print("%s zmq slow handler method=%s %.0fms"
+                          % (self.print_prefix, request.get("method"), handler_ms))
         finally:
             # Close the ROUTER socket on the thread that owns it. On Windows,
             # closing a ZMQ socket from a different thread trips a signaler
@@ -312,6 +320,13 @@ class ZmqTransport(RpcTransport):
             self._router.send_multipart([identity, payload.encode("utf-8")])
         except Exception as exc:
             print("%s zmq send failed: %s" % (self.print_prefix, exc))
+
+    def drain_request_queue(self, max_items=20):
+        """No-op: the ROUTER thread delivers requests itself. Defining this makes
+        the RPC service's per-tick drain skip the Redis LPOP fallback, so the QMT
+        strategy thread does NOT do a pointless cross-LAN Redis round-trip (which
+        holds the GIL and can stall this transport thread) on every adjust tick."""
+        return 0
 
     # -- client side ------------------------------------------------------
     def _resolve_connect_address(self):
