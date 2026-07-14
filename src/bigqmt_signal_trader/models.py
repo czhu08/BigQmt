@@ -231,6 +231,9 @@ class OrderSnapshot:
         price=0.0,
         strategy_name="",
         remark="",
+        created_at="",
+        price_type=50,
+        status_msg=""
     ):
         self.order_sys_id = order_sys_id
         self.user_order_id = user_order_id
@@ -242,10 +245,13 @@ class OrderSnapshot:
         self.price = price
         self.strategy_name = strategy_name
         self.remark = remark
+        self.created_at=created_at
+        self.price_type=price_type
+        self.status_msg=status_msg
 
 
 class TradeSnapshot:
-    def __init__(self, trade_id, order_sys_id, stock_code, action, volume, price, traded_at=""):
+    def __init__(self, trade_id, order_sys_id, stock_code, action, volume, price, traded_at="", amount=0, commission=0, remark=""):
         self.trade_id = trade_id
         self.order_sys_id = order_sys_id
         self.stock_code = stock_code
@@ -253,6 +259,9 @@ class TradeSnapshot:
         self.volume = volume
         self.price = price
         self.traded_at = traded_at
+        self.amount = amount
+        self.commission = commission
+        self.remark = remark
 
 
 class OrderRef:

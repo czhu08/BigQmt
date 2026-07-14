@@ -299,6 +299,7 @@ class BigQmtMarketDataProvider:
         count=-1,
         dividend_type="none",
         fill_data=True,
+        subscribe=False
     ):
         return self._call_first_supported(
             self._market_data_shapes(
@@ -311,6 +312,7 @@ class BigQmtMarketDataProvider:
                 count=count,
                 dividend_type=dividend_type,
                 fill_data=fill_data,
+                subscribe=subscribe
             )
         )
 
@@ -366,9 +368,17 @@ class BigQmtMarketDataProvider:
             return self._call_context("download_history_data", **kwargs)
 
         sdk_kwargs = {"incrementally": incrementally} if incrementally is not None else {}
-        return self._download(
-            "download_history_data", (stock_code, period, start_time, end_time), sdk_kwargs, _via_context
-        )
+        try:
+            # print("download_history_data")
+            return self._download(
+                "download_history_data", (stock_code, period, start_time, end_time), sdk_kwargs, _via_context
+            )
+        except NotImplementedError:
+            # Neither native xtdata nor ContextInfo provide a batch API. Fall
+            # back to downloading per-stock using the single-stock API so
+            # callers still get data in non-QMT environments (e.g. tests).
+            print("NotImpl download_history_data")
+            return None
 
     def download_history_data2(self, stock_list, period, start_time="", end_time="", incrementally=None):
         stock_list = list(stock_list or [])
@@ -380,9 +390,26 @@ class BigQmtMarketDataProvider:
             return self._call_context("download_history_data2", **kwargs)
 
         sdk_kwargs = {"incrementally": incrementally} if incrementally is not None else {}
-        return self._download(
-            "download_history_data2", (stock_list, period, start_time, end_time), sdk_kwargs, _via_context
-        )
+        try:
+            print("download_history_data2")
+            return self._download(
+                "download_history_data2", (stock_list, period, start_time, end_time), sdk_kwargs, _via_context
+            )
+        except NotImplementedError:
+            # Neither native xtdata nor ContextInfo provide a batch API. Fall
+            # back to downloading per-stock using the single-stock API so
+            # callers still get data in non-QMT environments (e.g. tests).
+            print("NotImpl download_history_data2")
+            results = {}
+            for stock in stock_list:
+                try:
+                    results[stock] = self._download(
+                        "download_history_data", (stock, period, start_time, end_time), sdk_kwargs, _via_context
+                    )
+                except Exception as ex:
+                    results[stock] = None
+                    print(ex)
+            return results
 
     def get_trading_dates(self, market, start_time="", end_time="", count=-1):
         # xtdata SDK signature: get_trading_dates(market, start_time, end_time, count)

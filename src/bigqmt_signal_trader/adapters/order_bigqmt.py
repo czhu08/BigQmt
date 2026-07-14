@@ -88,7 +88,8 @@ class BigQmtOrderGateway:
         else:
             raise ValueError("unsupported order action: %s" % request.action)
 
-        user_order_id = self.build_user_order_id(request.signal_id)
+        # user_order_id = self.build_user_order_id(request.signal_id)
+        user_order_id = request.remark
         account_id = request.account_id or self.account_id
         passorder(
             op_type,
@@ -125,6 +126,11 @@ class BigQmtOrderGateway:
             return []
         result = []
         for row in rows:
+            date: str = _attr(row, "m_strInsertDate", "")
+            if date:
+                dt = str(date) + " " + str(_attr(row, "m_strInsertTime", ""))
+            else:
+                dt = str(_attr(row, "m_strInsertTime", ""))
             result.append(
                 OrderSnapshot(
                     order_sys_id=str(_attr(row, ("m_strOrderSysID", "order_sys_id"), "") or ""),
@@ -138,8 +144,11 @@ class BigQmtOrderGateway:
                     traded_volume=int(_attr(row, ("m_nVolumeTraded", "traded_volume"), 0) or 0),
                     status=str(_attr(row, ("m_nOrderStatus", "status"), "") or ""),
                     price=float(_attr(row, ("m_dLimitPrice", "m_dPrice", "price"), 0.0) or 0.0),
-                    strategy_name=str(_attr(row, ("m_strStrategyName", "strategy_name"), "") or ""),
+                    strategy_name=str(_attr(row, ("m_strOptName", "strategy_name"), "") or ""),
                     remark=str(_attr(row, ("m_strRemark", "remark"), "") or ""),
+                    created_at=dt,
+                    price_type=int(_attr(row, ["m_nOrderPriceType"])),
+                    status_msg=str(_attr(row, "m_strCancelInfo", ""))
                 )
             )
         return result
@@ -156,6 +165,11 @@ class BigQmtOrderGateway:
                 rows = []
         result = []
         for row in rows:
+            date: str = str(_attr(row, "m_strTradeDate", ""))
+            if date:
+                dt = str(date) + " " + str(_attr(row, "m_strTradeTime", ""))
+            else:
+                dt = str(_attr(row, "m_strTradeTime", ""))
             result.append(
                 TradeSnapshot(
                     trade_id=str(_attr(row, ("m_strTradeID", "trade_id"), "") or ""),
@@ -167,7 +181,10 @@ class BigQmtOrderGateway:
                     action=_action_from_offset_flag(_attr(row, ("m_nOffsetFlag", "offset_flag"), 0)),
                     volume=int(_attr(row, ("m_nVolume", "volume"), 0) or 0),
                     price=float(_attr(row, ("m_dPrice", "m_dTradePrice", "price"), 0.0) or 0.0),
-                    traded_at=str(_attr(row, ("m_strTradeTime", "trade_time", "traded_at"), "") or ""),
+                    traded_at=dt,
+                    amount = float(_attr(row, ["m_dTradeAmount", "amount"])),
+                    commission=float(_attr(row, ["m_dCommission", "m_dComission", "commission"])),
+                    remark=str(_attr(row, ["m_strRemark", "order_remark", "remark"]))
                 )
             )
         return result

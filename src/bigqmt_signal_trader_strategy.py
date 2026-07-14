@@ -588,7 +588,8 @@ def _adjust_phase(name, fn, *args):
     finally:
         ms = (time.perf_counter() - t0) * 1000.0
         if ms > 50.0:
-            print("[adjust_phase] %s %.0fms" % (name, ms))
+            # print("[adjust_phase] %s %.0fms" % (name, ms))
+            pass
 
 
 def adjust(ContextInfo):
@@ -632,10 +633,12 @@ def _publish_exec_event(kind, obj):
         from bigqmt_signal_trader import exec_events
 
         if kind == "trade":
+            print("publish_trade_event")
             exec_events.publish_trade_event(
                 redis_client, account_id, exec_events.normalize_trade_event(obj, account_id)
             )
         else:
+            print("publish_order_event")
             exec_events.publish_order_event(
                 redis_client, account_id, exec_events.normalize_order_event(obj, account_id)
             )

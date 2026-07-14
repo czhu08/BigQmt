@@ -7,8 +7,8 @@ latency, plus a category summary. Does NOT call any order/cancel method.
 import sys
 import time
 
-sys.path.insert(0, r"D:\gjzqqmt\xtquant_big_convert\src")
-sys.path.insert(0, r"D:\国金证券QMT交易端_lemo\python")
+sys.path.insert(0, r"D:\delta43\BigQmt\src")
+sys.path.insert(0, r"D:\Programs\国金证券QMT交易端\python")
 
 import bigqmt_signal_trader.xtquant_compat as compat
 

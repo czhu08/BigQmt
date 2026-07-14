@@ -18,7 +18,6 @@ BIGQMT_REDIS_CONFIG = {
     "username": "",
     "password": "",
     # "transport": "zmq",
-    # "rpc_background_threads": True,        # 必须！
     # "zmq": {
     #     "host": "127.0.0.1",              # 默认端口从 account_id 派生
     #     # "port": 5560,                   # 可显式指定

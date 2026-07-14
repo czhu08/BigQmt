@@ -1372,9 +1372,13 @@ class BigQmtXtTrader:
         account_id = str(event.get("account_id") or self.client.account_id or "")
         try:
             if event.get("event_type") == "trade":
-                callback.on_stock_trade(self._trade_from_dict(account_id, event))
+                res = self._trade_from_dict(account_id, event)
+                if res:
+                    callback.on_stock_trade(res)
             elif event.get("event_type") == "order":
-                callback.on_stock_order(self._order_from_dict(account_id, event))
+                res = self._order_from_dict(account_id, event)
+                if res:
+                    callback.on_stock_order(res) 
         except Exception:
             pass
 
@@ -1698,38 +1702,50 @@ class BigQmtXtTrader:
 
     def _order_from_dict(self, account_id, item):
         action = item.get("action")
-        order_type = _action_to_order_type(action)
+        order_type = _action_to_order_type(action)     
         order_sysid = str(item.get("order_sys_id") or item.get("order_sysid") or item.get("order_id") or "")
-        return CompatObject(
-            account_id=account_id,
-            stock_code=str(item.get("stock_code") or ""),
-            order_type=order_type,
-            order_status=_safe_int(item.get("status", item.get("order_status")), ORDER_UNKNOWN),
-            order_volume=_safe_int(item.get("volume", item.get("order_volume"))),
-            traded_volume=_safe_int(item.get("traded_volume")),
-            price=_safe_float(item.get("price")),
-            order_sysid=order_sysid,
-            order_id=order_sysid or str(item.get("user_order_id") or ""),
-            strategy_name=str(item.get("strategy_name") or ""),
-            order_remark=str(item.get("remark") or item.get("user_order_id") or ""),
-        )
+        if order_sysid:
+            return CompatObject(
+                account_id=account_id,
+                stock_code=str(item.get("stock_code") or ""),
+                order_type=order_type,
+                order_status=_safe_int(item.get("status", item.get("order_status")), ORDER_UNKNOWN),
+                order_volume=_safe_int(item.get("volume", item.get("order_volume"))),
+                traded_volume=_safe_int(item.get("traded_volume")),
+                price=_safe_float(item.get("price")),
+                price_type=_safe_int(item.get("price_type")),  # 50 限价 83 市价
+                order_sysid=order_sysid,
+                order_id=order_sysid,
+                strategy_name=str(item.get("strategy_name") or ""),  # 限价买入
+                order_time=str(item.get("created_at") or ""),
+                order_remark=str(item.get("remark") or ""),
+                status_msg=str(item.get("status_msg") or ""),
+            )
+        else:
+            return None
 
     def _trade_from_dict(self, account_id, item):
         action = item.get("action")
         order_type = _action_to_order_type(action)
         order_sysid = str(item.get("order_sys_id") or item.get("order_sysid") or "")
         trade_id = str(item.get("trade_id") or "")
-        return CompatObject(
-            account_id=account_id,
-            stock_code=str(item.get("stock_code") or ""),
-            order_type=order_type,
-            order_sysid=order_sysid,
-            order_id=order_sysid,
-            traded_id=trade_id,
-            traded_volume=_safe_int(item.get("volume", item.get("traded_volume"))),
-            traded_price=_safe_float(item.get("price", item.get("traded_price"))),
-            traded_time=str(item.get("traded_at") or ""),
-        )
+        if trade_id:
+            return CompatObject(
+                account_id=account_id,
+                stock_code=str(item.get("stock_code") or ""),
+                order_type=order_type,
+                order_sysid=order_sysid,
+                order_id=order_sysid,
+                traded_id=trade_id,
+                order_remark=str(item.get("remark") or ""),
+                traded_volume=_safe_int(item.get("volume", item.get("traded_volume"))),
+                traded_price=_safe_float(item.get("price", item.get("traded_price"))),
+                traded_time=str(item.get("traded_at") or ""),
+                traded_amount=float(item.get("amount") or 0),
+                commission=float(item.get("commission") or 0),
+            )
+        else:
+            return None
 
 
 XtQuantTrader = BigQmtXtTrader

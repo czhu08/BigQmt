@@ -15,8 +15,9 @@ The normalized field names match ``BigQmtXtTrader._order_from_dict`` /
 """
 
 import json
-import time
 
+from .adapters.order_bigqmt import _action_from_offset_flag
+from .adapters.position_bigqmt import _full_code
 
 ORDER_CHANNEL_TEMPLATE = "bigqmt:order_events:{account_id}"
 TRADE_CHANNEL_TEMPLATE = "bigqmt:trade_events:{account_id}"
@@ -71,44 +72,58 @@ def _action_from_direction(direction):
 
 def normalize_order_event(order, account_id=""):
     """Build a JSON-able order event dict from a Big QMT orderInfo object."""
-    direction = _attr(order, ["m_nDirection", "direction", "order_type"])
+    date: str = _attr(order, "m_strInsertDate", "")
+    if date:
+        dt = str(date) + " " + str(_attr(order, "m_strInsertTime", ""))
+    else:
+        dt = str(_attr(order, "m_strInsertTime", ""))
     return {
         "event_type": EVENT_ORDER,
         "account_id": str(_attr(order, ["m_strAccountID", "account_id"], account_id) or account_id or ""),
-        "stock_code": str(_attr(order, ["m_strInstrumentID", "stock_code", "m_strInstrument"], "") or ""),
+        "stock_code": _full_code(
+            _attr(order, ("m_strInstrumentID", "instrument_id", "stock_code")),
+            _attr(order, ("m_strExchangeID", "exchange_id", "market")),
+        ),
         "order_sys_id": str(_attr(order, ["m_strOrderSysID", "order_sys_id", "order_sysid", "order_id"], "") or ""),
-        "order_volume": _attr(order, ["m_nVolumeTotal", "order_volume", "volume"]),
+        "user_order_id": str(_attr(order, ("m_strRemark", "user_order_id", "remark"), "") or ""),
+        "volume": _attr(order, ["m_nVolumeTotalOriginal", "order_volume", "volume"]),
         "traded_volume": _attr(order, ["m_nVolumeTraded", "traded_volume"]),
         "price": _attr(order, ["m_dLimitPrice", "price", "limit_price"]),
         "status": _attr(order, ["m_nOrderStatus", "order_status", "status"]),
-        "direction": direction,
-        "action": _action_from_direction(direction),
-        "offset_flag": _attr(order, ["m_nOffsetFlag", "offset_flag"]),
-        "strategy_name": str(_attr(order, ["m_strOptName", "strategy_name", "order_remark", "remark"], "") or ""),
-        "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-        "created_at_ts": time.time(),
+        "action": _action_from_offset_flag(_attr(order, ("m_nOffsetFlag", "offset_flag"), 0)),
+        "strategy_name": str(_attr(order, ["m_strOptName", "strategy_name"], "") or ""),
+        "remark": _attr(order, ["m_strRemark", "order_remark", "remark"], ""),
+        "created_at": dt,
+        "price_type": _attr(order, "m_nOrderPriceType", 50),
+        "status_msg": str(_attr(order, "m_strCancelInfo", ""))
     }
 
 
 def normalize_trade_event(trade, account_id=""):
     """Build a JSON-able trade (成交) event dict from a Big QMT dealInfo object."""
-    direction = _attr(trade, ["m_nDirection", "direction", "order_type"])
+    date: str = _attr(trade, "m_strTradeDate", "")
+    if date:
+        dt = str(date) + " " + str(_attr(trade, "m_strTradeTime", ""))
+    else:
+        dt = str(_attr(trade, "m_strTradeTime", ""))
     return {
         "event_type": EVENT_TRADE,
         "account_id": str(_attr(trade, ["m_strAccountID", "account_id"], account_id) or account_id or ""),
-        "stock_code": str(_attr(trade, ["m_strInstrumentID", "stock_code"], "") or ""),
+        "stock_code": _full_code(
+            _attr(trade, ("m_strInstrumentID", "instrument_id", "stock_code")),
+            _attr(trade, ("m_strExchangeID", "exchange_id", "market")),
+        ),
         "order_sys_id": str(_attr(trade, ["m_strOrderSysID", "order_sys_id", "order_sysid", "order_id"], "") or ""),
         "trade_id": str(_attr(trade, ["m_strTradeID", "trade_id"], "") or ""),
         "volume": _attr(trade, ["m_nVolume", "volume", "traded_volume"]),
         "price": _attr(trade, ["m_dPrice", "price", "traded_price"]),
         "amount": _attr(trade, ["m_dTradeAmount", "amount"]),
-        "commission": _attr(trade, ["m_dComssion", "m_dCommission", "commission"]),
-        "direction": direction,
-        "action": _action_from_direction(direction),
-        "offset_flag": _attr(trade, ["m_nOffsetFlag", "offset_flag"]),
-        "traded_at": str(_attr(trade, ["m_strTradeTime", "traded_at", "trade_time"], "") or ""),
-        "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-        "created_at_ts": time.time(),
+        "commission": _attr(trade, ["m_dCommission", "m_dComission", "commission"]),
+        "action": _action_from_offset_flag(_attr(trade, ("m_nOffsetFlag", "offset_flag"), 0)),
+        "remark": _attr(trade, ["m_strRemark", "order_remark", "remark"]),
+        "traded_at": dt,
+        # "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        # "created_at_ts": time.time(),
     }
 
 
