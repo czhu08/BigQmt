@@ -287,7 +287,8 @@ class ZmqTransport(RpcTransport):
                 except Exception as exc:
                     print("%s zmq deliver failed: %s" % (self.print_prefix, exc))
                 handler_ms = (time.perf_counter() - t0) * 1000.0
-                if handler_ms > 50.0:
+                # if handler_ms > 50.0:
+                if handler_ms > 200.0:
                     # Distinguishes a slow handler (real work) from a GIL stall
                     # (which the gil_probe catches): if handler_ms is small but pings
                     # still spike, the stall is elsewhere in the process.
