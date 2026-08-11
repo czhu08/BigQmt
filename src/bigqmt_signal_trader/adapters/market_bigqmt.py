@@ -42,6 +42,33 @@ def normalize_market_or_stock_code(code):
     return normalize_stock_code(text)
 
 
+def _raw_frame_columns(field_list):
+    columns = [str(field) for field in (field_list or [])]
+    if columns and "stime" not in columns:
+        columns.insert(0, "stime")
+    return columns
+
+
+def _raw_market_data_payload(payload, field_list, stock_list):
+    if not isinstance(payload, dict):
+        return payload
+    source = {str(code): records for code, records in payload.items()}
+    codes = []
+    for code in list(stock_list or []) + list(source):
+        text = str(code)
+        if text not in codes:
+            codes.append(text)
+    columns = _raw_frame_columns(field_list)
+    return {
+        code: {
+            "__bigqmt_type__": "DataFrame",
+            "columns": columns,
+            "records": source.get(code) or [],
+        }
+        for code in codes
+    }
+
+
 _NATIVE_XTDATA = None  # cached native xtdata SDK module (None = not yet tried)
 _NATIVE_XTDATA_UNAVAILABLE = object()  # sentinel: looked, not importable
 
@@ -317,6 +344,16 @@ class BigQmtMarketDataProvider:
         )
 
     def get_market_data_ex(self, **kwargs):
+        raw_method = getattr(self.context_info, "get_market_data_ex_ori", None)
+        if callable(raw_method):
+            raw_data = self._call_first_supported(
+                self._market_data_shapes("get_market_data_ex_ori", **kwargs)
+            )
+            return _raw_market_data_payload(
+                raw_data,
+                kwargs.get("field_list") or kwargs.get("fields"),
+                kwargs.get("stock_list") or kwargs.get("stock_code"),
+            )
         shapes = self._market_data_shapes("get_market_data_ex", **kwargs)
         if hasattr(self.context_info, "get_market_data"):
             shapes.extend(self._market_data_shapes("get_market_data", **kwargs))
@@ -508,16 +545,22 @@ class BigQmtMarketDataProvider:
         return self._call_context("get_his_option_list_batch", undl_code, start_time, end_time)
 
     def get_financial_data(self, stock_list, table_list=None, start_time="", end_time="", report_type="report_time"):
+        # ContextInfo stub signature: get_financial_data(fieldList, stockList, startDate, endDate, report_type)
+        # — fieldList (table_list) comes FIRST, stockList SECOND. Our public API keeps
+        # the xtdata order (stock_list, table_list) so callers don't change, but we
+        # must swap when forwarding to ContextInfo.
         return self._call_context(
             "get_financial_data",
-            stock_list,
             table_list or [],
+            stock_list,
             start_time,
             end_time,
             report_type,
         )
 
     def download_financial_data(self, stock_list, table_list=None, start_time="", end_time="", incrementally=None):
+        # download_financial_data is an xtdata SDK function, not a ContextInfo method.
+        # Try native SDK first, fall back to ContextInfo (may raise NotImplementedError).
         kwargs = {
             "stock_list": stock_list,
             "table_list": table_list or [],
@@ -526,10 +569,17 @@ class BigQmtMarketDataProvider:
         }
         if incrementally is not None:
             kwargs["incrementally"] = incrementally
-        return self._call_context("download_financial_data", **kwargs)
+        def _via_context():
+            return self._call_context("download_financial_data", **kwargs)
+        return self._native_or_context("download_financial_data", _via_context, **kwargs)
 
     def download_financial_data2(self, stock_list, table_list=None, start_time="", end_time=""):
-        return self._call_context("download_financial_data2", stock_list, table_list or [], start_time, end_time)
+        # download_financial_data2 is an xtdata SDK function, not a ContextInfo method.
+        def _via_context():
+            return self._call_context("download_financial_data2", stock_list, table_list or [], start_time, end_time)
+        return self._native_or_context(
+            "download_financial_data2", _via_context, stock_list, table_list or [], start_time, end_time
+        )
 
     # Well-known sector names that Big QMT's ContextInfo recognises for
     # get_stock_list_in_sector / get_sector. Used as a fallback when the full
@@ -1077,4 +1127,3 @@ class BigQmtMarketDataProvider:
             "%s is unavailable: needs native xtdata SDK quote service "
             "(not reachable in Big QMT full terminal)" % method_name
         )
-

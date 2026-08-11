@@ -33,6 +33,10 @@ class RedisPositionSyncSink:
             "asset": {
                 "cash": snapshot.asset.cash,
                 "total_asset": snapshot.asset.total_asset,
+                # Carried so the client's cached-asset fallback exposes the same
+                # fields as a live query_stock_asset.
+                "frozen_cash": getattr(snapshot.asset, "frozen_cash", None),
+                "market_value": getattr(snapshot.asset, "market_value", None),
             },
             "positions": {
                 code: {
@@ -55,4 +59,7 @@ class RedisPositionSyncSink:
             self.redis.set(key, payload)
         if self.publish_events:
             stream_key = self.event_stream_template.format(account_id=snapshot.account_id)
-            self.redis.xadd(stream_key, {"payload": payload})
+            # Cap the stream to prevent unbounded memory growth. Order/trade
+            # events already use maxlen=2000; position events were missing it,
+            # causing 4.2GB+ streams in production (issue #21).
+            self.redis.xadd(stream_key, {"payload": payload}, maxlen=2000, approximate=True)

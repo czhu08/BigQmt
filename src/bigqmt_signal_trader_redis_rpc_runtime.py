@@ -29,19 +29,38 @@ for _dir in _CANDIDATE_DIRS:
         break
 
 
-from bigqmt_signal_trader_strategy import (  # noqa: E402
-    adjust,
-    bind_qmt_api,
-    configure,
-    deal_callback,
-    handlebar,
-    init,
-    on_order,
-    on_trade,
-    order_callback,
-    set_account_id,
-    sync_positions,
-)
+try:
+    _load_bridge_module = __bigqmt_load_local_module
+except NameError:
+    _load_bridge_module = None
+
+if _load_bridge_module is not None:
+    _strategy_module = _load_bridge_module("bigqmt_signal_trader_strategy")
+    adjust = _strategy_module.adjust
+    bind_qmt_api = _strategy_module.bind_qmt_api
+    configure = _strategy_module.configure
+    deal_callback = _strategy_module.deal_callback
+    handlebar = _strategy_module.handlebar
+    init = _strategy_module.init
+    on_order = _strategy_module.on_order
+    on_trade = _strategy_module.on_trade
+    order_callback = _strategy_module.order_callback
+    set_account_id = _strategy_module.set_account_id
+    sync_positions = _strategy_module.sync_positions
+else:
+    from bigqmt_signal_trader_strategy import (  # noqa: E402
+        adjust,
+        bind_qmt_api,
+        configure,
+        deal_callback,
+        handlebar,
+        init,
+        on_order,
+        on_trade,
+        order_callback,
+        set_account_id,
+        sync_positions,
+    )
 
 
 ACCOUNT_ID = ""
@@ -93,6 +112,11 @@ DOWNLOAD_JOB_TTL_SECONDS = 3600
 # Push order_callback/deal_callback details to Redis so clients get real-time
 # on_stock_order/on_stock_trade callbacks (MiniQMT style) instead of polling.
 EXEC_EVENTS_ENABLED = True
+# Dump the raw order_callback/deal_callback object fields to the QMT output panel
+# (and into the published event as "raw_fields"). Off by default — it prints on
+# every callback. Turn on to settle what m_nDirection/m_nOffsetFlag actually
+# carry live, which the buy/sell direction mapping currently assumes.
+EXEC_EVENTS_DEBUG_RAW_FIELDS = False
 
 try:
     from bigqmt_signal_trader_local_config import BIGQMT_ACCOUNT_ID, BIGQMT_REDIS_CONFIG
@@ -140,6 +164,9 @@ DOWNLOAD_JOB_MAX_WALL_SECONDS = float(
 )
 DOWNLOAD_JOB_TTL_SECONDS = int(BIGQMT_REDIS_CONFIG.get("download_job_ttl_seconds", DOWNLOAD_JOB_TTL_SECONDS))
 EXEC_EVENTS_ENABLED = bool(BIGQMT_REDIS_CONFIG.get("exec_events_enabled", EXEC_EVENTS_ENABLED))
+EXEC_EVENTS_DEBUG_RAW_FIELDS = bool(
+    BIGQMT_REDIS_CONFIG.get("exec_events_debug_raw_fields", EXEC_EVENTS_DEBUG_RAW_FIELDS)
+)
 
 
 def _apply_config(account_id):
@@ -149,7 +176,7 @@ def _apply_config(account_id):
     configure(
         mode="bigqmt",
         account_id=account_id,
-        position_sync_type="redis",
+        position_sync_type="redis" if RPC_TRANSPORT in ("redis", "", "default") else "",
         enable_rpc=True,
         schedule_adjust=SCHEDULE_ADJUST_ENABLED,
         schedule_adjust_interval=SCHEDULE_ADJUST_INTERVAL,
@@ -200,6 +227,7 @@ def _apply_config(account_id):
         exec_events={
             "enabled": EXEC_EVENTS_ENABLED,
             "account_id": account_id,
+            "debug_raw_fields": EXEC_EVENTS_DEBUG_RAW_FIELDS,
         },
     )
 
@@ -209,7 +237,7 @@ def configure_runtime_account(account_id):
 
 
 def configure_runtime_redis(redis_config):
-    global REDIS_HOST, REDIS_PORT, REDIS_DB, REDIS_USERNAME, REDIS_PASSWORD, RPC_ALLOW_ORDER_METHODS, RPC_PROCESS_IN_LISTENER, RPC_BACKGROUND_THREADS, RPC_LISTENER_METHODS, SCHEDULE_ADJUST_ENABLED, SCHEDULE_ADJUST_INTERVAL, FULL_TICK_CACHE_ENABLED, FULL_TICK_DEMAND_TTL_SECONDS, FULL_TICK_CACHE_TTL_SECONDS, FULL_TICK_REFRESH_INTERVAL_SECONDS, FULL_TICK_MARKET_REFRESH_INTERVAL_SECONDS, FULL_TICK_REFRESH_MAX_WALL_SECONDS, FULL_TICK_MAX_REQUESTS, RPC_TRANSPORT, RPC_ZMQ_CONFIG, RPC_MYSQL_CONFIG, DOWNLOAD_JOBS_ENABLED, DOWNLOAD_JOB_CHUNK_SIZE, DOWNLOAD_JOB_MAX_WALL_SECONDS, DOWNLOAD_JOB_TTL_SECONDS, EXEC_EVENTS_ENABLED
+    global REDIS_HOST, REDIS_PORT, REDIS_DB, REDIS_USERNAME, REDIS_PASSWORD, RPC_ALLOW_ORDER_METHODS, RPC_PROCESS_IN_LISTENER, RPC_BACKGROUND_THREADS, RPC_LISTENER_METHODS, SCHEDULE_ADJUST_ENABLED, SCHEDULE_ADJUST_INTERVAL, FULL_TICK_CACHE_ENABLED, FULL_TICK_DEMAND_TTL_SECONDS, FULL_TICK_CACHE_TTL_SECONDS, FULL_TICK_REFRESH_INTERVAL_SECONDS, FULL_TICK_MARKET_REFRESH_INTERVAL_SECONDS, FULL_TICK_REFRESH_MAX_WALL_SECONDS, FULL_TICK_MAX_REQUESTS, RPC_TRANSPORT, RPC_ZMQ_CONFIG, RPC_MYSQL_CONFIG, DOWNLOAD_JOBS_ENABLED, DOWNLOAD_JOB_CHUNK_SIZE, DOWNLOAD_JOB_MAX_WALL_SECONDS, DOWNLOAD_JOB_TTL_SECONDS, EXEC_EVENTS_ENABLED, EXEC_EVENTS_DEBUG_RAW_FIELDS
     redis_config = dict(redis_config or {})
     REDIS_HOST = redis_config.get("host", REDIS_HOST)
     REDIS_PORT = int(redis_config.get("port", REDIS_PORT))
@@ -258,6 +286,9 @@ def configure_runtime_redis(redis_config):
     )
     DOWNLOAD_JOB_TTL_SECONDS = int(redis_config.get("download_job_ttl_seconds", DOWNLOAD_JOB_TTL_SECONDS))
     EXEC_EVENTS_ENABLED = bool(redis_config.get("exec_events_enabled", EXEC_EVENTS_ENABLED))
+    EXEC_EVENTS_DEBUG_RAW_FIELDS = bool(
+        redis_config.get("exec_events_debug_raw_fields", EXEC_EVENTS_DEBUG_RAW_FIELDS)
+    )
     _apply_config(ACCOUNT_ID)
 
 

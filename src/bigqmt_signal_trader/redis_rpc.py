@@ -21,6 +21,9 @@ from .code_utils import normalize_stock_code
 from .models import AccountSnapshot, OrderRef, OrderRequest
 
 
+RPC_REVISION = "20260715-execution-snapshot-v1"
+
+
 READ_METHODS = {
     "ping",
     "get_ticks",
@@ -58,6 +61,7 @@ READ_METHODS = {
     "get_asset",
     "query_orders",
     "query_trades",
+    "query_execution_snapshot",
     "query_stock_position",
     "sync_positions",
     # 账户 / 融资融券 / 交易扩展查询（官方全局函数 + detail types）
@@ -90,7 +94,17 @@ READ_METHODS = {
 
 ORDER_METHODS = {
     "submit_order",
+    "submit_orders_batch",
     "cancel_order",
+}
+
+# Whole-quote push subscription control methods. These drive a server-side
+# QuoteSubscriptionManager (reference-counted ContextInfo.subscribe_whole_quote)
+# rather than a market_data read; the data itself flows over the push channel.
+QUOTE_SUBSCRIPTION_METHODS = {
+    "subscribe_whole_quote",
+    "unsubscribe_whole_quote",
+    "quote_keepalive",
 }
 
 LISTENER_DEFERRED_METHODS = {
@@ -98,9 +112,9 @@ LISTENER_DEFERRED_METHODS = {
     # Trade-context queries route through QMT's get_trade_detail_data, which
     # returns EMPTY when called from the background RPC thread (it needs the main
     # strategy thread's context). Defer them so the adjust drain runs them on the
-    # main thread -- costs up to one adjust interval (~500ms) but returns REAL
-    # data. NOTE: get_asset is intentionally NOT here; it uses a different QMT
-    # call that works on the background thread, so it stays inline/low-latency.
+    # main thread -- costs up to one adjust interval (~500ms) but returns real
+    # data. Asset queries use the same QMT detail API and must follow this rule.
+    "get_asset",
     "get_positions",
     "query_stock_position",
     "query_orders",
@@ -120,6 +134,20 @@ LISTENER_DEFERRED_METHODS = {
     "get_history_trade_detail_data",
 }
 
+# Trade-context queries route through QMT's get_trade_detail_data, which
+# returns EMPTY when called from the background RPC thread (it needs the main
+# strategy thread's context). Defer them so the adjust drain runs them on the
+# main thread -- costs up to one adjust interval (~500ms) but returns real
+# data. Asset queries use the same QMT detail API and must follow this rule.
+#
+# NOTE: do NOT blanket-defer all READ_METHODS here. Market-data reads
+# (get_full_tick, get_market_data, ...) are thread-safe in the embedded
+# terminal and must stay inline for low latency; the ZMQ transport has no
+# adjust-driven drain for pending requests (its drain_request_queue is a
+# no-op when the router thread exists), so deferring everything would stall
+# them forever. Only the trade-context methods listed above go through drain.
+
+
 METHOD_ALIASES = {
     "get_full_tick": "get_ticks",
     "get_instrument_detail": "get_instrument",
@@ -131,6 +159,7 @@ METHOD_ALIASES = {
     "query_stock_trades": "query_trades",
     "order_stock": "submit_order",
     "order_stock_async": "submit_order",
+    "order_stock_batch": "submit_orders_batch",
     "cancel_order_stock": "cancel_order",
     "cancel_order_stock_sysid": "cancel_order",
 }
@@ -246,6 +275,7 @@ MARKET_DATA_METHODS = {
 # op — creates/updates a custom sector — but it is harmless to expose; trading
 # order writes stay gated behind ORDER_METHODS + allow_order_methods.)
 READ_METHODS |= MARKET_DATA_METHODS
+READ_METHODS |= QUOTE_SUBSCRIPTION_METHODS
 
 
 def _maybe_scalar(value):
@@ -323,6 +353,7 @@ class BigQmtRpcHandlers:
         allow_order_methods=False,
         allowed_methods=None,
         qmt_api=None,
+        quote_subscription_manager=None,
     ):
         self.account_id = str(account_id or "")
         self.market_data = market_data
@@ -330,9 +361,14 @@ class BigQmtRpcHandlers:
         self.order_gateway = order_gateway
         self.position_sync_sink = position_sync_sink
         self.allow_order_methods = bool(allow_order_methods)
+        self.quote_subscription_manager = quote_subscription_manager
         # QMT runtime-injected global functions (passorder/get_trade_detail_data/
         # 融资融券查询等)。由 strategy._build_config 解析注入。
         self.qmt_api = dict(qmt_api or {})
+        self._submit_journal = {}
+        # Server-side diagnostic for silent failures (e.g. passorder submitted
+        # but order not found in system). Surfaced to client via server_error.
+        self._last_server_error = ""
         if allowed_methods is None:
             allowed = set(READ_METHODS)
             if self.allow_order_methods:
@@ -375,8 +411,53 @@ class BigQmtRpcHandlers:
         return {
             "pong": True,
             "account_id": self.account_id,
+            "allow_order_methods": bool(self.allow_order_methods),
+            "rpc_revision": RPC_REVISION,
             "server_time": _dt.datetime.now(),
         }
+
+    # ------------------------------------------------------------------
+    # 全推行情订阅控制（引用计数共享 ContextInfo.subscribe_whole_quote）。
+    # 数据本身走推送通道；这里只负责订阅生命周期 + 心跳。
+    # ------------------------------------------------------------------
+
+    def _require_quote_manager(self):
+        manager = self.quote_subscription_manager
+        if manager is None:
+            raise RuntimeError("whole-quote push subscription is not configured on this server")
+        return manager
+
+    @staticmethod
+    def _quote_params(params, require_codes=False):
+        params = params or {}
+        client_id = str(params.get("client_id") or "").strip()
+        sub_id = str(params.get("sub_id") or "").strip()
+        if not client_id:
+            raise ValueError("client_id is required")
+        if not sub_id:
+            raise ValueError("sub_id is required")
+        codes = [str(c) for c in (params.get("codes") or []) if str(c or "").strip()]
+        if require_codes and not codes:
+            raise ValueError("codes is required")
+        return client_id, sub_id, codes
+
+    def _handle_subscribe_whole_quote(self, params):
+        manager = self._require_quote_manager()
+        client_id, sub_id, codes = self._quote_params(params, require_codes=True)
+        return manager.subscribe(client_id, sub_id, codes)
+
+    def _handle_unsubscribe_whole_quote(self, params):
+        manager = self._require_quote_manager()
+        client_id, sub_id, _codes = self._quote_params(params)
+        manager.unsubscribe(client_id, sub_id)
+        return {}
+
+    def _handle_quote_keepalive(self, params):
+        manager = self._require_quote_manager()
+        client_id, sub_id, _codes = self._quote_params(params)
+        manager.keepalive(client_id, sub_id)
+        return {}
+
 
     def _handle_get_ticks(self, params):
         codes = params.get("codes")
@@ -418,9 +499,13 @@ class BigQmtRpcHandlers:
     def _handle_query_orders(self, params):
         if self.order_gateway is None:
             raise RuntimeError("order_gateway is not configured")
+        # strategy_name filters orders by the name used in passorder. An empty
+        # string returns ALL orders for the account (verified via diagnostic:
+        # st="" -> 9 orders, st="bigqmt_signal_trader" -> 0). Default to ""
+        # so callers see every order unless they explicitly filter.
         orders = self.order_gateway.query_orders(
             self._request_account_id(params),
-            str(params.get("strategy_name")),
+            str(params.get("strategy_name") or ""),
         )
         if _bool_value(params.get("cancelable_only"), False):
             return [
@@ -433,10 +518,33 @@ class BigQmtRpcHandlers:
     def _handle_query_trades(self, params):
         if self.order_gateway is None:
             raise RuntimeError("order_gateway is not configured")
+        # Empty strategy_name returns ALL deals for the account (see query_orders
+        # note). Default "" so callers see every trade unless they filter.
+        strategy_name = params.get("strategy_name")
+        if strategy_name is None:
+            strategy_name = ""
         return self.order_gateway.query_trades(
             self._request_account_id(params),
-            str(params.get("strategy_name")),
+            str(strategy_name),
         )
+
+    def _handle_query_execution_snapshot(self, params):
+        if self.order_gateway is None:
+            raise RuntimeError("order_gateway is not configured")
+        account_id = self._request_account_id(params)
+        order_name = params.get("order_strategy_name")
+        if order_name is None:
+            order_name = params.get("strategy_name", "bigqmt_signal_trader")
+        trade_name = params.get("trade_strategy_name")
+        if trade_name is None:
+            trade_name = ""
+        return {
+            "account_id": account_id,
+            "server_time": _dt.datetime.now(),
+            "rpc_revision": RPC_REVISION,
+            "orders": self.order_gateway.query_orders(account_id, str(order_name)),
+            "trades": self.order_gateway.query_trades(account_id, str(trade_name)),
+        }
 
     def _handle_sync_positions(self, params):
         account_id = self._request_account_id(params)
@@ -617,7 +725,140 @@ class BigQmtRpcHandlers:
             raise ValueError("stock_code is required")
         if request.volume <= 0:
             raise ValueError("volume must be positive")
-        return self.order_gateway.submit(request)
+
+        result = self.order_gateway.submit(request)
+
+        # 委托后校验：确认委托是否真的进了系统。passorder 调用成功但委托没进
+        # 系统时（静默失败），记录 server_error 让客户端知道。
+        self._last_server_error = ""
+        try:
+            import time as _time
+            _time.sleep(0.5)  # 给 QMT 处理委托的时间
+            orders = self.order_gateway.query_orders(request.account_id, "")
+            if not any(
+                str(o.get("stock_code") or "").upper() == request.stock_code.upper()
+                and str(o.get("action") or "").upper() == request.action.upper()
+                for o in (orders or [])
+            ):
+                self._last_server_error = (
+                    "passorder submitted but order not found in system "
+                    "(stock=%s action=%s price=%.2f volume=%d). "
+                    "QMT may have silently rejected it (check price range / permissions)."
+                    % (request.stock_code, request.action, request.price, request.volume)
+                )
+        except Exception:
+            # 校验失败不影响主流程（委托已提交）
+            pass
+        return result
+
+    def _handle_submit_orders_batch(self, params):
+        orders = params.get("orders") or []
+        if not isinstance(orders, list) or not orders:
+            raise ValueError("orders must be a non-empty list")
+        if len(orders) > 500:
+            raise ValueError("orders exceeds batch limit 500")
+        batch_id = str(params.get("batch_id") or uuid.uuid4().hex)
+        account_id = self._request_account_id(params)
+        strategy_name = str(
+            params.get("strategy_name")
+            or (orders[0] or {}).get("strategy_name")
+            or "bigqmt_rpc"
+        )
+        existing_by_tag = {}
+        lookup_ok = True
+        requires_lookup = any(bool((item or {}).get("require_idempotency_check")) for item in orders)
+        if requires_lookup:
+            try:
+                identity_query = getattr(self.order_gateway, "query_submission_identities_strict", None)
+                if callable(identity_query):
+                    existing, trades = identity_query(account_id, strategy_name)
+                else:
+                    query = getattr(self.order_gateway, "query_orders_strict", None)
+                    existing = query(account_id, strategy_name) if callable(query) else self.order_gateway.query_orders(account_id, strategy_name)
+                    trades = []
+                existing_by_tag = {
+                    str(getattr(order, "user_order_id", "") or ""): order
+                    for order in existing or []
+                    if str(getattr(order, "user_order_id", "") or "")
+                }
+                for trade in trades or []:
+                    tag = str(getattr(trade, "user_order_id", "") or "")
+                    if tag and tag not in existing_by_tag:
+                        existing_by_tag[tag] = trade
+            except Exception:
+                lookup_ok = False
+        results = []
+        for index, item in enumerate(orders):
+            item = dict(item or {})
+            order_tag = str(item.get("order_remark") or item.get("remark") or item.get("signal_id") or "")
+            if not order_tag:
+                results.append({
+                    "index": index,
+                    "batch_id": batch_id,
+                    "success": False,
+                    "accepted": False,
+                    "explicit_failure": True,
+                    "code": -3,
+                    "error": "ORDER_TAG_REQUIRED",
+                    "user_order_id": "",
+                })
+                continue
+            known = existing_by_tag.get(order_tag)
+            journal_key = (account_id, strategy_name, order_tag)
+            journal = self._submit_journal.get(journal_key)
+            if known is not None or journal is not None:
+                results.append({
+                    "index": index,
+                    "batch_id": batch_id,
+                    "success": True,
+                    "accepted": True,
+                    "confirmed": known is not None,
+                    "idempotent": True,
+                    "code": 0,
+                    "order_sys_id": str(getattr(known, "order_sys_id", "") or (journal or {}).get("order_sys_id") or ""),
+                    "user_order_id": order_tag,
+                })
+                continue
+            if bool(item.get("require_idempotency_check")) and not lookup_ok:
+                results.append({
+                    "index": index,
+                    "batch_id": batch_id,
+                    "success": False,
+                    "accepted": False,
+                    "explicit_failure": False,
+                    "code": -2,
+                    "error": "IDEMPOTENCY_CHECK_UNAVAILABLE",
+                    "user_order_id": order_tag,
+                })
+                continue
+            try:
+                result = self._handle_submit_order(item)
+                response = {
+                    "index": index,
+                    "batch_id": batch_id,
+                    "success": True,
+                    "accepted": True,
+                    "confirmed": False,
+                    "idempotent": False,
+                    "code": 0,
+                    "order_sys_id": str(getattr(result, "order_sys_id", None) or ""),
+                    "user_order_id": str(getattr(result, "user_order_id", None) or ""),
+                }
+                if order_tag:
+                    self._submit_journal[journal_key] = dict(response)
+                results.append(response)
+            except Exception as exc:
+                results.append({
+                    "index": index,
+                    "batch_id": batch_id,
+                    "success": False,
+                    "accepted": False,
+                    "explicit_failure": True,
+                    "code": -1,
+                    "error": "%s: %s" % (exc.__class__.__name__, exc),
+                    "user_order_id": order_tag,
+                })
+        return results
 
     def _handle_cancel_order(self, params):
         if self.order_gateway is None:
@@ -726,6 +967,7 @@ class RedisPubSubRpcService:
         self._received_count = 0
         self._processed_count = 0
         self._published_count = 0
+        self._deferred_count = 0
         self.print_prefix = print_prefix
         self.pending = queue.Queue(maxsize=int(max_queue_size))
         self._running = threading.Event()
@@ -865,6 +1107,12 @@ class RedisPubSubRpcService:
         if self._should_process_in_listener(payload):
             self.process_request(payload)
             return
+        self._deferred_count += 1
+        if self._deferred_count <= self.debug_log_limit:
+            print(
+                "%s deferred method=%s pending_before=%s"
+                % (self.print_prefix, payload.get("method"), self.pending.qsize())
+            )
         self.pending.put_nowait(payload)
 
     def _should_process_in_listener(self, payload):
@@ -905,6 +1153,11 @@ class RedisPubSubRpcService:
                 request = self.pending.get_nowait()
             except queue.Empty:
                 break
+            if self._processed_count < self.debug_log_limit:
+                print(
+                    "%s draining method=%s pending_after=%s"
+                    % (self.print_prefix, request.get("method"), self.pending.qsize())
+                )
             self.process_request(request)
             processed += 1
         return processed
@@ -938,13 +1191,23 @@ class RedisPubSubRpcService:
             "ok": False,
             "data": None,
             "error": "",
+            # server_error carries QMT-side diagnostic info (e.g. passorder
+            # submitted but order not found in system, get_trade_detail_data
+            # returned empty) that doesn't raise an exception but indicates a
+            # problem. Lets clients see why an operation silently failed.
+            "server_error": "",
             "handled_at": _dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         }
         try:
             if self.account_id and account_id and account_id != self.account_id:
                 raise PermissionError("account_id mismatch")
-            response["data"] = to_jsonable(self.handlers.handle(method, request.get("params") or {}))
+            result = self.handlers.handle(method, request.get("params") or {})
+            response["data"] = to_jsonable(result)
             response["ok"] = True
+            # Surface server-side diagnostics when the handler recorded one.
+            server_error = getattr(self.handlers, "_last_server_error", None)
+            if server_error:
+                response["server_error"] = str(server_error)
         except Exception as exc:
             response["error"] = "%s: %s" % (exc.__class__.__name__, exc)
         self._publish_response(request, response)

@@ -44,7 +44,7 @@ class FakeRedis:
         self.acked.append((stream_key, group_name, stream_id))
         return 1
 
-    def xadd(self, stream_key, fields):
+    def xadd(self, stream_key, fields, maxlen=None, approximate=False):
         stream_id = "%d-0" % self.next_id
         self.next_id += 1
         self.streams.setdefault(stream_key, []).append((stream_id, fields))

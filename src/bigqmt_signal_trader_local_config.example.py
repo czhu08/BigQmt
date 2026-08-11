@@ -24,15 +24,13 @@ BIGQMT_REDIS_CONFIG = {
     # },
     # Keep order RPC disabled unless you explicitly want remote order/cancel.
     "rpc_allow_order_methods": True,
-    # Big QMT may freeze custom daemon threads after init and its bundled Redis
-    # client rejects raw stock-code JSON read from Redis. The default production
-    # path therefore uses an encoded Redis list queue and drains it from QMT's
-    # official run_time("adjust", ...) callback.
+    # Redis and ZMQ can both drain requests through QMT's official
+    # run_time("adjust", ...) callback. This avoids GIL stalls in QMT's process.
     "rpc_process_in_listener": True,
     "rpc_listener_methods": ("*",),
     "rpc_background_threads": False,
     "schedule_adjust": True,
-    "schedule_adjust_interval": "500nMilliSecond",
+    "schedule_adjust_interval": "100nMilliSecond",
     # The default mode calls get_full_tick through RPC. Enable this cache only
     # if full-market payloads are too large for your latency/CPU budget.
     # When a client calls get_full_tick, it renews demand for 10 seconds.
@@ -63,4 +61,10 @@ BIGQMT_REDIS_CONFIG = {
     # Push order_callback/deal_callback details to Redis so clients get real-time
     # on_stock_order / on_stock_trade callbacks (MiniQMT style) instead of polling.
     "exec_events_enabled": True,
+    # Dump the raw order_callback/deal_callback object fields to the QMT output
+    # panel, and attach them to the published event as "raw_fields". Prints on
+    # every callback, so keep it off outside a diagnosis window. Turn it on to
+    # observe what m_nDirection / m_nOffsetFlag actually carry in live callbacks
+    # — the buy/sell mapping in exec_events.py currently assumes 48/49 there.
+    "exec_events_debug_raw_fields": False,
 }

@@ -26,16 +26,34 @@ if _af_mod is not None:
     except Exception as _reload_err:
         print("[bigqmt_signal_trader] reload adapter_factory failed: %s" % _reload_err)
 
-from bigqmt_signal_trader.adapter_factory import build_app as _default_build_app
-from bigqmt_signal_trader.runner import (
-    forward_order_event,
-    forward_trade_event,
-    init_app,
-    reset_app as _reset_runner_app,
-    sync_positions_app,
-    tick_app,
-)
-from bigqmt_signal_trader.runtime_bigqmt import BigQmtRuntimeAdapter
+try:
+    _load_bridge_module = __bigqmt_load_local_module
+except NameError:
+    _load_bridge_module = None
+
+if _load_bridge_module is not None:
+    _adapter_factory = _load_bridge_module("bigqmt_signal_trader.adapter_factory")
+    _runner = _load_bridge_module("bigqmt_signal_trader.runner")
+    _runtime_bigqmt = _load_bridge_module("bigqmt_signal_trader.runtime_bigqmt")
+    _default_build_app = _adapter_factory.build_app
+    forward_order_event = _runner.forward_order_event
+    forward_trade_event = _runner.forward_trade_event
+    init_app = _runner.init_app
+    _reset_runner_app = _runner.reset_app
+    sync_positions_app = _runner.sync_positions_app
+    tick_app = _runner.tick_app
+    BigQmtRuntimeAdapter = _runtime_bigqmt.BigQmtRuntimeAdapter
+else:
+    from bigqmt_signal_trader.adapter_factory import build_app as _default_build_app
+    from bigqmt_signal_trader.runner import (
+        forward_order_event,
+        forward_trade_event,
+        init_app,
+        reset_app as _reset_runner_app,
+        sync_positions_app,
+        tick_app,
+    )
+    from bigqmt_signal_trader.runtime_bigqmt import BigQmtRuntimeAdapter
 
 
 _app_factory = None
@@ -44,6 +62,7 @@ _config = {}
 _qmt_api = {}
 _adjust_logged = False
 _rpc_service = None
+_quote_subscription_service = None  # (QuoteSubscriptionManager, QuotePushChannel)
 _scheduled_adjust = False
 # Latency tuning / diagnostics (server side, in the Big QMT process).
 #  - switch interval: hand the GIL to the background RPC thread ~5x more often
@@ -51,7 +70,7 @@ _scheduled_adjust = False
 #  - GIL probe: a heartbeat thread that measures how long the interpreter was
 #    unable to run it (i.e. the process was stalled), independent of any request.
 _GIL_SWITCH_INTERVAL = 0.001
-_LATENCY_PROBE_ENABLED = True
+_LATENCY_PROBE_ENABLED = False
 _LATENCY_PROBE_THRESHOLD_MS = 50.0
 _latency_probe_started = False
 _last_full_tick_refresh_at = 0.0
@@ -218,15 +237,47 @@ def _is_redis_transport(transport_name):
 def _resolve_background_threads(transport_name, configured):
     """Decide whether the RPC service runs its own background receive threads.
 
-    Non-redis transports (zmq/mysql/shm) own their receive threads and have no
-    QMT adjust-drain fallback, so they MUST run background threads or they bind
-    but never receive. Force it on so switching transport is a one-liner
-    (``transport: "zmq"``) — the user needn't also set rpc_background_threads.
-    Redis keeps the configured value (default False = adjust-drain path).
+    Redis honors the configured value because it has a blocking brpop path AND
+    an adjust-driven lpop drain. ZMQ and all other transports MUST run their
+    receiver threads — without the background router loop, requests are never
+    received (ZMQ's start_receiving(background_threads=False) only binds the
+    socket and does not poll it).
     """
-    if not _is_redis_transport(transport_name):
-        return True
-    return bool(configured)
+    normalized = str(transport_name or "redis").lower()
+    if _is_redis_transport(normalized):
+        return bool(configured)
+    return True
+
+
+def _build_quote_subscription_service(context_info, config, transport_name, account_id, redis_client):
+    """Assemble the server-side whole-quote push service (manager + channel).
+
+    Returns ``(manager, channel)`` or ``None`` when disabled. The channel publisher
+    is started in ``_start_rpc_service`` once the RPC service is up; the manager's
+    reaper is fed from ``_drain_rpc_service``.
+    """
+    quote_config = dict(config.get("quote_push") or {})
+    enabled = _config_bool(quote_config.get("enabled"), True)
+    if not enabled:
+        return None
+    if _load_bridge_module is not None:
+        _qsm = _load_bridge_module("bigqmt_signal_trader.quote_subscription_manager")
+    else:
+        from bigqmt_signal_trader import quote_subscription_manager as _qsm
+    import importlib
+
+    _qsm = importlib.reload(_qsm)
+    heartbeat_timeout = float(quote_config.get("heartbeat_timeout_seconds", 30.0))
+    zmq_bind_address = quote_config.get("zmq_bind_address")
+    return _qsm.build_quote_subscription_service(
+        context_info,
+        transport_name=transport_name,
+        account_id=account_id,
+        redis_client=redis_client,
+        zmq_bind_address=zmq_bind_address,
+        enabled=True,
+        heartbeat_timeout_seconds=heartbeat_timeout,
+    )
 
 
 def _build_rpc_service(context_info, app, config):
@@ -234,16 +285,23 @@ def _build_rpc_service(context_info, app, config):
     enabled = _config_bool(config.get("enable_rpc"), False) or _config_bool(rpc_config.get("enabled"), False)
     if not enabled:
         return None
+    transport_name = str(rpc_config.get("transport") or "redis").lower()
+    redis_transport = transport_name in ("redis", "", "default")
 
     import importlib
-    from bigqmt_signal_trader.adapters import redis_common as _redis_common
-    from bigqmt_signal_trader.adapters import market_bigqmt as _market_bigqmt
-    from bigqmt_signal_trader.adapters import position_bigqmt as _position_bigqmt
-    from bigqmt_signal_trader.redis_rpc import BigQmtRpcHandlers, RedisPubSubRpcService
+    if _load_bridge_module is not None:
+        _market_bigqmt = _load_bridge_module("bigqmt_signal_trader.adapters.market_bigqmt")
+        _position_bigqmt = _load_bridge_module("bigqmt_signal_trader.adapters.position_bigqmt")
+        _redis_rpc = _load_bridge_module("bigqmt_signal_trader.redis_rpc")
+        BigQmtRpcHandlers = _redis_rpc.BigQmtRpcHandlers
+        RedisPubSubRpcService = _redis_rpc.RedisPubSubRpcService
+    else:
+        from bigqmt_signal_trader.adapters import market_bigqmt as _market_bigqmt
+        from bigqmt_signal_trader.adapters import position_bigqmt as _position_bigqmt
+        from bigqmt_signal_trader.redis_rpc import BigQmtRpcHandlers, RedisPubSubRpcService
 
     # QMT keeps strategy modules in the same process between editor reruns.
     # Reload adapters here so synced local package fixes take effect immediately.
-    _redis_common = importlib.reload(_redis_common)
     _market_bigqmt = importlib.reload(_market_bigqmt)
     _position_bigqmt = importlib.reload(_position_bigqmt)
     # Reload the lazily-imported helper modules too, so edits to them take effect on
@@ -258,26 +316,41 @@ def _build_rpc_service(context_info, app, config):
             importlib.reload(importlib.import_module(_mod_name))
         except Exception as _reload_err:
             print("[bigqmt_rpc] reload %s failed: %s" % (_mod_name, _reload_err))
-    build_redis_client = _redis_common.build_redis_client
     BigQmtMarketDataProvider = _market_bigqmt.BigQmtMarketDataProvider
     BigQmtPositionProvider = _position_bigqmt.BigQmtPositionProvider
 
     qmt_api = dict(config.get("qmt_api") or {})
-    redis_config = dict(config.get("redis") or {})
-    redis_config.update(dict(rpc_config.get("redis") or {}))
-    listen_redis_config = dict(redis_config)
-    listen_redis_config["socket_timeout"] = None
-    redis_client = rpc_config.get("redis_client") or config.get("redis_client") or build_redis_client(listen_redis_config)
-    response_redis_client = (
-        rpc_config.get("response_redis_client")
-        or config.get("response_redis_client")
-        or build_redis_client(redis_config)
-    )
+    redis_client = None
+    response_redis_client = None
+    if redis_transport:
+        if _load_bridge_module is not None:
+            _redis_common = _load_bridge_module("bigqmt_signal_trader.adapters.redis_common")
+        else:
+            from bigqmt_signal_trader.adapters import redis_common as _redis_common
+
+        _redis_common = importlib.reload(_redis_common)
+        redis_config = dict(config.get("redis") or {})
+        redis_config.update(dict(rpc_config.get("redis") or {}))
+        listen_redis_config = dict(redis_config)
+        listen_redis_config["socket_timeout"] = None
+        redis_client = rpc_config.get("redis_client") or config.get("redis_client") or _redis_common.build_redis_client(listen_redis_config)
+        response_redis_client = (
+            rpc_config.get("response_redis_client")
+            or config.get("response_redis_client")
+            or _redis_common.build_redis_client(redis_config)
+        )
     account_id = str(rpc_config.get("account_id") or config.get("account_id") or _account_id or "")
     if not account_id:
         print("[bigqmt_rpc] disabled: account_id is empty")
         return None
     allow_order_methods = _config_bool(rpc_config.get("allow_order_methods"), False)
+    global _quote_subscription_service
+    _quote_subscription_service = _build_quote_subscription_service(
+        context_info, config, transport_name, account_id, redis_client
+    )
+    quote_manager = (
+        _quote_subscription_service[0] if _quote_subscription_service is not None else None
+    )
     handlers = BigQmtRpcHandlers(
         account_id=account_id,
         market_data=BigQmtMarketDataProvider(context_info),
@@ -290,10 +363,10 @@ def _build_rpc_service(context_info, app, config):
         allow_order_methods=allow_order_methods,
         allowed_methods=rpc_config.get("allowed_methods"),
         qmt_api=qmt_api,
+        quote_subscription_manager=quote_manager,
     )
     process_in_listener = _config_bool(rpc_config.get("process_in_listener"), True)
     listener_methods = rpc_config.get("listener_methods") or ("*",)
-    transport_name = str(rpc_config.get("transport") or "redis").lower()
     configured_bg = _config_bool(rpc_config.get("background_threads"), False)
     background_threads = _resolve_background_threads(transport_name, configured_bg)
     if background_threads and not configured_bg:
@@ -303,7 +376,10 @@ def _build_rpc_service(context_info, app, config):
     # bypass the Redis clients entirely.
     transport = None
     if transport_name not in ("redis", "", "default"):
-        from bigqmt_signal_trader.transports.factory import build_transport
+        if _load_bridge_module is not None:
+            build_transport = _load_bridge_module("bigqmt_signal_trader.transports.factory").build_transport
+        else:
+            from bigqmt_signal_trader.transports.factory import build_transport
 
         factory_config = dict(rpc_config)
         factory_config["account_id"] = account_id
@@ -338,6 +414,13 @@ def _start_rpc_service(context_info, app, config):
     _rpc_service = _build_rpc_service(context_info, app, config)
     if _rpc_service is not None:
         _rpc_service.start()
+        if _quote_subscription_service is not None:
+            try:
+                _quote_subscription_service[1].start_publisher()
+                print("[bigqmt_quote_push] publisher started transport=%s"
+                      % str(dict(config.get("rpc") or {}).get("transport") or "redis"))
+            except Exception as exc:
+                print("[bigqmt_quote_push] publisher start failed: %s" % exc)
     return _rpc_service
 
 
@@ -350,6 +433,11 @@ def _drain_rpc_service(config):
     if hasattr(_rpc_service, "drain_request_queue"):
         processed += _rpc_service.drain_request_queue(max_items=max_items)
     processed += _rpc_service.drain_pending(max_items=max_items)
+    if _quote_subscription_service is not None:
+        try:
+            _quote_subscription_service[0].reap_expired()
+        except Exception as exc:
+            print("[bigqmt_quote_push] reap failed: %s" % exc)
     return processed
 
 
@@ -538,7 +626,50 @@ def init(ContextInfo):
     _start_rpc_service(ContextInfo, app, config)
     _schedule_adjust_if_needed(ContextInfo, config)
     print("[bigqmt_signal_trader] init ok")
+
+    # 启动时自动诊断：检测服务状态 + 关键函数绑定，方便发现问题
+    _diag_startup(ContextInfo, config)
     return app
+
+
+def _diag_startup(ContextInfo, config):
+    """Startup diagnostics: check service status and key function bindings.
+
+    Prints a summary to the QMT log so users can quickly see if the RPC service
+    is up, which transport is active, and whether key QMT functions (passorder,
+    get_trade_detail_data) are bound. Helps diagnose "service won't start" issues.
+    """
+    print("=" * 60)
+    print("[bigqmt_diag] startup diagnostics")
+    print("=" * 60)
+
+    # 1. RPC service status
+    rpc_config = dict(config.get("rpc") or {})
+    transport = rpc_config.get("transport", "redis")
+    print("[bigqmt_diag] transport=%s" % transport)
+    if _rpc_service is not None:
+        print("[bigqmt_diag] rpc_service=running (type=%s)" % type(_rpc_service).__name__)
+    else:
+        print("[bigqmt_diag] rpc_service=NOT STARTED (check enable_rpc / errors above)")
+
+    # 2. Key QMT function bindings
+    qmt_api = dict(config.get("qmt_api") or {})
+    for name in ("passorder", "cancel", "get_trade_detail_data"):
+        bound = qmt_api.get(name) is not None
+        print("[bigqmt_diag] %s bound=%s" % (name, bound))
+
+    # 3. Quick connectivity test (get_full_tick)
+    try:
+        tick = ContextInfo.get_full_tick(["000001.SZ"])
+        if tick:
+            print("[bigqmt_diag] get_full_tick=OK (keys=%d)" % len(tick))
+        else:
+            print("[bigqmt_diag] get_full_tick=EMPTY (market may be closed)")
+    except Exception as e:
+        print("[bigqmt_diag] get_full_tick=FAIL: %s" % str(e)[:60])
+
+    print("[bigqmt_diag] diagnostics complete")
+    print("=" * 60)
 
 
 def _pump_download_jobs(context_info, config):
@@ -616,6 +747,18 @@ def _publish_exec_event(kind, obj):
     """Push a normalized order/trade event to Redis for real-time client callbacks."""
     config = _build_config()
     event_config = dict(config.get("exec_events") or {})
+    # Raw-field diagnostics run BEFORE every other check (and before the
+    # enabled/account_id early returns), because the point is to observe the
+    # object exactly as QMT handed it over — even when publishing is off.
+    raw_fields = None
+    if _config_bool(event_config.get("debug_raw_fields"), False):
+        try:
+            from bigqmt_signal_trader import exec_events
+
+            print(exec_events.format_raw_snapshot(kind, obj))
+            raw_fields = exec_events.raw_field_snapshot(obj)
+        except Exception as exc:
+            print("[bigqmt_exec_raw] snapshot %s failed: %s" % (kind, exc))
     if not _config_bool(event_config.get("enabled"), True):
         return
     account_id = str(event_config.get("account_id") or config.get("account_id") or _account_id or "")
@@ -633,15 +776,26 @@ def _publish_exec_event(kind, obj):
         from bigqmt_signal_trader import exec_events
 
         if kind == "trade":
-            print("publish_trade_event")
-            exec_events.publish_trade_event(
-                redis_client, account_id, exec_events.normalize_trade_event(obj, account_id)
-            )
+            event = exec_events.normalize_trade_event(obj, account_id)
+            if raw_fields:
+                event["raw_fields"] = raw_fields
+            exec_events.publish_trade_event(redis_client, account_id, event)
         else:
-            print("publish_order_event")
-            exec_events.publish_order_event(
-                redis_client, account_id, exec_events.normalize_order_event(obj, account_id)
-            )
+            event = exec_events.normalize_order_event(obj, account_id)
+            if raw_fields:
+                event["raw_fields"] = raw_fields
+            exec_events.publish_order_event(redis_client, account_id, event)
+            # 废单 (status=57 ENTRUST_STATUS_JUNK) 推送 order_error，让客户端
+            # on_order_error 能感知下单被拒。
+            try:
+                status = int(event.get("status") or 0)
+            except (TypeError, ValueError):
+                status = 0
+            if status == 57:
+                err_event = exec_events.normalize_order_error_event(obj, account_id)
+                if raw_fields:
+                    err_event["raw_fields"] = raw_fields
+                exec_events.publish_order_error_event(redis_client, account_id, err_event)
     except Exception as exc:
         print("[bigqmt_exec_events] publish %s failed: %s" % (kind, exc))
 
