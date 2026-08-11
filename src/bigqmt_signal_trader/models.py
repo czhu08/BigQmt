@@ -2,7 +2,7 @@
 
 import datetime as _dt
 from enum import Enum
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 
 class SignalAction(str, Enum):
@@ -32,13 +32,13 @@ def parse_datetime(value: Any, field_name: str) -> _dt.datetime:
     raise ValueError(f"{field_name} is required")
 
 
-def _optional_int(value: Any) -> Optional[int]:
+def _optional_int(value: Any) -> int | None:
     if value is None or value == "":
         return None
     return int(value)
 
 
-def _optional_float(value: Any) -> Optional[float]:
+def _optional_float(value: Any) -> float | None:
     if value is None or value == "":
         return None
     return float(value)
@@ -105,7 +105,7 @@ class TradeSignal:
         self.raw_payload = dict(raw_payload or {})
 
     @classmethod
-    def from_dict(cls, payload: Dict[str, Any]) -> "TradeSignal":
+    def from_dict(cls, payload: dict[str, Any]) -> "TradeSignal":
         required = ("signal_id", "account_id", "action", "created_at", "expire_at", "schema_version")
         for field_name in required:
             if payload.get(field_name) in (None, ""):
