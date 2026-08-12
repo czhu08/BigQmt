@@ -1675,10 +1675,14 @@ class BigQmtXtTrader:
         account_id = str(event.get("account_id") or self.client.account_id or "")
         try:
             event_type = event.get("event_type")
-            if event_type == "trade":
-                callback.on_stock_trade(self._trade_from_dict(account_id, event))
-            elif event_type == "order":
-                callback.on_stock_order(self._order_from_dict(account_id, event))
+            if event.get("event_type") == "trade":
+                res = self._trade_from_dict(account_id, event)
+                if res:
+                    callback.on_stock_trade(res)
+            elif event.get("event_type") == "order":
+                res = self._order_from_dict(account_id, event)
+                if res:
+                    callback.on_stock_order(res) 
             elif event_type == "order_error":
                 callback.on_order_error(
                     CompatObject(
@@ -1913,6 +1917,8 @@ class BigQmtXtTrader:
         ) or {}
 
     def order_stock_async(self, *args, **kwargs):
+        return self.order_stock(*args, **kwargs)
+
         # MiniQMT semantics: returns a seq; the result comes back through
         # on_order_stock_async_response(seq, order_error|None). Our RPC is
         # synchronous under the hood, so we fire the response callback
@@ -2179,6 +2185,8 @@ class BigQmtXtTrader:
         return self._async_query(self.query_appointment_info, account, callback)
 
     def cancel_order_stock_async(self, account, order_id):
+        return self.cancel_order_stock(account, order_id)
+
         # MiniQMT: returns seq, result comes back via on_cancel_order_stock_async_response.
         seq = self._next_async_seq()
         try:
@@ -2215,6 +2223,8 @@ class BigQmtXtTrader:
         return seq
 
     def cancel_order_stock_sysid_async(self, account, market, order_sysid):
+        return self.cancel_order_stock_sysid(account, market, order_sysid)
+
         seq = self._next_async_seq()
         try:
             ok = self.cancel_order_stock_sysid(account, market, order_sysid)
