@@ -698,6 +698,11 @@ class BigQmtXtData:
         self._quote_session = None          # lazily built WholeQuoteClientSession
         self._quote_session_factory = None  # test hook: returns a session-like object
 
+        self._subscription_thread = None
+        self._subscription_stop_event = None
+        self._subscription_codes = []
+        self._subscription_lock = threading.Lock()
+
     def _next_seq(self):
         self._subscribe_seq += 1
         return self._subscribe_seq
