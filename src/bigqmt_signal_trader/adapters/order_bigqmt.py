@@ -194,9 +194,9 @@ class BigQmtOrderGateway:
                     volume=int(_attr(row, ("m_nVolume", "volume"), 0) or 0),
                     price=float(_attr(row, ("m_dPrice", "m_dTradePrice", "price"), 0.0) or 0.0),
                     traded_at=dt,
+                    user_order_id=str(_attr(row, ["m_strRemark", "user_order_id", "remark"])),
                     amount = float(_attr(row, ["m_dTradeAmount", "amount"])),
-                    commission=float(_attr(row, ["m_dCommission", "m_dComission", "commission"])),
-                    remark=str(_attr(row, ["m_strRemark", "order_remark", "remark"]))
+                    commission=float(_attr(row, ["m_dCommission", "m_dComission", "commission"]))
                 )
             )
         return result

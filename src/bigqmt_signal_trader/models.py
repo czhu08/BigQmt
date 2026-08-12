@@ -143,7 +143,7 @@ class TradeSignal:
             percentage=percentage,
             price_type=str(payload.get("price_type") or "AUTO_LIMIT").upper(),
             price=_optional_float(payload.get("price")),
-            strategy_name=str(payload.get("strategy_name")),
+            strategy_name=str(payload.get("strategy_name") or "bigqmt_signal_trader"),
             remark=str(payload.get("remark") or ""),
             source=str(payload.get("source") or ""),
             source_type=str(payload.get("source_type") or "auto"),
@@ -265,7 +265,8 @@ class OrderSnapshot:
 
 
 class TradeSnapshot:
-    def __init__(self, trade_id, order_sys_id, stock_code, action, volume, price, traded_at="", amount=0, commission=0, remark=""):
+    def __init__(self, trade_id, order_sys_id, stock_code, action, volume, price,
+                 traded_at="", user_order_id="", amount=0, commission=0):
         self.trade_id = trade_id
         self.order_sys_id = order_sys_id
         self.stock_code = stock_code
@@ -273,9 +274,9 @@ class TradeSnapshot:
         self.volume = volume
         self.price = price
         self.traded_at = traded_at
+        self.user_order_id = user_order_id
         self.amount = amount
         self.commission = commission
-        self.remark = remark
 
 
 class OrderRef:

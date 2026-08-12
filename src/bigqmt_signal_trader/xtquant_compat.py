@@ -1005,7 +1005,6 @@ class BigQmtXtData:
         }
         self.client.save_quote_subscription(seq, payload, active=True)
         self.client.publish_event("subscribe_quote", payload)
-
         if callback is not None:
             try:
                 if str(period).lower() in ("tick", "full_tick"):
@@ -1023,7 +1022,6 @@ class BigQmtXtData:
                     )
             except Exception:
                 pass
-            
         return seq
 
     def subscribe_quote2(self, stock_code, period="1d", start_time="", end_time="", count=0, dividend_type=None, callback=None):
@@ -2298,10 +2296,10 @@ class BigQmtXtTrader:
                 order_sysid=order_sysid,
                 order_id=order_sysid,
                 traded_id=trade_id,
-                order_remark=str(item.get("remark") or ""),
                 traded_volume=_safe_int(item.get("volume", item.get("traded_volume"))),
                 traded_price=_safe_float(item.get("price", item.get("traded_price"))),
                 traded_time=str(item.get("traded_at") or ""),
+                order_remark=str(item.get("user_order_id") or item.get("remark") or ""),
                 traded_amount=float(item.get("amount") or 0),
                 commission=float(item.get("commission") or 0),
             )

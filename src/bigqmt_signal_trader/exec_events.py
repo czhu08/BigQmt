@@ -297,6 +297,7 @@ def normalize_order_event(order, account_id=""):
         dt = str(date) + " " + str(_attr(order, "m_strInsertTime", ""))
     else:
         dt = str(_attr(order, "m_strInsertTime", ""))
+    direction = _extract_direction(order)
     return {
         "event_type": EVENT_ORDER,
         "account_id": str(_attr(order, ["m_strAccountID", "account_id"], account_id) or account_id or ""),
@@ -306,11 +307,13 @@ def normalize_order_event(order, account_id=""):
         ),
         "order_sys_id": str(_attr(order, ["m_strOrderSysID", "order_sys_id", "order_sysid", "order_id"], "") or ""),
         "user_order_id": str(_attr(order, ("m_strRemark", "user_order_id", "remark"), "") or ""),
-        "volume": _attr(order, ["m_nVolumeTotalOriginal", "order_volume", "volume"]),
+        "order_volume": _attr(order, ["m_nVolumeTotal", "order_volume", "volume"]),
         "traded_volume": _attr(order, ["m_nVolumeTraded", "traded_volume"]),
         "price": _attr(order, ["m_dLimitPrice", "price", "limit_price"]),
         "status": _attr(order, ["m_nOrderStatus", "order_status", "status"]),
-        "action": _action_from_offset_flag(_attr(order, ("m_nOffsetFlag", "offset_flag"), 0)),
+        "direction": direction,
+        "action": _action_from_direction(direction),
+        "offset_flag": _attr(order, ["m_nOffsetFlag", "offset_flag"]),
         "strategy_name": str(_attr(order, ["m_strOptName", "strategy_name"], "") or ""),
         "remark": _attr(order, ["m_strRemark", "order_remark", "remark"], ""),
         "created_at": dt,
@@ -326,6 +329,7 @@ def normalize_trade_event(trade, account_id=""):
         dt = str(date) + " " + str(_attr(trade, "m_strTradeTime", ""))
     else:
         dt = str(_attr(trade, "m_strTradeTime", ""))
+    direction = _extract_direction(trade)
     return {
         "event_type": EVENT_TRADE,
         "account_id": str(_attr(trade, ["m_strAccountID", "account_id"], account_id) or account_id or ""),
@@ -338,8 +342,10 @@ def normalize_trade_event(trade, account_id=""):
         "volume": _attr(trade, ["m_nVolume", "volume", "traded_volume"]),
         "price": _attr(trade, ["m_dPrice", "price", "traded_price"]),
         "amount": _attr(trade, ["m_dTradeAmount", "amount"]),
-        "commission": _attr(trade, ["m_dCommission", "m_dComission", "commission"]),
-        "action": _action_from_offset_flag(_attr(trade, ("m_nOffsetFlag", "offset_flag"), 0)),
+        "commission": _attr(trade, ["m_dComssion", "m_dCommission", "commission"]),
+        "direction": direction,
+        "action": _action_from_direction(direction),
+        "offset_flag": _attr(trade, ["m_nOffsetFlag", "offset_flag"]),
         "remark": _attr(trade, ["m_strRemark", "order_remark", "remark"]),
         "traded_at": dt,
         # "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
