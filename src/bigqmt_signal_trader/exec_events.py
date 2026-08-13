@@ -307,8 +307,7 @@ def normalize_order_event(order, account_id=""):
             _attr(order, ("m_strExchangeID", "exchange_id", "market")),
         ),
         "order_sys_id": str(_attr(order, ["m_strOrderSysID", "order_sys_id", "order_sysid", "order_id"], "") or ""),
-        "user_order_id": str(_attr(order, ("m_strRemark", "user_order_id", "remark"), "") or ""),
-        "order_volume": _attr(order, ["m_nVolumeTotal", "order_volume", "volume"]),
+        "order_volume": _attr(order, ["m_nVolumeTotalOriginal", "order_volume", "volume"]),
         "traded_volume": _attr(order, ["m_nVolumeTraded", "traded_volume"]),
         "price": _attr(order, ["m_dLimitPrice", "price", "limit_price"]),
         "status": _attr(order, ["m_nOrderStatus", "order_status", "status"]),
@@ -316,8 +315,9 @@ def normalize_order_event(order, account_id=""):
         "action": _action_from_direction(direction),
         "offset_flag": _attr(order, ["m_nOffsetFlag", "offset_flag"]),
         "strategy_name": str(_attr(order, ["m_strOptName", "strategy_name"], "") or ""),
-        "remark": _attr(order, ["m_strRemark", "order_remark", "remark"], ""),
         "created_at": dt,
+        "user_order_id": str(_attr(order, ("m_strRemark", "user_order_id"), "") or ""),
+        "remark": _attr(order, ["m_strRemark", "order_remark", "remark"], ""),
         "price_type": _attr(order, "m_nOrderPriceType", 50),
         "status_msg": str(_attr(order, "m_strCancelInfo", ""))
     }
@@ -347,8 +347,8 @@ def normalize_trade_event(trade, account_id=""):
         "direction": direction,
         "action": _action_from_direction(direction),
         "offset_flag": _attr(trade, ["m_nOffsetFlag", "offset_flag"]),
-        "remark": _attr(trade, ["m_strRemark", "order_remark", "remark"]),
         "traded_at": dt,
+        "remark": _attr(trade, ["m_strRemark", "order_remark", "remark"]),
         # "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
         # "created_at_ts": time.time(),
     }

@@ -2271,9 +2271,10 @@ class BigQmtXtTrader:
 
     def _order_from_dict(self, account_id, item):
         action = item.get("action")
-        order_type = _action_to_order_type(action)     
+        order_type = _action_to_order_type(action)
         order_sysid = str(item.get("order_sys_id") or item.get("order_sysid") or item.get("order_id") or "")
         if order_sysid:
+            # print(f"price_type: {item.get('price_type')}")
             return CompatObject(
                 account_id=account_id,
                 stock_code=str(item.get("stock_code") or ""),
@@ -2282,12 +2283,12 @@ class BigQmtXtTrader:
                 order_volume=_safe_int(item.get("volume", item.get("order_volume"))),
                 traded_volume=_safe_int(item.get("traded_volume")),
                 price=_safe_float(item.get("price")),
-                price_type=_safe_int(item.get("price_type")),  # 50 限价 83 市价
                 order_sysid=order_sysid,
                 order_id=order_sysid,
                 strategy_name=str(item.get("strategy_name") or ""),  # 限价买入
+                order_remark=str(item.get("remark") or item.get("user_order_id") or ""),
+                price_type=_safe_int(item.get("price_type")),  # 50, 121 限价 83 市价
                 order_time=str(item.get("created_at") or ""),
-                order_remark=str(item.get("remark") or ""),
                 status_msg=str(item.get("status_msg") or ""),
             )
         else:
