@@ -107,15 +107,17 @@ class ZmqQuotePushChannel(QuotePushChannel):
         self._running = True
 
     def publish(self, topic, data):
-        if self._pub is None:
-            return
         payload = encode_push_payload({"combo_key": topic, "data": data})
         frame = [str(topic).encode("utf-8"), payload]
-        # PUB socket is not thread-safe; the big-QMT quote thread and any other
-        # publisher thread serialize here.
+        # PUB socket is not thread-safe; serialize under the lock and read the
+        # socket inside it so a concurrent stop() (which nulls _pub) can't hand
+        # us a closed socket.
         with self._pub_lock:
+            pub = self._pub
+            if pub is None:
+                return
             try:
-                self._pub.send_multipart(frame)
+                pub.send_multipart(frame)
             except Exception as exc:
                 print("%s zmq publish failed: %s" % (self.print_prefix, exc))
 
@@ -124,50 +126,71 @@ class ZmqQuotePushChannel(QuotePushChannel):
         zmq, ctx = self._ensure_context()
         if not self.connect_address:
             raise ValueError("connect_address is required to start a subscriber")
-        self._sub = ctx.socket(zmq.SUB)
-        self._sub.connect(self.connect_address)
+        sub = ctx.socket(zmq.SUB)
+        sub.connect(self.connect_address)
         for topic in topics or []:
-            self._sub.setsockopt(zmq.SUBSCRIBE, str(topic).encode("utf-8"))
+            sub.setsockopt(zmq.SUBSCRIBE, str(topic).encode("utf-8"))
+        self._sub = sub
         self._running = True
         self._sub_thread = threading.Thread(
-            target=self._sub_loop, args=(on_msg,), name="bigqmt-quote-push-sub", daemon=True
+            target=self._sub_loop, args=(sub, on_msg), name="bigqmt-quote-push-sub", daemon=True
         )
         self._sub_thread.start()
 
-    def _sub_loop(self, on_msg):
+    def _sub_loop(self, sub, on_msg):
+        # The SUB socket is owned by THIS thread; it must be closed HERE (in a
+        # finally) and never from another thread. Closing a ZMQ socket cross-
+        # thread trips a Windows signaler assertion and aborts the whole QMT
+        # process (the "auto-exit" users hit).
         poller = self._zmq.Poller()
-        poller.register(self._sub, self._zmq.POLLIN)
-        while self._running:
+        poller.register(sub, self._zmq.POLLIN)
+        try:
+            while self._running:
+                try:
+                    events = dict(poller.poll(200))
+                except Exception:
+                    break
+                if sub not in events:
+                    continue
+                try:
+                    frames = sub.recv_multipart(self._zmq.NOBLOCK)
+                except Exception:
+                    continue
+                if len(frames) < 2:
+                    continue
+                topic = frames[0].decode("utf-8", errors="ignore")
+                data = decode_push_payload(frames[-1])
+                payload_data = data.get("data") if isinstance(data, dict) else data
+                try:
+                    on_msg(topic, payload_data)
+                except Exception as exc:
+                    print("%s subscriber callback failed: %s" % (self.print_prefix, exc))
+        finally:
             try:
-                events = dict(poller.poll(200))
+                sub.close(linger=0)
             except Exception:
-                break
-            if self._sub not in events:
-                continue
-            try:
-                frames = self._sub.recv_multipart(self._zmq.NOBLOCK)
-            except Exception:
-                continue
-            if len(frames) < 2:
-                continue
-            topic = frames[0].decode("utf-8", errors="ignore")
-            data = decode_push_payload(frames[-1])
-            payload_data = data.get("data") if isinstance(data, dict) else data
-            try:
-                on_msg(topic, payload_data)
-            except Exception as exc:
-                print("%s subscriber callback failed: %s" % (self.print_prefix, exc))
+                pass
 
     def stop(self):
+        # Signal the sub thread to exit and let IT close its own socket (see
+        # _sub_loop). Closing the SUB socket from this (foreign) thread would
+        # trip the Windows ZMQ signaler abort and crash QMT.
         self._running = False
-        for sock in (self._sub, self._pub):
-            if sock is not None:
-                try:
-                    sock.close(linger=0)
-                except Exception:
-                    pass
+        thread = self._sub_thread
+        if thread is not None and thread.is_alive():
+            thread.join(1.0)
+        self._sub_thread = None
         self._sub = None
-        self._pub = None
+        # The PUB socket is only touched by publisher threads under _pub_lock;
+        # null it first so a racing publish() sees None and bails, then close.
+        with self._pub_lock:
+            pub = self._pub
+            self._pub = None
+        if pub is not None:
+            try:
+                pub.close(linger=0)
+            except Exception:
+                pass
 
 
 class RedisQuotePushChannel(QuotePushChannel):
@@ -204,6 +227,8 @@ class RedisQuotePushChannel(QuotePushChannel):
         self._thread.start()
 
     def _sub_loop(self, topics, on_msg):
+        # The pubsub connection is owned by THIS thread and closed HERE so a
+        # concurrent stop() can't close it out from under us.
         pubsub = self.redis.pubsub(ignore_subscribe_messages=True)
         self._pubsub = pubsub
         channels = [self._channel(topic) for topic in topics]
@@ -212,29 +237,34 @@ class RedisQuotePushChannel(QuotePushChannel):
         except Exception as exc:
             print("%s redis subscribe failed: %s" % (self.print_prefix, exc))
             return
-        while self._running:
+        try:
+            while self._running:
+                try:
+                    message = pubsub.get_message(timeout=0.2)
+                except Exception:
+                    break
+                if not message or message.get("type") != "message":
+                    continue
+                channel = message.get("channel")
+                if isinstance(channel, bytes):
+                    channel = channel.decode("utf-8", errors="ignore")
+                topic = str(channel).rsplit(":", 1)[-1]
+                data = decode_push_payload(message.get("data"))
+                payload_data = data.get("data") if isinstance(data, dict) else data
+                try:
+                    on_msg(topic, payload_data)
+                except Exception as exc:
+                    print("%s subscriber callback failed: %s" % (self.print_prefix, exc))
+        finally:
             try:
-                message = pubsub.get_message(timeout=0.2)
+                pubsub.close()
             except Exception:
-                break
-            if not message or message.get("type") != "message":
-                continue
-            channel = message.get("channel")
-            if isinstance(channel, bytes):
-                channel = channel.decode("utf-8", errors="ignore")
-            topic = str(channel).rsplit(":", 1)[-1]
-            data = decode_push_payload(message.get("data"))
-            payload_data = data.get("data") if isinstance(data, dict) else data
-            try:
-                on_msg(topic, payload_data)
-            except Exception as exc:
-                print("%s subscriber callback failed: %s" % (self.print_prefix, exc))
+                pass
 
     def stop(self):
         self._running = False
-        if self._pubsub is not None:
-            try:
-                self._pubsub.close()
-            except Exception:
-                pass
+        thread = self._thread
+        if thread is not None and thread.is_alive():
+            thread.join(1.0)
+        self._thread = None
         self._pubsub = None

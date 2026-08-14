@@ -125,6 +125,31 @@ class ZmqPushChannelTest(unittest.TestCase):
         self.assertEqual(topic, "SH,SZ")
         self.assertEqual(data["000001.SZ"]["lastPrice"], 10.5)
 
+    def test_stop_from_foreign_thread_while_sub_active_does_not_crash(self):
+        """Regression: stop() used to close the SUB socket from the calling
+        thread while the sub thread was still polling it -> Windows ZMQ
+        signaler abort -> QMT process crash ("auto-exit"). The sub thread must
+        close its own socket; repeated stop/start (topic changes) must be safe."""
+        zmq = __import__("zmq")
+        ctx = zmq.Context.instance()
+        pub_addr = "inproc://quote-push-stop-%d" % id(self)
+
+        server = ZmqQuotePushChannel(bind_address=pub_addr, context=ctx)
+        server.start_publisher()
+        client = ZmqQuotePushChannel(connect_address=pub_addr, context=ctx)
+        try:
+            for i in range(5):
+                # Simulate _sync_subscriber_locked topic changes: start a
+                # subscriber, immediately stop it from this (foreign) thread.
+                client.start_subscriber(["T%d" % i], lambda t, d: None)
+                time.sleep(0.05)
+                client.stop()  # must not raise / abort
+        finally:
+            client.stop()
+            server.stop()
+        # Reaching here without an abort/crash is the assertion.
+        self.assertTrue(True)
+
 
 class RedisPushChannelTest(unittest.TestCase):
     def test_pub_sub_roundtrip(self):
