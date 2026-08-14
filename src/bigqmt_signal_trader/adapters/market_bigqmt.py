@@ -405,9 +405,9 @@ class BigQmtMarketDataProvider:
             return self._call_context("download_history_data", **kwargs)
 
         sdk_kwargs = {"incrementally": incrementally} if incrementally is not None else {}
-            return self._download(
-                "download_history_data", (stock_code, period, start_time, end_time), sdk_kwargs, _via_context
-            )
+        return self._download(
+            "download_history_data", (stock_code, period, start_time, end_time), sdk_kwargs, _via_context
+        )
 
     def download_history_data2(self, stock_list, period, start_time="", end_time="", incrementally=None):
         stock_list = list(stock_list or [])
@@ -419,9 +419,9 @@ class BigQmtMarketDataProvider:
             return self._call_context("download_history_data2", **kwargs)
 
         sdk_kwargs = {"incrementally": incrementally} if incrementally is not None else {}
-            return self._download(
-                "download_history_data2", (stock_list, period, start_time, end_time), sdk_kwargs, _via_context
-            )
+        return self._download(
+            "download_history_data2", (stock_list, period, start_time, end_time), sdk_kwargs, _via_context
+        )
 
     def get_trading_dates(self, market, start_time="", end_time="", count=-1):
         # xtdata SDK signature: get_trading_dates(market, start_time, end_time, count)
