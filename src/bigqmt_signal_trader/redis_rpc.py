@@ -693,6 +693,59 @@ class BigQmtRpcHandlers:
     def _handle_get_hkt_exchange_rate(self, params):
         return self._call_qmt_global("get_hkt_exchange_rate")
 
+    def _handle_download_history_data(self, params):
+        """download_history_data is a QMT global function (issue #32).
+
+        It is NOT a ContextInfo method — the adapter's _call_context path
+        always raised NotImplementedError. Now route through qmt_api (the
+        injected global), falling back to the adapter (which tries native
+        xtdata SDK then ContextInfo).
+        """
+        func = self.qmt_api.get("download_history_data")
+        if func is not None:
+            try:
+                stock_code = str(params.get("stock_code") or "")
+                period = str(params.get("period") or "1d")
+                start_time = str(params.get("start_time") or "")
+                end_time = str(params.get("end_time") or "")
+                result = func(stock_code, period, start_time, end_time)
+                return bool(result) if result is not None else True
+            except Exception as exc:
+                raise RuntimeError("download_history_data failed: %s" % exc)
+        # Fallback: adapter tries native xtdata SDK then ContextInfo.
+        # If the adapter lacks the method, return False (not crash).
+        try:
+            return self._handle_market_data_method("download_history_data", params)
+        except (NotImplementedError, AttributeError):
+            return False
+
+    def _handle_download_history_data2(self, params):
+        """download_history_data2 is a QMT global function (issue #32).
+
+        Native signature includes an optional callback for progress; the QMT
+        global may require it, so pass a no-op when the client didn't.
+        """
+        func = self.qmt_api.get("download_history_data2")
+        if func is not None:
+            try:
+                stock_list = list(params.get("stock_list") or [])
+                period = str(params.get("period") or "1d")
+                start_time = str(params.get("start_time") or "")
+                end_time = str(params.get("end_time") or "")
+                # Try with a no-op callback first (some QMT builds require it);
+                # fall back to 4-arg call if that raises TypeError.
+                try:
+                    result = func(stock_list, period, start_time, end_time, lambda data: None)
+                except TypeError:
+                    result = func(stock_list, period, start_time, end_time)
+                return bool(result) if result is not None else True
+            except Exception as exc:
+                raise RuntimeError("download_history_data2 failed: %s" % exc)
+        try:
+            return self._handle_market_data_method("download_history_data2", params)
+        except (NotImplementedError, AttributeError):
+            return False
+
     def _order_action_from_params(self, params):
         action = str(params.get("action") or "").upper()
         if action:

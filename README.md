@@ -289,6 +289,60 @@ QMT 原生安装、逐 Bar 同步协议、CSV 备用模式和安全边界见
 
 对股票现货，direction=offset（48=买/49=卖）；对期货，direction≠offset，仲裁保正确。
 
+### 多账号使用（股票+期货 / 普通+信用）
+
+当前架构是**单账号单实例**——一个 QMT 策略进程绑定一个账号，RPC channel 按 `account_id` 隔离（`bigqmt:rpc:req:{account_id}`）。多账号场景（如股票+期货、普通+信用账户同时交易）的推荐方案是**在 QMT 里跑多个策略实例**，每个实例绑一个账号。
+
+#### 方案：多策略实例（推荐，不改代码）
+
+**服务端（QMT 内）**：为每个账号创建一个独立的配置文件和 DRYRUN 入口。
+
+```python
+# bigqmt_signal_trader_local_config_stock.py  — 股票账号
+BIGQMT_ACCOUNT_ID = "你的股票账号"
+BIGQMT_REDIS_CONFIG = {
+    "host": "...", "port": 6379, "db": 5, "password": "...",
+    "transport": "redis",          # 或 "zmq"
+    "account_type": "STOCK",       # 股票
+    # ...
+}
+
+# bigqmt_signal_trader_local_config_credit.py  — 信用账号
+BIGQMT_ACCOUNT_ID = "你的信用账号"
+BIGQMT_REDIS_CONFIG = {
+    "host": "...", "port": 6379, "db": 5, "password": "...",
+    "transport": "redis",
+    "account_type": "CREDIT",      # 信用（两融）
+    # ...
+}
+```
+
+然后在 QMT 策略编辑器里加载两个 DRYRUN 文件（每个指向不同的配置），分别运行。两个实例的 RPC channel 自动隔离（按 account_id）。
+
+> **zmq 模式注意**：每个实例的 zmq 端口从 account_id 派生（`15560 + account_id mod 100`），不同账号自动不冲突。
+
+**客户端（外部程序）**：为每个账号创建独立的 client/trader 对象。
+
+```python
+from bigqmt_signal_trader.xtquant_compat import BigQmtRpcClient, BigQmtXtTrader, StockAccount
+
+# 股票账号
+stock_client = BigQmtRpcClient(account_id="股票账号", redis_config={...})
+stock_trader = BigQmtXtTrader(account_id="股票账号", redis_client=stock_client.redis_client)
+stock_acc = StockAccount("股票账号", "STOCK")
+
+# 信用账号
+credit_client = BigQmtRpcClient(account_id="信用账号", redis_config={...})
+credit_trader = BigQmtXtTrader(account_id="信用账号", redis_client=credit_client.redis_client)
+credit_acc = StockAccount("信用账号", "CREDIT")
+
+# 分别查询/下单
+stock_asset = stock_trader.query_stock_asset(stock_acc)
+credit_positions = credit_trader.query_stock_positions(credit_acc)
+```
+
+> **跨账号隔离**：每个账号的 RPC channel、持仓查询、委托回报完全隔离（按 `account_id` 路由），互不影响。
+
 ---
 
 ## 环境要求与依赖安装

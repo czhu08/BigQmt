@@ -729,5 +729,74 @@ class RedisRpcTest(unittest.TestCase):
         self.assertEqual(response["data"]["data"]["600000.SH"]["close"], [10.0])
 
 
+class DownloadHistoryDataTest(unittest.TestCase):
+    """Issue #32: download_history_data was routing to ContextInfo (which has
+    no such method) instead of the QMT-injected global function."""
+
+    def _handlers_with_qmt_global(self, func_name, func):
+        return BigQmtRpcHandlers(
+            account_id="acct",
+            market_data=FakeMarketData(),
+            position_provider=FakePositionProvider(),
+            qmt_api={func_name: func},
+        )
+
+    def test_download_history_data_calls_qmt_global(self):
+        calls = []
+
+        def fake_download(stock_code, period, start_time, end_time):
+            calls.append((stock_code, period, start_time, end_time))
+            return True
+
+        handlers = self._handlers_with_qmt_global("download_history_data", fake_download)
+        result = handlers.handle("download_history_data", {
+            "stock_code": "000001.SZ",
+            "period": "1d",
+            "start_time": "20230101",
+            "end_time": "",
+        })
+
+        self.assertEqual(calls, [("000001.SZ", "1d", "20230101", "")])
+        self.assertTrue(result)
+
+    def test_download_history_data2_calls_qmt_global(self):
+        calls = []
+
+        def fake_download2(stock_list, period, start_time, end_time):
+            calls.append((stock_list, period, start_time, end_time))
+            return True
+
+        handlers = self._handlers_with_qmt_global("download_history_data2", fake_download2)
+        result = handlers.handle("download_history_data2", {
+            "stock_list": ["000001.SZ", "600000.SH"],
+            "period": "1d",
+            "start_time": "20230101",
+            "end_time": "",
+        })
+
+        self.assertEqual(calls[0][0], ["000001.SZ", "600000.SH"])
+        self.assertEqual(calls[0][1], "1d")
+        self.assertTrue(result)
+
+    def test_download_history_data_fallback_to_adapter_when_no_global(self):
+        """When qmt_api has no download_history_data (e.g. outside QMT),
+        the handler falls back to the adapter path. With a FakeMarketData
+        that lacks the method, the handler returns False (graceful, not crash)."""
+        handlers = BigQmtRpcHandlers(
+            account_id="acct",
+            market_data=FakeMarketData(),
+            position_provider=FakePositionProvider(),
+            qmt_api={},
+        )
+        result = handlers.handle("download_history_data", {
+            "stock_code": "000001.SZ",
+            "period": "1d",
+            "start_time": "20230101",
+            "end_time": "",
+        })
+        # No global func and adapter lacks the method → returns False, not crash.
+        self.assertFalse(result)
+
+
 if __name__ == "__main__":
     unittest.main()
