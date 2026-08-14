@@ -194,6 +194,7 @@ xtdata.unsubscribe_quote(seq)
 - `get_divid_factors` / `get_risk_free_rate` —— 参数语义不同（区间 vs 单日、index vs timetag）。
 - **复权 K 线** —— 实测 `dividendType` 传 `none` 和 `front` 返回完全相同，复权未生效。因此只有
   `dividend_type="none"` 才走直连，其余回退 RPC，避免静默返回未复权价格。
+  （复权数据还需**先在服务端下载原始数据**，见下文「复权数据下载陷阱」。）
 
 配置（客户端侧，默认就是开启，通常不用写）：
 
@@ -276,6 +277,32 @@ QMT 原生安装、逐 Bar 同步协议、CSV 备用模式和安全边界见
 - `st=""` → ORDER=9, DEAL=9（全部）
 - `st="rpc_test"` → ORDER=3, DEAL=1（只有 rpc_test 的）
 - `st="bigqmt_signal_trader"` → ORDER=0, DEAL=0（空）
+
+### 复权数据下载陷阱（重要）
+
+**前/后复权 K 线必须先在服务端下载原始数据，否则返回全 0**。
+
+Big QMT 的复权（`dividend_type='front'`/`'back'`）是**服务端现场计算**的——需要原始 K 线 + 除权因子已经在服务端存在。直接请求 front 而服务端没下载过原始数据时，返回的 close 全是 `0.0`（只有最后一根有价）。
+
+实测复现（600654.SH / 600227.SH）：
+- 直接 `get_market_data_ex(dividend_type='front')` → 634 行全 0
+- 先 `download_history_data` 后再请求 → 真实复权价（front ≠ none，复权生效）
+
+**已修复**：`xtdata.download_history_data2(codes, period, dividend_type='front')` 现在会**自动先触发服务端原始数据下载**（拉原始 K 线 + 除权因子），再拉复权数据到本地缓存。用法不变：
+
+```python
+# 前复权下载（自动先服务端下载原始数据 + 除权因子）
+xtdata.download_history_data2(["600654.SH"], period="1d",
+                               start_time="20240101", dividend_type="front")
+
+# 之后本地读取（零 RPC）
+xtdata.get_local_data(["close"], ["600654.SH"], period="1d",
+                      start_time="20240101", dividend_type="front")
+```
+
+**读取类 API 也自愈**：`get_market_data_ex` / `get_market_data` 带复权参数时，若检测到返回全 0（服务端缺原始数据），会自动触发服务端下载、等待落盘、重试一次，拿到真实复权价。`get_local_data` 的 fallback 拉取同样受益。无需手动等待。
+
+注意：QMT 服务端下载是**异步落盘**的，自愈路径内置了等待 + 一次重试；极端大区间若一次重试仍全 0，可稍后重读或先显式 `download_history_data2`。
 
 ### 实盘卖出方向误判修复（exec_events）
 
