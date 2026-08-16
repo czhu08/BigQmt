@@ -162,12 +162,33 @@ class TradeSignal:
 
 
 class PositionSnapshot:
-    def __init__(self, stock_code, volume, available, cost=0.0, stock_name=""):
+    def __init__(
+        self,
+        stock_code,
+        volume,
+        available,
+        cost=0.0,
+        stock_name="",
+        market_value=None,
+        price=None,
+        open_price=None,
+        frozen_volume=0,
+        on_road_volume=0,
+        yesterday_volume=None,
+        direction=48,
+    ):
         self.stock_code = stock_code
         self.volume = volume
         self.available = available
         self.cost = cost
         self.stock_name = stock_name
+        self.market_value = market_value
+        self.price = price
+        self.open_price = open_price
+        self.frozen_volume = frozen_volume
+        self.on_road_volume = on_road_volume
+        self.yesterday_volume = yesterday_volume
+        self.direction = direction
 
 
 class AssetSnapshot:

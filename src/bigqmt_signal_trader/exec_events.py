@@ -24,6 +24,7 @@ ORDER_CHANNEL_TEMPLATE = "bigqmt:order_events:{account_id}"
 TRADE_CHANNEL_TEMPLATE = "bigqmt:trade_events:{account_id}"
 ORDER_ERROR_CHANNEL_TEMPLATE = "bigqmt:order_error_events:{account_id}"
 CANCEL_ERROR_CHANNEL_TEMPLATE = "bigqmt:cancel_error_events:{account_id}"
+ORDER_IDENTITY_KEY_TEMPLATE = "bigqmt:order_identity:{account_id}:{user_order_id}"
 
 EVENT_ORDER = "order"
 EVENT_TRADE = "trade"
@@ -79,6 +80,13 @@ def order_error_channel(account_id):
 
 def cancel_error_channel(account_id):
     return CANCEL_ERROR_CHANNEL_TEMPLATE.format(account_id=str(account_id or ""))
+
+
+def order_identity_key(account_id, user_order_id):
+    return ORDER_IDENTITY_KEY_TEMPLATE.format(
+        account_id=str(account_id or ""),
+        user_order_id=str(user_order_id or ""),
+    )
 
 
 def _attr(obj, names, default=None):
@@ -231,7 +239,9 @@ _RAW_SNAPSHOT_EXTRA_FIELDS = (
     "trade_id",
     "traded_id",
     "strategy_name",
+    "user_order_id",
     "order_remark",
+    "remark",
 )
 
 
@@ -314,13 +324,60 @@ def normalize_order_event(order, account_id=""):
         "direction": direction,
         "action": _action_from_direction(direction),
         "offset_flag": _attr(order, ["m_nOffsetFlag", "offset_flag"]),
-        "strategy_name": str(_attr(order, ["m_strOptName", "strategy_name"], "") or ""),
-        "created_at": dt,
-        "user_order_id": str(_attr(order, ("m_strRemark", "user_order_id"), "") or ""),
-        "remark": _attr(order, ["m_strRemark", "order_remark", "remark"], ""),
+        "strategy_name": str(_attr(order, ["strategyName", "m_strStrategyName", "strategy_name"], "") or ""),
+        "remark": str(_attr(order, ["m_strRemark", "order_remark", "remark", "user_order_id"], "") or ""),
+        "user_order_id": str(_attr(order, ["m_strRemark", "user_order_id", "order_remark", "remark"], "") or ""),
+        "opt_name": str(_attr(order, ["m_strOptName", "opt_name"], "") or ""),
+        "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),  # dt
+        "created_at_ts": time.time(),
         "price_type": _attr(order, "m_nOrderPriceType", 50),
         "status_msg": str(_attr(order, "m_strCancelInfo", ""))
     }
+
+
+def remember_order_identity(redis_client, account_id, user_order_id, strategy_name="", stock_code="", ttl_seconds=86400):
+    user_order_id = str(user_order_id or "").strip()
+    if not user_order_id or redis_client is None:
+        return None
+    payload = {
+        "account_id": str(account_id or ""),
+        "user_order_id": user_order_id,
+        "strategy_name": str(strategy_name or ""),
+        "stock_code": str(stock_code or ""),
+        "created_at_ts": time.time(),
+    }
+    try:
+        redis_client.setex(
+            order_identity_key(account_id, user_order_id),
+            int(ttl_seconds or 86400),
+            json.dumps(payload, ensure_ascii=False, default=str),
+        )
+    except Exception:
+        pass
+    return payload
+
+
+def enrich_order_identity(redis_client, account_id, event):
+    if redis_client is None or not isinstance(event, dict):
+        return event
+    user_order_id = str(event.get("user_order_id") or event.get("remark") or "").strip()
+    if not user_order_id:
+        return event
+    try:
+        raw = redis_client.get(order_identity_key(account_id, user_order_id))
+    except Exception:
+        raw = None
+    if not raw:
+        return event
+    try:
+        identity = json.loads(raw.decode("utf-8") if isinstance(raw, (bytes, bytearray)) else str(raw))
+    except Exception:
+        return event
+    if not event.get("strategy_name") and identity.get("strategy_name"):
+        event["strategy_name"] = str(identity.get("strategy_name") or "")
+    if not event.get("stock_code") and identity.get("stock_code"):
+        event["stock_code"] = str(identity.get("stock_code") or "")
+    return event
 
 
 def normalize_trade_event(trade, account_id=""):

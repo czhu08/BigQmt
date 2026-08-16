@@ -25,3 +25,5 @@ src/bigqmt_signal_trader_client_config.py
 # Generated evidence from standalone/QMT backtest bridge runs.
 backtest_runs/
 qmt_backtest_runs/
+.workbuddy/
+.vscode/

@@ -8,10 +8,12 @@ ROOT = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "src"))
 
 from bigqmt_signal_trader.exec_events import (
+    enrich_order_identity,
     format_raw_snapshot,
     normalize_cancel_error_event,
     normalize_order_error_event,
     normalize_order_event,
+    remember_order_identity,
     normalize_trade_event,
     order_channel,
     order_error_channel,
@@ -46,13 +48,16 @@ class FakeOrder:
     m_dLimitPrice = 9.9
     m_strOrderSysID = "O2"
     m_nDirection = 49
-    m_strOptName = "s1"
+    strategyName = "s1"
+    m_strRemark = "remark-1"
+    m_strOptName = "限价买入"
 
 
 class FakeRedis:
     def __init__(self):
         self.xadds = []
         self.pubs = []
+        self.kv = {}
 
     def xadd(self, key, fields, maxlen=None, approximate=None):
         self.xadds.append((key, fields))
@@ -61,6 +66,13 @@ class FakeRedis:
     def publish(self, key, value):
         self.pubs.append((key, value))
         return 1
+
+    def setex(self, key, _ttl, value):
+        self.kv[key] = value
+        return True
+
+    def get(self, key):
+        return self.kv.get(key)
 
 
 class RecordingCallback(XtQuantTraderCallback):
@@ -120,6 +132,23 @@ class ExecEventsServerTest(unittest.TestCase):
         self.assertEqual(ev["status"], 50)
         self.assertEqual(ev["action"], "SELL")  # m_nDirection 49 -> sell
         self.assertEqual(ev["strategy_name"], "s1")
+        self.assertEqual(ev["remark"], "remark-1")
+        self.assertEqual(ev["user_order_id"], "remark-1")
+        self.assertEqual(ev["opt_name"], "限价买入")
+
+    def test_order_event_fills_strategy_from_remark_identity(self):
+        class CallbackOrder:
+            m_strAccountID = "acct"
+            m_strInstrumentID = "159518"
+            m_strRemark = "涨停价买入1手"
+            m_strOptName = "限价买入"
+
+        redis_client = FakeRedis()
+        remember_order_identity(redis_client, "acct", "涨停价买入1手", "rpc_test", "159518")
+        ev = enrich_order_identity(redis_client, "acct", normalize_order_event(CallbackOrder(), "acct"))
+
+        self.assertEqual(ev["strategy_name"], "rpc_test")
+        self.assertEqual(ev["remark"], "涨停价买入1手")
 
     def test_publish_writes_stream_and_channel(self):
         r = FakeRedis()

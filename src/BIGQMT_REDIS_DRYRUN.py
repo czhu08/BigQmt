@@ -236,6 +236,7 @@ try:
     ):
         if function_name in globals():
             qmt_extra[function_name] = globals()[function_name]
+    print("[bigqmt_shell] down_history_data bound=%s" % ("down_history_data" in qmt_extra))
     _runtime.bind_runtime_api(
         passorder_func=globals().get("passorder"),
         cancel_func=globals().get("cancel"),

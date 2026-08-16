@@ -10,6 +10,8 @@ Do not commit the real file. It may contain account ids and Redis credentials.
 
 BIGQMT_ACCOUNT_ID = "YOUR_ACCOUNT_ID"
 BIGQMT_RPC_TIMEOUT_SECONDS = 6.0
+BIGQMT_DOWNLOAD_WAIT_SECONDS = 1800
+BIGQMT_DOWNLOAD_POLL_INTERVAL_SECONDS = 0.5
 
 BIGQMT_REDIS_CONFIG = {
     "host": "127.0.0.1",
@@ -43,9 +45,9 @@ BIGQMT_FULL_TICK_CACHE_CONFIG = {
 }
 
 # Client-side LOCAL market-data cache.
-#   download_history_data2(codes, period, start_time, ..., callback) pulls bars
-#   over RPC once and persists them under `dir`; get_local_data(...) then reads
-#   them locally with NO RPC to Big QMT (for offline / repeated local analysis).
+#   get_market_data_ex(...) writes returned bars under `dir`; get_local_data(...)
+#   then reads them locally with NO RPC to Big QMT (for offline / repeated local
+#   analysis). download_history_data* submits a server-side Big QMT download job.
 #   - dir: cache folder (default ~/.bigqmt_cache), one pickle per (period, code).
 #   - fallback_rpc: if True, get_local_data auto-fetches+caches a cache miss;
 #     if False (default), a cache-missed code is simply omitted (download first).

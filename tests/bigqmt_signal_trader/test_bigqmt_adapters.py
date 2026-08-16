@@ -129,6 +129,11 @@ class BigQmtAdaptersTest(unittest.TestCase):
                         m_nVolume=1000,
                         m_nCanUseVolume=800,
                         m_dOpenPrice=3.456,
+                        m_dLastPrice=3.789,
+                        m_dMarketValue=3789.0,
+                        m_nFrozenVolume=200,
+                        m_nOnRoadVolume=10,
+                        m_nYesterdayVolume=900,
                         m_strInstrumentName="ETF",
                     )
                 ]
@@ -141,6 +146,11 @@ class BigQmtAdaptersTest(unittest.TestCase):
         self.assertEqual(positions["510300.SH"].volume, 1000)
         self.assertEqual(positions["510300.SH"].available, 800)
         self.assertEqual(positions["510300.SH"].cost, 3.456)
+        self.assertEqual(positions["510300.SH"].price, 3.789)
+        self.assertEqual(positions["510300.SH"].market_value, 3789.0)
+        self.assertEqual(positions["510300.SH"].frozen_volume, 200)
+        self.assertEqual(positions["510300.SH"].on_road_volume, 10)
+        self.assertEqual(positions["510300.SH"].yesterday_volume, 900)
 
     def test_order_gateway_submit_uses_qmt_jq_trade_passorder_shape(self):
         calls = []

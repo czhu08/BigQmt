@@ -73,6 +73,22 @@ def getDividFactors(*args, **kwargs):
     return _compat.xtdata.get_divid_factors(*args, **kwargs)
 
 
+def submit_download_history_data(stock_code, period, start_time="", end_time="", incrementally=None):
+    return _compat.xtdata.submit_download_history_data(stock_code, period, start_time, end_time, incrementally)
+
+
+def submit_download_history_data2(stock_list, period, start_time="", end_time="", incrementally=None):
+    return _compat.xtdata.submit_download_history_data2(stock_list, period, start_time, end_time, incrementally)
+
+
+def get_download_status(job_id):
+    return _compat.xtdata.get_download_status(job_id)
+
+
+def wait_download(job_id, timeout=None, poll_interval=None, callback=None):
+    return _compat.xtdata.wait_download(job_id, timeout, poll_interval, callback)
+
+
 def download_history_data(stock_code, period, start_time="", end_time="", incrementally=None):
     return _compat.xtdata.download_history_data(stock_code, period, start_time, end_time, incrementally)
 

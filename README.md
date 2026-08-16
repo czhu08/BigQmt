@@ -1,8 +1,16 @@
 # xtquant_big_convert
 
+[![PyPI](https://img.shields.io/pypi/v/xtquant-big-convert.svg)](https://pypi.org/project/xtquant-big-convert/)
+[![Python](https://img.shields.io/pypi/pyversions/xtquant-big-convert.svg)](https://pypi.org/project/xtquant-big-convert/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
 大 QMT 运行环境里的 RPC 桥接包：把大 QMT 内置 Python（行情查询、交易、持仓）封装成**可远程调用的服务**，并兼容一组 MiniQMT 方法名，让外部程序无需 XtQuantServer 权限就能驱动大 QMT。
 
 支持 **Redis / ZMQ / MySQL / 共享内存** 四种可插拔传输，切换只需改一个配置字段。
+
+已发布 PyPI，客户端一行安装：`pip install xtquant-big-convert`（详见下文「环境要求与依赖安装」）。
+
+另附 [qmt-trader skill](qmt-trader/)：让 Claude Code / ZCode / Cursor 等 AI 助手通过统一 CLI（46 个子命令）直接查行情、查持仓、下单撤单，详见下文「AI 助手 Skill：qmt-trader」。
 
 ---
 
@@ -727,6 +735,10 @@ src/BIGQMT_ZMQ_BACKTEST.py                  独立 QMT 回测 ZMQ 入口（GBK�
 src/bigqmt_backtest/                        独立历史驱动、模拟撮合、ZMQ 协议与客户端
 tests/bigqmt_signal_trader/        单元测试（无 QMT 环境可跑）
 tests/bigqmt_backtest/             回测、确定性、隔离和 ZMQ 往返测试
+qmt-trader/                        AI 助手 Skill（大模型直接操作 QMT，见下文专节）
+│   ├── SKILL.md                   skill 说明书（命令速查 + 工作流 + 安全须知）
+│   ├── scripts/qmt.py             统一 CLI（46 子命令 + rpc 兜底）
+│   └── references/api_reference.md  完整 API 参考
 docs/                              详细文档
 test_all_apis.py                   端到端 API 测试（发现生产问题）
 bench_latency.py / bench_transports.py  延迟基准脚本
@@ -790,6 +802,42 @@ python test_all_apis.py
 
 ---
 
+## 日志与排错（出错去哪看）
+
+系统自带**文件日志**——所有报错/异常同时写 QMT 输出面板和本地日志文件，重启/崩溃后也能回溯。
+
+### 日志位置
+
+| 环境 | 日志文件 |
+|------|---------|
+| **QMT 内（服务端）** | `<QMT python 目录>\logs\bigqmt.log`（如 `D:\国金证券QMT交易端_lemo\python\logs\bigqmt.log`）|
+| **外部客户端** | `~\.cache\bigqmt\logs\bigqmt.log`（用户目录下）|
+
+- **按天轮转**（午夜），**默认保留最近 7 天**。
+- 每行带时间戳 + 级别 + 模块标签：`2026-08-14 21:45:59 [ERROR] [bigqmt.quote_push] publisher start failed: ...`
+
+### 查看方式
+
+```powershell
+# 实时跟踪日志
+Get-Content "D:\国金证券QMT交易端\lempython\logs\bigqmt.log" -Wait -Tail 50
+
+# 只看错误
+Get-Content "D:\...\python\logs\bigqmt.log" | Select-String "ERROR|WARN"
+```
+
+### 配置
+
+| 环境变量 | 默认 | 说明 |
+|---------|------|------|
+| `BIGQMT_LOG_ENABLED` | `1` | 置 `0` 关闭文件日志 |
+| `BIGQMT_LOG_TO_STDOUT` | `1` | 置 `0` 不输出到 QMT 面板 |
+| `BIGQMT_LOG_RETENTION_DAYS` | `7` | 日志保留天数 |
+
+> **排错首选看日志文件**：QMT 面板内容重启/清空后丢失，日志文件保留 7 天，包含启动诊断（`[bigqmt_diag]`）、崩溃原因、端口冲突等。
+
+---
+
 ## 安全默认值
 
 - `rpc_allow_order_methods` 默认 `False`：远程 `order_stock` / `cancel_order` 被拒绝。确认接入方、账号、风控后再显式开启。
@@ -799,8 +847,102 @@ python test_all_apis.py
 
 ---
 
+## AI 助手 Skill：qmt-trader（大模型直接操作 QMT）
+
+仓库内置一个 **Agent Skill**——[qmt-trader/](qmt-trader/)，让支持 SKILL.md 约定的 AI 编程助手（Claude Code / ZCode / Cursor / Codex 等）**直接用命令行驱动 QMT 的全部交易与行情能力**，无需每次现场写 Python 调用代码。人也可以脱离 AI 手动执行其中的 CLI 脚本。
+
+### 目录结构
+
+```
+qmt-trader/
+├── SKILL.md                        skill 说明书（触发条件 + 命令速查 + 典型工作流 + 安全须知）
+├── scripts/qmt.py                  统一 CLI 入口（46 个子命令 + 通用 rpc 兜底，约 1000 行）
+└── references/api_reference.md     完整 API 参考（参数/返回值/常量/已知陷阱）
+```
+
+### 工作原理
+
+- AI 助手匹配到 `SKILL.md` 里的 `description`（"查行情 / 查持仓 / 下单 / 龙虎榜 / 北向资金…时触发"）后自动加载本 skill；
+- 之后助手调用 `python qmt-trader/scripts/qmt.py <子命令>` 执行**确定性命令**，不再临时生成 RPC 调用代码，避免参数写错；
+- 所有命令默认输出 JSON（`ok` / `data` / `ts` 三字段，便于模型解析），加 `--table` 切换人类可读表格；出错时返回 `ok: false` + `error` / `detail` / `code`，退出码 1；
+- `qmt.py` 自动把仓库 `src/` 加入 `sys.path`（开发模式免 pip install），并自动发现 QMT 的 python 目录读取客户端配置。
+
+### 启用方式
+
+**方式 A：安装到 AI 助手的 skills 目录**（推荐，全局生效）：
+
+```powershell
+# Claude Code
+cp -r qmt-trader ~/.claude/skills/qmt-trader
+# ZCode / 其他遵循 agents skills 约定的助手
+cp -r qmt-trader ~/.agents/skills/qmt-trader
+```
+
+安装后正常提需求即可，例如"帮我看下工商银行最近的走势""我账户现在什么持仓"，助手会自动触发。
+
+**方式 B：不安装，对话里显式指定**：
+
+> 阅读 qmt-trader/SKILL.md，之后用里面的 qmt.py 命令帮我查行情 / 持仓 / 下单。
+
+**方式 C：纯手动**（不经过 AI，人直接当 CLI 用）：
+
+```powershell
+python qmt-trader/scripts/qmt.py ping
+python qmt-trader/scripts/qmt.py snapshot --table
+```
+
+### 前置条件
+
+与「快速开始」的客户端一致：
+
+1. QMT 端 RPC 服务已启动（`BIGQMT_REDIS_DRYRUN.py` 运行中，输出面板/日志看到启动诊断 OK）；
+2. 客户端配置就绪——环境变量（`BIGQMT_ACCOUNT_ID` / `BIGQMT_REDIS_HOST` / `BIGQMT_REDIS_PORT` / `BIGQMT_REDIS_DB` / `BIGQMT_REDIS_PASSWORD`）或配置文件；
+3. 先 `ping` 确认连通：redis 约 13ms / zmq 约 0.7ms 为正常，超时说明 transport 或配置不匹配。
+
+### 一分钟上手
+
+```powershell
+# 0. 连通性检测（含延迟测量）
+python qmt-trader/scripts/qmt.py ping
+
+# 1. 账户全景：资产 + 持仓 + 委托 + 成交（一次往返）
+python qmt-trader/scripts/qmt.py snapshot
+
+# 2. 实时五档盘口（含涨跌幅）
+python qmt-trader/scripts/qmt.py tick 600000.SH
+
+# 3. 前复权日 K 60 根（含 MA5/20/60 统计）
+python qmt-trader/scripts/qmt.py kline 600000.SH --period 1d --count 60 --dividend front
+
+# 4. 干跑下单（只打印不提交，确认参数）
+python qmt-trader/scripts/qmt.py buy 600000.SH 100 --price 7.50 --dry-run
+```
+
+### 命令概览
+
+| 分类 | 命令 |
+|------|------|
+| **连通/全景** | `ping` / `snapshot` |
+| **账户** | `account`（资产）/ `positions`（持仓含浮动盈亏）/ `orders`（委托含语义化状态）/ `trades`（成交） |
+| **行情** | `tick` / `kline` / `instrument` / `sector` / `trading-dates` / `north`（北向）/ `longhubang`（龙虎榜）/ `financial`（财务）/ `download`（历史数据下载）/ `quote-subscribe`（全推订阅） |
+| **扩展查询（25 个快捷命令）** | `holiday` / `stock-name` / `instrument-type` / `divid-factors` / `market-times` / `trading-calendar` / `option-list` / `bsm-price` / `bsm-iv` / `hkt-stats` / `hkt-details` / `hkt-rate` / `top10-holder` / `holder-num` / `ipo` / `ipo-limit` / `credit-assure` / `credit-short` / `credit-debt` / `his-st` / `index-weight` / `industry` / `sector-info` / `local-data` / `timetag2dt` / `dt2timetag` |
+| **交易** | `buy` / `sell` / `cancel`（均支持 `--dry-run`，buy/sell 支持 `--latest` / `--strategy` / `--remark`） |
+| **通用兜底** | `rpc <method> [json]` — 调用白名单内**任意**方法（如 `rpc get_l2_quote '{"stock_code":"600000.SH"}'`），未列出的方法都能这样调 |
+
+### 安全设计
+
+- 下单三命令（`buy` / `sell` / `cancel`）受服务端白名单控制，`rpc_allow_order_methods` 默认 `False`，未显式开启时返回 `ORDER_DISABLED`；
+- 下单前先用 `tick` 看价 + `--dry-run` 确认参数；
+- 报 `ORDER_TIMEOUT` 时**不要直接重试**，先 `orders` 查询确认委托是否已进系统，避免重复下单；
+- 下单的 `--strategy` 与查询的 `--strategy` 需一致；查全部委托用 `orders --strategy ""`（空 = 不过滤）。
+
+完整命令表、四个典型工作流（行情分析 / 持仓监控 / 下单交易 / 批量分析）和 API 参数细节见 [qmt-trader/SKILL.md](qmt-trader/SKILL.md) 与 [qmt-trader/references/api_reference.md](qmt-trader/references/api_reference.md)。
+
+---
+
 ## 相关文档
 
+- [CHANGELOG.md](CHANGELOG.md) — **版本变更记录**（新增/修复/变更）
 - [docs/RPC_API_REFERENCE.md](docs/RPC_API_REFERENCE.md) — **全部 RPC 方法参考**（参数、返回值、别名、大 QMT 能力边界）
 - [docs/FORMULA_SERVER_FASTPATH.md](docs/FORMULA_SERVER_FASTPATH.md) — FormulaServer(58600) 直连快速路径：协议、映射表、能力边界与回退行为
 - [docs/SUBSCRIBE_WHOLE_QUOTE_PUSH.md](docs/SUBSCRIBE_WHOLE_QUOTE_PUSH.md) — 全推行情订阅推送机制设计
@@ -810,6 +952,7 @@ python test_all_apis.py
 - [docs/XTQUANT_COMPAT_REPLACEMENT.md](docs/XTQUANT_COMPAT_REPLACEMENT.md) — 用兼容层替换旧 xtquant 的步骤
 - [docs/BIG_QMT_SIGNAL_TRADER_RUNBOOK.md](docs/BIG_QMT_SIGNAL_TRADER_RUNBOOK.md) — 信号交易运行手册
 - [docs/ZMQ_BACKTEST_BRIDGE.md](docs/ZMQ_BACKTEST_BRIDGE.md) — 独立 ZMQ 回测协议、撮合规则和 QMT 入口
+- [qmt-trader/](qmt-trader/) — **QMT Trader skill**：AI 助手统一 CLI 驱动全部 QMT API（46 子命令 + 通用 rpc 兜底），用法见上文「AI 助手 Skill：qmt-trader」专节
 
 ---
 

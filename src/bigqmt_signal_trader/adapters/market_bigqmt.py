@@ -42,6 +42,14 @@ def normalize_market_or_stock_code(code):
     return normalize_stock_code(text)
 
 
+def _as_list(value):
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [value]
+    return list(value)
+
+
 def _raw_frame_columns(field_list):
     columns = [str(field) for field in (field_list or [])]
     if columns and "stime" not in columns:
@@ -141,10 +149,11 @@ def _load_native_xtdata():
 
 
 class BigQmtMarketDataProvider:
-    def __init__(self, context_info, native_xtdata=None):
+    def __init__(self, context_info, native_xtdata=None, qmt_api=None):
         self.context_info = context_info
         # Allow injection for tests; otherwise resolve lazily on first use.
         self._native_xtdata = native_xtdata
+        self.qmt_api = dict(qmt_api or {})
 
     def _context_method(self, method_name):
         method = getattr(self.context_info, method_name, None)
@@ -205,7 +214,7 @@ class BigQmtMarketDataProvider:
 
     def _market_data_shapes(self, method_name, **params):
         field_list = list(params.get("field_list") or params.get("fields") or [])
-        stock_list = list(params.get("stock_list") or params.get("stock_code") or [])
+        stock_list = _as_list(params.get("stock_list") or params.get("stock_code"))
         period = params.get("period", "1d")
         start_time = params.get("start_time", "")
         end_time = params.get("end_time", "")
@@ -376,25 +385,29 @@ class BigQmtMarketDataProvider:
         return self._call_context("get_divid_factors", stock_code)
 
     def _download(self, func_name, sdk_args, sdk_kwargs, ctx_call):
-        """Download history via the xtdata SDK (its natural home), falling back to
-        ContextInfo. If neither works, raise with the REAL native reason so the
-        failure is diagnosable instead of a bare 'ContextInfo has no ...'."""
-        module = self._native()
-        if module is None:
-            native_err = "xtdata SDK not importable"
-        else:
-            fn = getattr(module, func_name, None)
-            if fn is None:
-                native_err = "xtdata SDK has no %s" % func_name
-            else:
-                try:
-                    return fn(*sdk_args, **sdk_kwargs)
-                except Exception as exc:
-                    native_err = "%s: %s" % (exc.__class__.__name__, exc)
+        """Download history in Big QMT.
+
+        Full Big QMT exposes historical-data supplementation as the injected
+        global ``down_history_data`` function. Prefer it directly; the MiniQMT
+        ``xtdata`` client usually cannot connect inside the full terminal.
+        """
+        down_history_data = self.qmt_api.get("down_history_data")
+        if callable(down_history_data):
+            if func_name == "download_history_data":
+                stock_code, period, start_time, end_time = sdk_args
+                return down_history_data(stock_code, period, start_time, end_time)
+            if func_name == "download_history_data2":
+                stock_list, period, start_time, end_time = sdk_args
+                result = None
+                for stock_code in stock_list:
+                    result = down_history_data(stock_code, period, start_time, end_time)
+                return result
+
         if getattr(self.context_info, func_name, None) is not None:
             return ctx_call()
         raise NotImplementedError(
-            "%s unavailable (native xtdata -> %s; ContextInfo has no %s)" % (func_name, native_err, func_name)
+            "%s unavailable (down_history_data unavailable; ContextInfo has no %s)"
+            % (func_name, func_name)
         )
 
     def download_history_data(self, stock_code, period, start_time="", end_time="", incrementally=None):
@@ -410,7 +423,7 @@ class BigQmtMarketDataProvider:
         )
 
     def download_history_data2(self, stock_list, period, start_time="", end_time="", incrementally=None):
-        stock_list = list(stock_list or [])
+        stock_list = _as_list(stock_list)
 
         def _via_context():
             kwargs = {"stock_list": stock_list, "period": period, "start_time": start_time, "end_time": end_time}

@@ -64,6 +64,10 @@ READ_METHODS = {
     "query_execution_snapshot",
     "query_stock_position",
     "sync_positions",
+    "submit_download_history_data",
+    "submit_download_history_data2",
+    "get_download_status",
+    "wait_download",
     # 账户 / 融资融券 / 交易扩展查询（官方全局函数 + detail types）
     "query_account_infos",
     "query_account_status",
@@ -288,6 +292,13 @@ def _maybe_scalar(value):
     return value
 
 
+def _is_redis_timeout(exc):
+    name = exc.__class__.__name__.lower()
+    module = getattr(exc.__class__, "__module__", "")
+    text = str(exc).lower()
+    return ("redis" in module and "timeout" in name) or "timeout reading from socket" in text
+
+
 def to_jsonable(value):
     value = _maybe_scalar(value)
     if value is None or isinstance(value, (str, int, float, bool)):
@@ -457,6 +468,62 @@ class BigQmtRpcHandlers:
         client_id, sub_id, _codes = self._quote_params(params)
         manager.keepalive(client_id, sub_id)
         return {}
+
+    def _download_job_redis(self):
+        redis_client = getattr(self, "download_job_redis_client", None)
+        if redis_client is None:
+            raise RuntimeError("download jobs require a Redis client")
+        return redis_client
+
+    def _handle_submit_download_history_data2(self, params):
+        from .download_jobs import submit_download_job
+
+        stock_list = params.get("stock_list") or params.get("stock_code") or []
+        if isinstance(stock_list, str):
+            stock_list = [stock_list]
+        return submit_download_job(
+            self._download_job_redis(),
+            self.account_id,
+            stock_list,
+            params.get("period"),
+            method="download_history_data2",
+            start_time=params.get("start_time", ""),
+            end_time=params.get("end_time", ""),
+            incrementally=params.get("incrementally"),
+            chunk_size=int(params.get("chunk_size") or getattr(self, "download_job_chunk_size", 10)),
+            job_ttl_seconds=int(params.get("job_ttl_seconds") or getattr(self, "download_job_ttl_seconds", 3600)),
+        )
+
+    def _handle_submit_download_history_data(self, params):
+        stock_code = params.get("stock_code") or params.get("code")
+        next_params = dict(params or {})
+        next_params["stock_list"] = [stock_code] if stock_code else []
+        return self._handle_submit_download_history_data2(next_params)
+
+    def _handle_get_download_status(self, params):
+        from .download_jobs import read_download_status
+
+        job_id = params.get("job_id")
+        if not job_id:
+            raise ValueError("job_id is required")
+        status = read_download_status(self._download_job_redis(), self.account_id, job_id)
+        if status is None:
+            raise KeyError("download job not found or expired: %s" % job_id)
+        return status
+
+    def _handle_wait_download(self, params):
+        from .download_jobs import wait_download_job
+
+        job_id = params.get("job_id")
+        if not job_id:
+            raise ValueError("job_id is required")
+        return wait_download_job(
+            self._download_job_redis(),
+            self.account_id,
+            job_id,
+            wait_seconds=float(params.get("wait_seconds", 600.0)),
+            poll_interval_seconds=float(params.get("poll_interval_seconds", 0.5)),
+        )
 
 
     def _handle_get_ticks(self, params):
@@ -761,8 +828,12 @@ class BigQmtRpcHandlers:
         if self.order_gateway is None:
             raise RuntimeError("order_gateway is not configured")
         price = params.get("price")
+        signal_id = str(params.get("signal_id") or "rpc-%s" % uuid.uuid4().hex)
+        order_tag = str(params.get("remark") or params.get("order_remark") or "").strip()
+        if not order_tag:
+            order_tag = "bqrpc:%s" % signal_id
         request = OrderRequest(
-            signal_id=str(params.get("signal_id") or "rpc-%s" % uuid.uuid4().hex),
+            signal_id=signal_id,
             account_id=self._request_account_id(params),
             action=self._order_action_from_params(params),
             stock_code=str(params.get("stock_code") or ""),
@@ -770,7 +841,7 @@ class BigQmtRpcHandlers:
             price=float(price if price not in (None, "") else 0),
             price_type=params.get("price_type") or "LIMIT",
             strategy_name=str(params.get("strategy_name") or "bigqmt_rpc"),
-            remark=str(params.get("remark") or params.get("order_remark") or "redis_rpc"),
+            remark=order_tag,
         )
         if request.action not in ("BUY", "SELL"):
             raise ValueError("action must be BUY or SELL")
@@ -778,6 +849,19 @@ class BigQmtRpcHandlers:
             raise ValueError("stock_code is required")
         if request.volume <= 0:
             raise ValueError("volume must be positive")
+
+        try:
+            from .exec_events import remember_order_identity
+
+            remember_order_identity(
+                getattr(self, "download_job_redis_client", None),
+                request.account_id,
+                request.remark,
+                strategy_name=request.strategy_name,
+                stock_code=request.stock_code,
+            )
+        except Exception:
+            pass
 
         result = self.order_gateway.submit(request)
 
@@ -1166,7 +1250,20 @@ class RedisPubSubRpcService:
                 "%s deferred method=%s pending_before=%s"
                 % (self.print_prefix, payload.get("method"), self.pending.qsize())
             )
-        self.pending.put_nowait(payload)
+        try:
+            self.pending.put_nowait(payload)
+        except queue.Full:
+            # A full pending queue (client polling storm) must not raise into the
+            # adjust thread — QMT stops the strategy on a callback raise. Drop the
+            # oldest request and keep the newest instead of crashing.
+            try:
+                self.pending.get_nowait()
+            except Exception:
+                pass
+            try:
+                self.pending.put_nowait(payload)
+            except Exception:
+                pass
 
     def _should_process_in_listener(self, payload):
         if not self.process_in_listener:
@@ -1263,7 +1360,20 @@ class RedisPubSubRpcService:
                 response["server_error"] = str(server_error)
         except Exception as exc:
             response["error"] = "%s: %s" % (exc.__class__.__name__, exc)
-        self._publish_response(request, response)
+        try:
+            self._publish_response(request, response)
+        except Exception:
+            # A response-publish failure (e.g. redis outage) must not propagate
+            # to the adjust thread — QMT stops the strategy on a callback raise.
+            # The request already ran; the client will just see a timeout.
+            import traceback as _tb
+            try:
+                from .logging_setup import get_logger
+                get_logger("rpc").error(
+                    "publish response failed method=%s:\n%s", method, _tb.format_exc()
+                )
+            except Exception:
+                pass
         self._processed_count += 1
         if self._processed_count <= self.debug_log_limit:
             print("%s responded method=%s ok=%s" % (self.print_prefix, method, response["ok"]))
@@ -1375,19 +1485,34 @@ def call_redis_rpc(
     if str(transport or "queue").lower() in ("queue", "list", "blpop"):
         redis_client.rpush(request_queue, payload)
         redis_client.expire(request_queue, max(60, int(ttl_seconds)))
-        wait_timeout = max(1, int(float(timeout_seconds) + 0.999))
-        item = redis_client.blpop(response_list, timeout=wait_timeout)
-        if item:
-            raw_response = item[1] if isinstance(item, (list, tuple)) and len(item) >= 2 else item
+        deadline = time.time() + float(timeout_seconds)
+        while True:
+            raw_response = redis_client.get(response_key)
+            if raw_response:
+                return json.loads(decode_text(raw_response))
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                break
+            wait_timeout = max(1, int(min(remaining, 1.0) + 0.999))
             try:
-                redis_client.delete(response_list)
-            except Exception:
-                pass
-            return json.loads(decode_text(raw_response))
+                item = redis_client.blpop(response_list, timeout=wait_timeout)
+            except Exception as exc:
+                if _is_redis_timeout(exc):
+                    continue
+                raise
+            if item:
+                raw_response = item[1] if isinstance(item, (list, tuple)) and len(item) >= 2 else item
+                try:
+                    redis_client.delete(response_list)
+                except Exception:
+                    pass
+                return json.loads(decode_text(raw_response))
         raw_response = redis_client.get(response_key)
         if raw_response:
             return json.loads(decode_text(raw_response))
-        raise TimeoutError("redis rpc timeout: %s" % method)
+        raise TimeoutError(
+            "redis rpc timeout: %s account_id=%s request_queue=%s" % (method, account_id, request_queue)
+        )
 
     pubsub = redis_client.pubsub(ignore_subscribe_messages=True)
     try:

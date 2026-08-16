@@ -13,6 +13,15 @@ def _attr(obj, names, default=None):
     return default
 
 
+def _float_or_none(value):
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
 # Candidate ThinkTrader field names on the ACCOUNT row of get_trade_detail_data.
 # The MiniQMT SDK only documents the normalized name (XtAsset.frozen_cash); the
 # big QMT ACCOUNT struct is a different surface and brokers vary, so probe the
@@ -92,6 +101,13 @@ class BigQmtPositionProvider:
                 available=int(_attr(row, ("m_nCanUseVolume", "available", "can_use_volume"), 0) or 0),
                 cost=float(_attr(row, ("m_dOpenPrice", "m_dCostPrice", "cost"), 0.0) or 0.0),
                 stock_name=str(_attr(row, ("m_strInstrumentName", "stock_name"), "") or ""),
+                market_value=_float_or_none(_attr(row, ("m_dMarketValue", "m_dInstrumentValue", "market_value"))),
+                price=_float_or_none(_attr(row, ("m_dLastPrice", "m_dSettlementPrice", "price", "last_price"))),
+                open_price=_float_or_none(_attr(row, ("m_dOpenPrice", "m_dCostPrice", "open_price", "cost"))),
+                frozen_volume=int(_attr(row, ("m_nFrozenVolume", "frozen_volume"), 0) or 0),
+                on_road_volume=int(_attr(row, ("m_nOnRoadVolume", "on_road_volume"), 0) or 0),
+                yesterday_volume=int(_attr(row, ("m_nYesterdayVolume", "yesterday_volume"), 0) or 0),
+                direction=int(_attr(row, ("m_nDirection", "direction"), 48) or 48),
             )
         return positions
 

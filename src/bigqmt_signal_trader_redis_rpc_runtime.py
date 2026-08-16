@@ -42,8 +42,6 @@ if _load_bridge_module is not None:
     deal_callback = _strategy_module.deal_callback
     handlebar = _strategy_module.handlebar
     init = _strategy_module.init
-    on_order = _strategy_module.on_order
-    on_trade = _strategy_module.on_trade
     order_callback = _strategy_module.order_callback
     set_account_id = _strategy_module.set_account_id
     sync_positions = _strategy_module.sync_positions
@@ -55,8 +53,6 @@ else:
         deal_callback,
         handlebar,
         init,
-        on_order,
-        on_trade,
         order_callback,
         set_account_id,
         sync_positions,

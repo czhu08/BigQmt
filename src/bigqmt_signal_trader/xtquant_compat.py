@@ -11,15 +11,24 @@ import time
 import uuid
 import threading
 import importlib
+import datetime as _dt
 
 from .full_tick_cache import request_full_tick_cache, wait_full_tick_cache
 from .local_cache import LocalMarketCache
 from .redis_rpc import call_redis_rpc
 
 
-# Default OHLCV fields pulled + cached by download_history_data*.
+# Default OHLCV fields pulled + cached by get_local_data fallback_rpc.
 DEFAULT_DOWNLOAD_FIELDS = ["open", "high", "low", "close", "volume", "amount"]
 _TIME_COL_NAMES = ("stime", "time", "index", "date", "datetime", "timetag")
+
+
+def _as_list(value):
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [value]
+    return list(value)
 
 
 STOCK_BUY = 23
@@ -307,6 +316,12 @@ def load_client_config(module_name=None):
         timeout_seconds = getattr(module, "BIGQMT_RPC_TIMEOUT_SECONDS", None)
         if timeout_seconds is None:
             timeout_seconds = redis_config.get("rpc_timeout_seconds")
+        download_wait_seconds = getattr(module, "BIGQMT_DOWNLOAD_WAIT_SECONDS", None)
+        if download_wait_seconds is None:
+            download_wait_seconds = redis_config.get("download_wait_seconds")
+        download_poll_interval_seconds = getattr(module, "BIGQMT_DOWNLOAD_POLL_INTERVAL_SECONDS", None)
+        if download_poll_interval_seconds is None:
+            download_poll_interval_seconds = redis_config.get("download_poll_interval_seconds")
         full_tick_cache_config = dict(getattr(module, "BIGQMT_FULL_TICK_CACHE_CONFIG", {}) or {})
         for key in (
             "full_tick_cache_enabled",
@@ -328,6 +343,8 @@ def load_client_config(module_name=None):
             "account_id": account_id,
             "redis_config": redis_config,
             "timeout_seconds": timeout_seconds,
+            "download_wait_seconds": download_wait_seconds,
+            "download_poll_interval_seconds": download_poll_interval_seconds,
             "full_tick_cache_config": full_tick_cache_config,
             "local_cache_config": local_cache_config,
             "formula_server_config": formula_server_config,
@@ -406,6 +423,78 @@ def _restore_jsonable(value):
     return value
 
 
+def _digits_only(value):
+    return "".join(ch for ch in str(value or "") if ch.isdigit())
+
+
+def _parse_qmt_stime(value):
+    digits = _digits_only(value)
+    if len(digits) >= 14:
+        try:
+            return _dt.datetime.strptime(digits[:14], "%Y%m%d%H%M%S")
+        except ValueError:
+            return None
+    if len(digits) >= 8:
+        try:
+            return _dt.datetime.strptime(digits[:8], "%Y%m%d")
+        except ValueError:
+            return None
+    return None
+
+
+def _qmt_stime_index(value):
+    digits = _digits_only(value)
+    if len(digits) >= 14:
+        return digits[:14]
+    if len(digits) >= 8:
+        return digits[:8]
+    return str(value or "")
+
+
+def _qmt_datetime_to_epoch_ms(dt_value):
+    # QMT bar labels are China local time; MiniQMT's time column is epoch ms.
+    china_tz = _dt.timezone(_dt.timedelta(hours=8))
+    return int(dt_value.replace(tzinfo=china_tz).timestamp() * 1000)
+
+
+def _normalize_market_data_frame(df, field_list=None):
+    try:
+        columns = list(df.columns)
+    except Exception:
+        return df
+    if "stime" not in columns:
+        return df
+
+    requested = [str(field) for field in (field_list or [])]
+    try:
+        out = df.copy()
+        stimes = list(out["stime"])
+        out.index = [_qmt_stime_index(value) for value in stimes]
+        if "time" in out.columns or "time" in requested:
+            out["time"] = [
+                _qmt_datetime_to_epoch_ms(parsed) if parsed is not None else None
+                for parsed in (_parse_qmt_stime(value) for value in stimes)
+            ]
+        if requested:
+            keep = [field for field in requested if field in out.columns]
+            if keep:
+                return out[keep]
+        if "stime" in out.columns:
+            return out.drop(columns=["stime"])
+        return out
+    except Exception:
+        return df
+
+
+def _normalize_market_data_result(data, field_list=None):
+    if not isinstance(data, dict):
+        return data
+    return {
+        code: _normalize_market_data_frame(frame, field_list=field_list)
+        for code, frame in data.items()
+    }
+
+
 def _normalize_code_for_filter(code):
     text = str(code or "").strip().upper()
     if "." not in text:
@@ -468,6 +557,18 @@ class BigQmtRpcClient:
             if config_timeout is not None
             else _env_float("BIGQMT_RPC_TIMEOUT_SECONDS", 6.0)
         )
+        config_download_wait = client_config.get("download_wait_seconds")
+        self.download_wait_seconds = float(
+            config_download_wait
+            if config_download_wait is not None
+            else _env_float("BIGQMT_DOWNLOAD_WAIT_SECONDS", 1800.0)
+        )
+        config_download_poll = client_config.get("download_poll_interval_seconds")
+        self.download_poll_interval_seconds = float(
+            config_download_poll
+            if config_download_poll is not None
+            else _env_float("BIGQMT_DOWNLOAD_POLL_INTERVAL_SECONDS", 0.5)
+        )
         full_tick_cache_config = dict(client_config.get("full_tick_cache_config") or {})
         self.full_tick_cache_config = {
             "enabled": _bool_value(
@@ -495,9 +596,8 @@ class BigQmtRpcClient:
                 or _env_float("BIGQMT_FULL_TICK_POLL_INTERVAL_SECONDS", 0.2)
             ),
         }
-        # Client-side local market-data cache. download_history_data* pulls bars
-        # over RPC once and persists them here; get_local_data then reads them with
-        # no RPC. fallback_rpc=True lets get_local_data fetch+cache a cache miss.
+        # Client-side local market-data cache. get_market_data_ex is cache-through;
+        # fallback_rpc=True lets get_local_data fetch+cache a cache miss.
         local_cache_config = dict(client_config.get("local_cache_config") or {})
         self.local_cache_config = {
             "enabled": _bool_value(
@@ -909,6 +1009,9 @@ class BigQmtXtData:
         data = self._call("get_market_data_ex", **params)
         # Self-heal adjusted reads (all-zero bars -> server raw download + retry).
         data = self._heal_adjusted("get_market_data_ex", params, data)
+        # Normalize Big QMT's stime-indexed frame to MiniQMT shape (time-indexed).
+        if isinstance(data, dict):
+            data = _normalize_market_data_result(data, field_list=params.get("field_list"))
         cache = self._local_cache()
         if cache is not None and isinstance(data, dict):
             for code, df in data.items():
@@ -932,9 +1035,8 @@ class BigQmtXtData:
     ):
         """Read bars from the CLIENT-side local cache — no RPC to Big QMT.
 
-        Populate the cache first with download_history_data2(...). Returns a dict
-        {code: DataFrame}. A cache-missed code is omitted, unless
-        local_cache_fallback_rpc is enabled (then it is fetched + cached).
+        Returns a dict {code: DataFrame}. A cache-missed code is omitted, unless
+        local_cache_fallback_rpc is enabled (then it is fetched + cached over RPC).
         """
         codes = [str(c) for c in (stock_list or []) if str(c or "").strip()]
         cache = self._local_cache()
@@ -942,7 +1044,7 @@ class BigQmtXtData:
             # Cache disabled -> behave like a plain RPC local-data read.
             return self._call(
                 "get_local_data",
-                field_list=list(field_list or []),
+                field_list=_as_list(field_list),
                 stock_list=codes,
                 period=period,
                 start_time=start_time,
@@ -958,7 +1060,10 @@ class BigQmtXtData:
         for code in codes:
             df = cache.read(code, period, start_time, end_time, count, dividend_type=dividend_type)
             if df is not None and getattr(df, "shape", (0,))[0] > 0:
-                result[code] = self._select_fields(df, fields)
+                result[code] = self._select_fields(
+                    _normalize_market_data_frame(df, field_list=fields),
+                    fields,
+                )
             else:
                 missing.append(code)
         if missing and _bool_value(self.client.local_cache_config.get("fallback_rpc"), False):
@@ -966,7 +1071,10 @@ class BigQmtXtData:
             for code in missing:
                 df = fetched.get(code)
                 if df is not None and getattr(df, "shape", (0,))[0] > 0:
-                    result[code] = self._select_fields(df, fields)
+                    result[code] = self._select_fields(
+                        _normalize_market_data_frame(df, field_list=fields),
+                        fields,
+                    )
         return result
 
     @staticmethod
@@ -974,7 +1082,7 @@ class BigQmtXtData:
         if not fields:
             return df
         try:
-            keep = [c for c in df.columns if c in fields or c in _TIME_COL_NAMES]
+            keep = [c for c in df.columns if c in fields or (c in _TIME_COL_NAMES and c != "stime")]
             return df[keep] if keep else df
         except Exception:
             return df
@@ -1850,6 +1958,40 @@ class BigQmtXtTrader:
             market_value=_safe_float(market_value, 0.0) if market_value is not None else 0.0,
         )
 
+    def _position_object(self, account_id, item):
+        volume = _safe_int(item.get("volume"))
+        available = _safe_int(item.get("available", item.get("can_use_volume")))
+        cost = _safe_float(item.get("cost", item.get("avg_price")))
+        price = _safe_float(item.get("price", item.get("last_price")), cost)
+        market_value = item.get("market_value")
+        if market_value is None:
+            market_value = price * volume
+        return CompatObject(
+            account_type=2,
+            account_id=account_id,
+            stock_code=str(item.get("stock_code") or ""),
+            stock_name=str(item.get("stock_name") or ""),
+            volume=volume,
+            can_use_volume=available,
+            enable_amount=available,
+            available_amount=available,
+            avg_price=cost,
+            price=price,
+            open_price=_safe_float(item.get("open_price"), cost),
+            cost_price=cost,
+            market_value=_safe_float(market_value, 0.0),
+            frozen_volume=_safe_int(item.get("frozen_volume")),
+            on_road_volume=_safe_int(item.get("on_road_volume")),
+            yesterday_volume=_safe_int(item.get("yesterday_volume"), volume),
+            direction=_safe_int(item.get("direction"), 48),
+        )
+
+    @staticmethod
+    def _position_items(data):
+        if isinstance(data, dict):
+            return list(data.values())
+        return _as_list(data)
+
     def query_stock_positions(self, account):
         account_id = _account_id(account, self.client.account_id)
         try:
@@ -1860,29 +2002,7 @@ class BigQmtXtTrader:
             data = self._cached_positions(account_id)
             if not data:
                 raise
-        positions = []
-        for item in _as_list(data):
-            stock_code = str(item.get("stock_code") or "")
-            volume = _safe_int(item.get("volume"))
-            available = _safe_int(item.get("available", item.get("can_use_volume")))
-            cost = _safe_float(item.get("cost", item.get("avg_price")))
-            positions.append(
-                CompatObject(
-                    account_id=account_id,
-                    stock_code=stock_code,
-                    stock_name=str(item.get("stock_name") or ""),
-                    volume=volume,
-                    can_use_volume=available,
-                    enable_amount=available,
-                    available_amount=available,
-                    avg_price=cost,
-                    price=cost,
-                    open_price=cost,
-                    cost_price=cost,
-                    yesterday_volume=_safe_int(item.get("yesterday_volume"), volume),
-                )
-            )
-        return positions
+        return [self._position_object(account_id, item) for item in self._position_items(data)]
 
     def query_stock_position(self, account, stock_code):
         account_id = _account_id(account, self.client.account_id)
@@ -1906,20 +2026,7 @@ class BigQmtXtTrader:
         if not data:
             return None
         return [
-            CompatObject(
-                account_id=account_id,
-                stock_code=str(item.get("stock_code") or ""),
-                stock_name=str(item.get("stock_name") or ""),
-                volume=_safe_int(item.get("volume")),
-                can_use_volume=_safe_int(item.get("available", item.get("can_use_volume"))),
-                enable_amount=_safe_int(item.get("available", item.get("can_use_volume"))),
-                available_amount=_safe_int(item.get("available", item.get("can_use_volume"))),
-                avg_price=_safe_float(item.get("cost", item.get("avg_price"))),
-                price=_safe_float(item.get("cost", item.get("avg_price"))),
-                open_price=_safe_float(item.get("cost", item.get("avg_price"))),
-                cost_price=_safe_float(item.get("cost", item.get("avg_price"))),
-                yesterday_volume=_safe_int(item.get("yesterday_volume"), _safe_int(item.get("volume"))),
-            )
+            self._position_object(account_id, item)
             for item in [data]
         ][0]
 
@@ -2002,20 +2109,26 @@ class BigQmtXtTrader:
         price, strategy_name, order_remark,
     ):
         account_id = _account_id(account, self.client.account_id)
-        return self.client.call(
-            "order_stock",
-            {
-                "account_id": account_id,
-                "stock_code": stock_code,
-                "order_type": order_type,
-                "order_volume": order_volume,
-                "price_type": price_type,
-                "price": price,
-                "strategy_name": strategy_name,
-                "order_remark": order_remark,
-            },
-            account_id=account_id,
-        ) or {}
+        user_order_id = str(order_remark or "").strip()
+        if not user_order_id:
+            user_order_id = "bqrpc:%s:%s" % (int(time.time() * 1000), uuid.uuid4().hex[:10])
+        payload = {
+            "account_id": account_id,
+            "stock_code": stock_code,
+            "order_type": order_type,
+            "order_volume": order_volume,
+            "price_type": price_type,
+            "price": price,
+            "strategy_name": strategy_name,
+            "order_remark": user_order_id,
+        }
+        try:
+            return self.client.call("order_stock", payload, account_id=account_id) or {}
+        except TimeoutError as exc:
+            raise TimeoutError(
+                "order_stock rpc timeout; user_order_id=%s. Query orders/trades before retrying to avoid duplicate orders. %s"
+                % (user_order_id, exc)
+            )
 
     def order_stock_async(self, *args, **kwargs):
         return self.order_stock(*args, **kwargs)
