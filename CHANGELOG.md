@@ -2,11 +2,21 @@
 
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/) 和 [语义化版本](https://semver.org/)。
 
-## [Unreleased]
+## [0.2.1] - 2026-08-17
+
+### 修复
+
+- **正常下单误报 on_order_error(-1)**（Issue #38）：passorder 提交成功但委托号异步分配，客户端把「暂无 order_sys_id」误判为失败。服务端 `_handle_submit_order` 按唯一 `user_order_id`(remark) 匹配并回填 `order_sys_id`；顺带修掉校验代码对无 `.get()` 方法的 `OrderSnapshot` 调 `.get()` 的死代码（server_error 之前从未生效）。客户端 `call()` 不再丢弃 `server_error`，委托未进系统时转成异常，`order_stock_async` 携带真实原因回调 `on_order_error`。实盘验证：async 下单回调带真实委托号、提交阶段零误报（302 个测试通过，新增 5 个）。
+- **query_stock_orders 查不到委托**（strategy_name 陷阱）：客户端别名默认 `"bigqmt_signal_trader"` 与服务端默认 `""` 不一致，改用其他策略名下单后别名查询返回空。默认改 `""`（返回全部）并对齐测试。
 
 ### 新增
 
-- qmt-trader skill 内置「首次部署」引导：客户端装包、QMT 端文件同步、私有配置模板、入口启动验证、部署排错速查，零上下文也能从零跑通。
+- **qmt-trader skill 首次部署引导**：客户端装包、QMT 端文件同步、私有配置模板、入口启动验证、部署排错速查，零上下文也能从零跑通。
+- **PyPI 发布**：`BIGQMT_REDIS_DRYRUN` 入口模块补进 py-modules，`pip install xtquant-big-convert` 即可获得完整包（wheel/sdist 均通过 twine check）。
+
+### 变更
+
+- README 头部加 PyPI / Python 版本 / License 徽章，新增「AI 助手 Skill：qmt-trader」专节（启用方式、命令概览、安全设计）。
 
 ---
 

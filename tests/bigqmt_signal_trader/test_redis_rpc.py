@@ -145,6 +145,34 @@ class CapturingTradeGateway(DryRunOrderGateway):
         return []
 
 
+class LandingOrderGateway(DryRunOrderGateway):
+    """模拟 QMT：passorder 异步落地，委托号稍后出现在查询结果里。"""
+
+    def __init__(self, landed=True):
+        super().__init__()
+        self.landed = landed
+        self.orders = []
+
+    def submit(self, request):
+        result = super().submit(request)
+        if self.landed:
+            self.orders.append(
+                OrderSnapshot(
+                    order_sys_id="sysid-1",
+                    user_order_id=str(request.remark or ""),
+                    stock_code=request.stock_code,
+                    action=request.action,
+                    volume=request.volume,
+                    traded_volume=0,
+                    status="50",
+                )
+            )
+        return result
+
+    def query_orders(self, account_id, strategy_name):
+        return list(self.orders)
+
+
 class CapturingExecutionGateway(CapturingTradeGateway):
     def __init__(self):
         super().__init__()
@@ -248,6 +276,40 @@ class RedisRpcTest(unittest.TestCase):
         self.assertTrue(all(item["accepted"] for item in results))
         self.assertTrue(all(item["user_order_id"] for item in results))
         self.assertTrue(all(not item["order_sys_id"] for item in results))
+
+    def test_submit_order_enriches_order_sys_id_by_remark(self):
+        # issue #38: passorder 提交成功但委托号异步分配。服务端必须按唯一
+        # user_order_id(remark) 匹配并回填 order_sys_id，客户端才不会把
+        # 「已提交」误判成 -1 失败。
+        gateway = LandingOrderGateway(landed=True)
+        handlers = BigQmtRpcHandlers(
+            account_id="acct", market_data=FakeMarketData(),
+            position_provider=FakePositionProvider(), order_gateway=gateway,
+            allow_order_methods=True,
+        )
+        result = handlers.handle("order_stock", {
+            "account_id": "acct", "stock_code": "600000.SH", "order_type": 23,
+            "order_volume": 100, "price_type": 11, "price": 10.0,
+            "order_remark": "REMARK-38",
+        })
+        self.assertEqual(result.order_sys_id, "sysid-1")
+        self.assertEqual(handlers._last_server_error, "")
+
+    def test_submit_order_silent_rejection_sets_server_error(self):
+        # 委托没进系统（静默拒绝）时记录 server_error，客户端据此收到真实原因。
+        gateway = LandingOrderGateway(landed=False)
+        handlers = BigQmtRpcHandlers(
+            account_id="acct", market_data=FakeMarketData(),
+            position_provider=FakePositionProvider(), order_gateway=gateway,
+            allow_order_methods=True,
+        )
+        result = handlers.handle("order_stock", {
+            "account_id": "acct", "stock_code": "600000.SH", "order_type": 23,
+            "order_volume": 100, "price_type": 11, "price": 10.0,
+            "order_remark": "REMARK-38",
+        })
+        self.assertIsNone(result.order_sys_id)
+        self.assertIn("not found in system", handlers._last_server_error)
 
     def test_submit_orders_batch_reuses_order_tag_without_resubmitting(self):
         gateway = CountingOrderGateway()

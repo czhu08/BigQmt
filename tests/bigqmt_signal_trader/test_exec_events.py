@@ -493,6 +493,54 @@ class ExecEventsClientDispatchTest(unittest.TestCase):
         # No success response for a failed submit.
         self.assertEqual(len(cb.async_responses), 0)
 
+    def test_order_stock_async_submitted_without_sysid_fires_response_not_error(self):
+        # issue #38: passorder 已提交但委托号还没分配到（order_sys_id 为空）时，
+        # 必须回调成功响应而不是误报 on_order_error。
+        trader, cb = self._trader()
+        original_order_stock = trader.order_stock
+
+        def fake_order_stock(*args, **kwargs):
+            return {"status": "SUBMITTED", "user_order_id": "u-1", "order_sys_id": ""}
+
+        trader.order_stock = fake_order_stock
+        try:
+            seq = trader.order_stock_async("acct", "600654.SH", 23, 100, 11, 10.0, "s", "r")
+        finally:
+            trader.order_stock = original_order_stock
+
+        self.assertGreater(seq, 0)
+        self.assertEqual(len(cb.order_errors), 0)
+        self.assertEqual(len(cb.async_responses), 1)
+        resp = cb.async_responses[0]
+        self.assertEqual(resp.order_id, "u-1")  # 委托号未知时回退到 user_order_id
+        self.assertEqual(resp.order_sys_id, "")
+
+    def test_order_stock_async_server_error_fires_order_error_with_reason(self):
+        # server_error（委托没进系统）由 call() 转成异常后，async 必须把真实
+        # 原因回调给 on_order_error（issue #38）。
+        trader, cb = self._trader()
+        original_order_stock = trader.order_stock
+
+        def fake_order_stock(*args, **kwargs):
+            raise RuntimeError(
+                "Big QMT order_stock server_error: passorder submitted but "
+                "order not found in system (stock=600654.SH action=BUY price=10.00 "
+                "volume=100). QMT may have silently rejected it."
+            )
+
+        trader.order_stock = fake_order_stock
+        try:
+            seq = trader.order_stock_async("acct", "600654.SH", 23, 100, 11, 10.0, "s", "r")
+        finally:
+            trader.order_stock = original_order_stock
+
+        self.assertGreater(seq, 0)
+        self.assertEqual(len(cb.async_responses), 0)
+        self.assertEqual(len(cb.order_errors), 1)
+        err = cb.order_errors[0]
+        self.assertIn("not found in system", err.error_msg)
+        self.assertEqual(err.stock_code, "600654.SH")
+
     def test_cancel_order_stock_async_fires_response(self):
         trader, cb = self._trader()
         original = trader.cancel_order_stock_sysid

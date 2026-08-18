@@ -867,15 +867,29 @@ class BigQmtRpcHandlers:
 
         # 委托后校验：确认委托是否真的进了系统。passorder 调用成功但委托没进
         # 系统时（静默失败），记录 server_error 让客户端知道。
+        # QMT 的委托号是异步分配的（passorder 无返回值），这里按唯一
+        # user_order_id(remark) 精确匹配并回填 order_sys_id，避免客户端把
+        # 「已提交但暂无委托号」误判为下单失败（issue #38）。
         self._last_server_error = ""
         try:
             import time as _time
             _time.sleep(0.5)  # 给 QMT 处理委托的时间
-            orders = self.order_gateway.query_orders(request.account_id, "")
-            if not any(
-                str(o.get("stock_code") or "").upper() == request.stock_code.upper()
-                and str(o.get("action") or "").upper() == request.action.upper()
-                for o in (orders or [])
+            orders = self.order_gateway.query_orders(request.account_id, "") or []
+            by_remark = [
+                o for o in orders
+                if str(getattr(o, "user_order_id", "") or "").strip() == request.remark.strip()
+            ]
+            if by_remark:
+                sysid = str(getattr(by_remark[0], "order_sys_id", "") or "")
+                if sysid:
+                    try:
+                        result.order_sys_id = sysid
+                    except Exception:
+                        pass
+            elif not any(
+                str(getattr(o, "stock_code", "") or "").upper() == request.stock_code.upper()
+                and str(getattr(o, "action", "") or "").upper() == request.action.upper()
+                for o in orders
             ):
                 self._last_server_error = (
                     "passorder submitted but order not found in system "
