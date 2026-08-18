@@ -328,8 +328,8 @@ def normalize_order_event(order, account_id=""):
         "remark": str(_attr(order, ["m_strRemark", "order_remark", "remark", "user_order_id"], "") or ""),
         "user_order_id": str(_attr(order, ["m_strRemark", "user_order_id", "order_remark", "remark"], "") or ""),
         "opt_name": str(_attr(order, ["m_strOptName", "opt_name"], "") or ""),
-        "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),  # dt
-        "created_at_ts": time.time(),
+        "created_at": dt,  # time.strftime("%Y-%m-%d %H:%M:%S"),  # dt
+        # "created_at_ts": time.time(),
         "price_type": _attr(order, "m_nOrderPriceType", 50),
         "status_msg": str(_attr(order, "m_strCancelInfo", ""))
     }
