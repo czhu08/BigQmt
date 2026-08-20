@@ -911,7 +911,15 @@ class BigQmtXtData:
     def _call(self, method, **params):
         return self.client.call(method, params)
 
-    def get_full_tick(self, code_list):
+    def get_full_tick(self, code_list, timeout_seconds=None):
+        """Fetch full tick data for a list of codes.
+
+        Args:
+            code_list: stock codes to query.
+            timeout_seconds: per-request RPC timeout. None = auto (30s for whole-market
+                snapshots, else client default 120s). Callers can pass a larger value
+                when querying many codes (e.g. 1256 ETF options may need 150-180s).
+        """
         codes = list(code_list or [])
         if not codes:
             return {}
@@ -942,10 +950,15 @@ class BigQmtXtData:
                 raise TimeoutError("full tick redis cache timeout: %s" % ",".join(str(code) for code in codes))
             # Symbol-list miss (cold start / expired snapshot): fall back to a live
             # RPC so the first call is ~ms instead of a hard wait_seconds stall.
-            return self.client.call("get_full_tick", {"codes": codes}) or {}
+            rpc_timeout = timeout_seconds if timeout_seconds is not None else None
+            return self.client.call("get_full_tick", {"codes": codes}, timeout_seconds=rpc_timeout) or {}
         upper_codes = {str(code).strip().upper() for code in codes}
-        timeout_seconds = 30 if upper_codes & {"SH", "SZ", "BJ", "HK"} else None
-        return self.client.call("get_full_tick", {"codes": codes}, timeout_seconds=timeout_seconds) or {}
+        # Caller-provided timeout takes priority; otherwise auto-detect whole-market.
+        if timeout_seconds is not None:
+            rpc_timeout = timeout_seconds
+        else:
+            rpc_timeout = 30 if upper_codes & {"SH", "SZ", "BJ", "HK"} else None
+        return self.client.call("get_full_tick", {"codes": codes}, timeout_seconds=rpc_timeout) or {}
 
     def get_instrument_detail(self, stock_code):
         return self.client.call("get_instrument_detail", {"code": stock_code}) or {}
