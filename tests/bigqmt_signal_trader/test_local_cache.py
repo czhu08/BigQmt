@@ -51,6 +51,162 @@ class LocalMarketCacheTest(unittest.TestCase):
         self.assertIsNone(c.read("MISSING", "1d"))
         self.assertEqual(c.covered("X", "1d"), ("20260101", "20260103", 3))
 
+    def test_index_time_frames_slice_by_date_window(self):
+        # issue #54 follow-up: MiniQMT-shaped frames carry time as the index
+        # (the client normalizer moves stime to the index and drops the column).
+        # The cache must slice by that index — otherwise get_local_data returns
+        # every cached day regardless of the requested window.
+        import pandas as pd
+
+        c = LocalMarketCache(self.dir)
+        df = pd.DataFrame(
+            {"open": [1.0, 2.0, 3.0], "close": [1.5, 2.5, 3.5]},
+            index=["20260101", "20260102", "20260103"],
+        )
+        c.write("X", "1d", df)
+
+        out = c.read("X", "1d", start_time="20260102", end_time="20260102")
+        self.assertEqual(list(out.index), ["20260102"])
+        self.assertEqual(out["close"].iloc[0], 2.5)
+
+    def test_index_time_merge_dedupes_by_index_keep_last(self):
+        import pandas as pd
+
+        c = LocalMarketCache(self.dir)
+        c.write("X", "1d", pd.DataFrame({"close": [1.0, 2.0]}, index=["20260101", "20260102"]))
+        c.write("X", "1d", pd.DataFrame({"close": [2.5, 3.0]}, index=["20260102", "20260103"]))
+
+        out = c.read("X", "1d")
+        self.assertEqual(list(out.index), ["20260101", "20260102", "20260103"])
+        self.assertEqual(out.loc["20260102", "close"], 2.5)
+        self.assertEqual(c.covered("X", "1d"), ("20260101", "20260103", 3))
+
+
+class LocalCacheReadMatrixTest(unittest.TestCase):
+    """读路径参数矩阵：时间轴形态 × 周期形态 × 窗口参数组合。"""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+
+    def tearDown(self):
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    def _cache(self):
+        return LocalMarketCache(self.dir)
+
+    def _index_df(self, pairs):
+        import pandas as pd
+
+        return pd.DataFrame(
+            {"open": [p[1] for p in pairs], "close": [p[2] for p in pairs]},
+            index=[p[0] for p in pairs],
+        )
+
+    # -- 索引形态：日级窗口 --
+
+    def test_index_time_start_only_end_only(self):
+        c = self._cache()
+        c.write("X", "1d", self._index_df([("20260101", 1, 10), ("20260102", 2, 20), ("20260103", 3, 30)]))
+        self.assertEqual(list(c.read("X", "1d", start_time="20260102").index), ["20260102", "20260103"])
+        self.assertEqual(list(c.read("X", "1d", end_time="20260102").index), ["20260101", "20260102"])
+
+    def test_index_time_count_tail_and_window_plus_count(self):
+        c = self._cache()
+        c.write("X", "1d", self._index_df([("20260101", 1, 10), ("20260102", 2, 20), ("20260103", 3, 30)]))
+        self.assertEqual(list(c.read("X", "1d", count=1).index), ["20260103"])
+        # 窗口 + count：先切窗口再取尾部
+        self.assertEqual(
+            list(c.read("X", "1d", start_time="20260101", end_time="20260102", count=1).index),
+            ["20260102"],
+        )
+
+    def test_index_time_empty_windows(self):
+        c = self._cache()
+        c.write("X", "1d", self._index_df([("20260101", 1, 10), ("20260102", 2, 20)]))
+        # start > end
+        self.assertEqual(c.read("X", "1d", start_time="20260102", end_time="20260101").shape[0], 0)
+        # 未来窗口
+        self.assertEqual(c.read("X", "1d", start_time="20270101").shape[0], 0)
+        # 过去窗口
+        self.assertEqual(c.read("X", "1d", end_time="20250101").shape[0], 0)
+        # 恰好无交集（周末）
+        self.assertEqual(c.read("X", "1d", start_time="20260103", end_time="20260104").shape[0], 0)
+
+    def test_index_time_minute_level_14digit_index(self):
+        # 分钟线索引（14 位时间戳形态）：按 8 位日期前缀切片
+        c = self._cache()
+        c.write("X", "1m", self._index_df([
+            ("20260102093000", 1, 10), ("20260102093100", 2, 20), ("20260105093000", 3, 30),
+        ]))
+        out = c.read("X", "1m", start_time="20260102", end_time="20260102")
+        self.assertEqual(list(out.index), ["20260102093000", "20260102093100"])
+        # 精确到分钟的窗口
+        out2 = c.read("X", "1m", start_time="20260102093100")
+        self.assertEqual(list(out2.index), ["20260102093100", "20260105093000"])
+
+    def test_index_time_placeholder_rows_dropped(self):
+        # 全 0 占位行（QMT 对没下载的日期填 0）不该进缓存——索引形态也一样
+        c = self._cache()
+        c.write("X", "1d", self._index_df([("20260101", 0.0, 0.0), ("20260102", 2.0, 20.0)]))
+        out = c.read("X", "1d")
+        self.assertEqual(list(out.index), ["20260102"])
+
+    def test_index_time_rewritten_after_new_dividend(self):
+        # 前复权数据除权后历史重缩放：重写同区间必须覆盖旧值（keep last）
+        c = self._cache()
+        c.write("X", "1d", self._index_df([("20260101", 1, 10.0)]), dividend_type="front")
+        c.write("X", "1d", self._index_df([("20260101", 1, 5.0)]), dividend_type="front")
+        out = c.read("X", "1d", dividend_type="front")
+        self.assertEqual(list(out["close"]), [5.0])
+
+    # -- 列形态：窗口边界补齐 --
+
+    def test_column_time_empty_windows(self):
+        import pandas as pd
+
+        c = self._cache()
+        c.write("X", "1d", pd.DataFrame({"stime": ["20260101", "20260102"], "close": [1.0, 2.0]}))
+        self.assertEqual(c.read("X", "1d", start_time="20260102", end_time="20260101").shape[0], 0)
+        self.assertEqual(c.read("X", "1d", start_time="20270101").shape[0], 0)
+
+    def test_column_time_14digit_stime_slice(self):
+        import pandas as pd
+
+        c = self._cache()
+        c.write("X", "1m", pd.DataFrame({
+            "stime": ["20260102093000", "20260102093100", "20260105093000"], "close": [1.0, 2.0, 3.0],
+        }))
+        out = c.read("X", "1m", start_time="20260102", end_time="20260102")
+        self.assertEqual(list(out["stime"]), ["20260102093000", "20260102093100"])
+
+    # -- 混合形态：老缓存（无时间轴）+ 新写入不崩 --
+
+    def test_mixed_legacy_rangeindex_cache_plus_new_write_does_not_crash(self):
+        import pandas as pd
+
+        c = self._cache()
+        # 模拟旧版写出的无时间轴缓存（RangeIndex，无 stime 列）
+        c.write("X", "1d", pd.DataFrame({"close": [9.0]}))
+        # 新版索引形态写入：老行无时间轴不可切片，丢弃老行保住新数据的时间索引
+        c.write("X", "1d", self._index_df([("20260101", 1, 10.0)]))
+        out = c.read("X", "1d")
+        self.assertEqual(out.shape[0], 1)
+        self.assertEqual(list(out.index), ["20260101"])
+        # 老行被丢后，窗口过滤正常工作
+        out2 = c.read("X", "1d", start_time="20260102")
+        self.assertEqual(out2.shape[0], 0)
+
+    # -- dividend_type 三种形态彻底隔离 --
+
+    def test_three_dividend_types_fully_isolated(self):
+        c = self._cache()
+        for dtype, price in (("none", 10.0), ("front", 8.0), ("back", 12.0)):
+            c.write("X", "1d", self._index_df([("20260101", 1, price)]), dividend_type=dtype)
+        self.assertEqual(list(c.read("X", "1d", dividend_type="none")["close"]), [10.0])
+        self.assertEqual(list(c.read("X", "1d", dividend_type="front")["close"]), [8.0])
+        self.assertEqual(list(c.read("X", "1d", dividend_type="back")["close"]), [12.0])
+
+
     def test_drops_zero_fill_placeholder_rows(self):
         import pandas as pd
 
@@ -188,6 +344,131 @@ class LocalCacheClientTest(unittest.TestCase):
         self.assertEqual(len(xt.client.calls), n)
 
 
+class CompatReadMatrixTest(unittest.TestCase):
+    """compat 层读路径矩阵：download -> cache -> get_local_data 全链路，
+    窗口/字段/count/复权/分批 参数逐一验证（#54 端到端回归）。"""
+
+    _BARS = {
+        "600000.SH": [("20260817", 9.04), ("20260818", 8.97), ("20260819", 9.08)],
+        "000001.SZ": [("20260817", 12.0), ("20260818", 12.1), ("20260819", 12.2)],
+    }
+
+    class _MatrixClient:
+        def __init__(self, cache_dir):
+            self.account_id = "acct"
+            self.calls = []
+            self.call_params = []
+            self.local_cache_config = {"enabled": True, "dir": cache_dir, "fallback_rpc": False}
+
+        def _redis(self):
+            return None
+
+        def call(self, method, params=None, account_id=None, timeout_seconds=None):
+            import pandas as pd
+
+            params = dict(params or {})
+            self.calls.append(method)
+            self.call_params.append((method, params))
+            if method == "get_market_data_ex":
+                out = {}
+                for code in params.get("stock_list") or []:
+                    rows = CompatReadMatrixTest._BARS.get(code) or []
+                    out[code] = pd.DataFrame(
+                        {"stime": [r[0] for r in rows], "close": [r[1] for r in rows]}
+                    )
+                return out
+            if method == "download_history_data2":
+                return True
+            raise AssertionError("unexpected rpc: %s" % method)
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+
+    def tearDown(self):
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    def _xt(self):
+        from bigqmt_signal_trader.xtquant_compat import BigQmtXtData
+
+        return BigQmtXtData(self._MatrixClient(self.dir))
+
+    def test_download_window_then_local_read_single_day(self):
+        # issue #54 端到端：下载 0817-0819，读 0818 必须只返回 0818
+        xt = self._xt()
+        xt.download_history_data2(["600000.SH"], "1d", start_time="20260817", end_time="20260819")
+        out = xt.get_local_data(["close"], ["600000.SH"], "1d",
+                                start_time="20260818", end_time="20260818", count=-1)
+        df = out["600000.SH"]
+        self.assertEqual(df.shape[0], 1)
+        self.assertEqual(list(df["close"]), [8.97])
+        self.assertEqual(str(df.index[0]), "20260818")
+
+    def test_local_read_windows_and_count(self):
+        xt = self._xt()
+        xt.download_history_data2(["600000.SH"], "1d", start_time="20260817", end_time="20260819")
+        code = "600000.SH"
+        self.assertEqual([str(i) for i in xt.get_local_data(
+            ["close"], [code], "1d", start_time="20260818")[code].index], ["20260818", "20260819"])
+        self.assertEqual([str(i) for i in xt.get_local_data(
+            ["close"], [code], "1d", end_time="20260818")[code].index], ["20260817", "20260818"])
+        self.assertEqual([str(i) for i in xt.get_local_data(
+            ["close"], [code], "1d", count=2)[code].index], ["20260818", "20260819"])
+
+    def test_local_read_field_selection(self):
+        xt = self._xt()
+        xt.download_history_data2(["600000.SH"], "1d")
+        out = xt.get_local_data(["close"], ["600000.SH"], "1d")
+        self.assertIn("close", out["600000.SH"].columns)
+        out_all = xt.get_local_data([], ["600000.SH"], "1d")
+        self.assertIn("close", out_all["600000.SH"].columns)
+
+    def test_get_market_data_ex_passes_params_to_rpc(self):
+        xt = self._xt()
+        xt.get_market_data_ex(field_list=["close"], stock_list=["600000.SH"], period="1d",
+                              start_time="20260817", end_time="20260819", count=-1,
+                              dividend_type="front")
+        method, params = xt.client.call_params[-1]
+        self.assertEqual(method, "get_market_data_ex")
+        self.assertEqual(params["start_time"], "20260817")
+        self.assertEqual(params["end_time"], "20260819")
+        self.assertEqual(params["dividend_type"], "front")
+        self.assertEqual(params["count"], -1)
+
+    def test_download_front_does_not_pollute_none_cache(self):
+        xt = self._xt()
+        xt.download_history_data2(["600000.SH"], "1d", dividend_type="front")
+        front = xt.get_local_data(["close"], ["600000.SH"], "1d", dividend_type="front")
+        self.assertEqual(front["600000.SH"].shape[0], 3)
+        # none 缓存没有被 front 数据污染
+        none = xt.get_local_data(["close"], ["600000.SH"], "1d", dividend_type="none")
+        self.assertEqual(none, {})
+
+    def test_get_market_data_ex_chunks_wide_stock_lists(self):
+        from bigqmt_signal_trader.xtquant_compat import DEFAULT_MARKET_DATA_CHUNK
+
+        xt = self._xt()
+        codes = ["600000.SH", "000001.SZ"] * DEFAULT_MARKET_DATA_CHUNK  # 200 只 > 默认 100/批
+        xt.get_market_data_ex(field_list=["close"], stock_list=codes, period="1d")
+        n_calls = xt.client.calls.count("get_market_data_ex")
+        self.assertEqual(n_calls, (len(codes) + DEFAULT_MARKET_DATA_CHUNK - 1) // DEFAULT_MARKET_DATA_CHUNK)
+
+    def test_local_read_returns_miniqmt_time_index_shape(self):
+        # MiniQMT 形态：时间做索引、没有 stime 列
+        xt = self._xt()
+        xt.download_history_data2(["600000.SH"], "1d")
+        df = xt.get_local_data(["close"], ["600000.SH"], "1d")["600000.SH"]
+        self.assertNotIn("stime", list(df.columns))
+        self.assertEqual([str(i) for i in df.index], ["20260817", "20260818", "20260819"])
+
+    def test_download_passes_window_to_server_rpc(self):
+        xt = self._xt()
+        xt.download_history_data2(["600000.SH"], "1d", start_time="20260815", end_time="20260819")
+        dl = [p for m, p in xt.client.call_params if m == "download_history_data2"]
+        self.assertTrue(dl)
+        self.assertEqual(dl[0]["start_time"], "20260815")
+        self.assertEqual(dl[0]["end_time"], "20260819")
+
+
 class AdjustedDownloadTest(unittest.TestCase):
     """Adjusted (front/back) downloads must trigger the server-side raw
     download FIRST: Big QMT computes adjusted bars from raw bars + dividend
@@ -224,14 +505,42 @@ class AdjustedDownloadTest(unittest.TestCase):
         self.assertEqual(raw_call["period"], "1d")
         self.assertEqual(raw_call["start_time"], "20200101")
 
-    def test_none_download_skips_server_side_raw_download(self):
+    def test_none_download_still_triggers_server_side_download(self):
+        """issue #47: an unadjusted download used to skip the server RPC and
+        only read what Big QMT already had -- a no-op that still reported
+        {finished: N}. xtdata semantics are "populate the local QMT store", and
+        callers (FormulaServer, get_local_data) depend on that actually happening."""
         xt = self._xt()
         xt.download_history_data2(["600000.SH"], "1d", dividend_type="none")
 
-        # Unadjusted pulls need no server-side download.
         method_calls = [m for m, _ in xt.client.call_params]
-        self.assertNotIn("download_history_data2", method_calls)
+        self.assertIn("download_history_data2", method_calls)
         self.assertIn("get_market_data_ex", method_calls)
+        self.assertLess(
+            method_calls.index("download_history_data2"),
+            method_calls.index("get_market_data_ex"),
+            "the download must precede the pull, or the pull reads stale data",
+        )
+        raw_call = next(p for m, p in xt.client.call_params if m == "download_history_data2")
+        self.assertEqual(raw_call["stock_list"], ["600000.SH"])
+        self.assertEqual(raw_call["period"], "1d")
+
+    def test_none_download_survives_server_download_failure(self):
+        """Same best-effort contract the adjusted path already had: a deployment
+        without the QMT global must still get its bars."""
+        xt = self._xt()
+        original_call = xt.client.call
+
+        def failing_download(method, params=None, account_id=None, timeout_seconds=None):
+            if method == "download_history_data2":
+                raise RuntimeError("global not available")
+            return original_call(method, params, account_id=account_id, timeout_seconds=timeout_seconds)
+
+        xt.client.call = failing_download
+        result = xt.download_history_data2(["600000.SH"], "1d", dividend_type="none")
+
+        self.assertEqual(result["finished"], 1)
+        self.assertIn("get_market_data_ex", [m for m, _ in xt.client.call_params])
 
     def test_front_download_survives_server_download_failure(self):
         # Deployments without the QMT global must still get the adjusted pull

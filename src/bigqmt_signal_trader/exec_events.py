@@ -404,10 +404,15 @@ def normalize_trade_event(trade, account_id=""):
         "direction": direction,
         "action": _action_from_direction(direction),
         "offset_flag": _attr(trade, ["m_nOffsetFlag", "offset_flag"]),
-        "traded_at": dt,
-        "remark": _attr(trade, ["m_strRemark", "order_remark", "remark"]),
-        # "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-        # "created_at_ts": time.time(),
+        "traded_at": str(_attr(trade, ["m_strTradeTime", "traded_at", "trade_time"], "") or ""),
+        # 和委托事件一致带上 remark。客户端要在拿到 order_sys_id 之前就把成交
+        # 关联到某笔异步委托 (issue #51)，而那时唯一已知的标识就是 remark。
+        # QMT 的成交行不一定有这个字段，取不到则为空，客户端退回按
+        # order_sys_id 关联。
+        "remark": str(_attr(trade, ["m_strRemark", "order_remark", "remark", "user_order_id"], "") or ""),
+        "user_order_id": str(_attr(trade, ["m_strRemark", "user_order_id", "order_remark", "remark"], "") or ""),
+        "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "created_at_ts": time.time(),
     }
 
 

@@ -271,5 +271,51 @@ class BigQmtAdaptersTest(unittest.TestCase):
         self.assertIsInstance(app.order_gateway, BigQmtOrderGateway)
 
 
-if __name__ == "__main__":
-    unittest.main()
+class FinancialFieldTranslateTest(unittest.TestCase):
+    """Issue #52: MiniQMT table names must translate to Big QMT's dotted
+    "BIGTABLE.field" fieldList before calling ContextInfo.get_financial_data."""
+
+    def _provider(self):
+        calls = []
+
+        class _Ctx:
+            def get_financial_data(self, field_list, stock_list, start_date, end_date, report_type):
+                calls.append((field_list, stock_list, start_date, end_date, report_type))
+                return {}
+
+        return BigQmtMarketDataProvider(_Ctx()), calls
+
+    def test_miniqmt_table_name_expands_to_full_dotted_field_list(self):
+        provider, calls = self._provider()
+        provider.get_financial_data(["600000.SH"], ["Balance"], "20260101", "20260819")
+        field_list = calls[0][0]
+        self.assertEqual(calls[0][1], ["600000.SH"])  # stockList second
+        self.assertTrue(field_list)
+        self.assertTrue(all(f.startswith("ASHAREBALANCESHEET.") for f in field_list))
+        self.assertIn("ASHAREBALANCESHEET.tot_assets", field_list)
+        self.assertIn("ASHAREBALANCESHEET.tot_liab", field_list)
+
+    def test_bigqmt_bare_table_name_also_expands(self):
+        provider, calls = self._provider()
+        provider.get_financial_data(["600000.SH"], ["CAPITALSTRUCTURE"])
+        field_list = calls[0][0]
+        self.assertIn("CAPITALSTRUCTURE.total_capital", field_list)
+
+    def test_dotted_entries_remap_prefix_and_bigqmt_dots_pass_through(self):
+        provider, calls = self._provider()
+        provider.get_financial_data(["600000.SH"], [
+            "Balance.tot_assets",
+            "ASHAREINCOME.net_profit_incl_min_int_inc",
+        ])
+        field_list = calls[0][0]
+        self.assertEqual(field_list, [
+            "ASHAREBALANCESHEET.tot_assets",
+            "ASHAREINCOME.net_profit_incl_min_int_inc",
+        ])
+
+    def test_unknown_table_name_passes_through(self):
+        provider, calls = self._provider()
+        provider.get_financial_data(["600000.SH"], ["CustomTable"])
+        self.assertEqual(calls[0][0], ["CustomTable"])
+
+

@@ -224,6 +224,10 @@ _EXTRA_QMT_GLOBAL_FUNCS = (
     # must be captured here so the adapter can call them. Issue #32.
     "download_history_data",
     "download_history_data2",
+    # Some QMT builds expose only down_history_data (single stock, same 4-arg
+    # signature). Issue #54: without it the download RPC is a silent no-op and
+    # reads only ever return the latest day.
+    "down_history_data",
 )
 
 
@@ -398,6 +402,11 @@ def _build_rpc_service(context_info, app, config):
         allow_order_methods=allow_order_methods,
         allowed_methods=rpc_config.get("allowed_methods"),
         qmt_api=qmt_api,
+        # Async settlement keeps passorder off the adjust thread's critical
+        # path; set rpc_settle_orders_inline=True only for a runtime with no
+        # adjust drain to retry on.
+        settle_orders_inline=_config_bool(rpc_config.get("settle_orders_inline"), False),
+        order_settle_timeout_seconds=float(rpc_config.get("order_settle_timeout_seconds", 3.0)),
         quote_subscription_manager=quote_manager,
     )
     handlers.download_job_redis_client = response_redis_client or redis_client
@@ -577,6 +586,62 @@ def _schedule_adjust_if_needed(context_info, config):
         )
 
 
+# Where each adjust() call came from, and what tick_app actually costs.
+# The question this answers: handlebar is documented as tick-driven in live
+# trading, but the observed cadence is a flat ~50/10s -- exactly the run_time
+# timer and nothing else. Splitting the counters shows whether handlebar fires
+# at all once the historical replay ends, and the tick_app histogram shows what
+# it would cost to let it drive the strategy body rather than just the drain.
+_adjust_source_stats = {"handlebar": 0, "timer": 0, "window_start": 0.0}
+# Bucket upper bounds in ms; the last bucket is everything above.
+_TICK_APP_BUCKETS = (1, 5, 20, 50, 100, 250, 500, 1000, 2000)
+_tick_app_hist = [0] * (len(_TICK_APP_BUCKETS) + 1)
+_tick_app_max_ms = [0.0]
+
+
+def _record_adjust_source(source):
+    """Count adjust() calls per trigger source, logged on the cadence window."""
+    stats = _adjust_source_stats
+    now = time.time()
+    if stats["window_start"] <= 0:
+        stats["window_start"] = now
+    stats[source] = stats.get(source, 0) + 1
+    if now - stats["window_start"] >= 10.0:
+        print(
+            "[adjust_source] handlebar=%d timer=%d over %.0fs"
+            % (stats["handlebar"], stats["timer"], now - stats["window_start"])
+        )
+        stats.update({"handlebar": 0, "timer": 0, "window_start": now})
+
+
+def _record_tick_app_ms(ms):
+    """Histogram of tick_app cost.
+
+    tick_app is the expensive half of adjust() and is skipped while
+    is_last_bar() is False, so the replay-time cost (~0.2ms/call) says nothing
+    about what it costs at the live edge. Before letting ticks drive it we need
+    the real distribution, not just the >50ms outliers the phase logger prints.
+    """
+    for index, bound in enumerate(_TICK_APP_BUCKETS):
+        if ms <= bound:
+            _tick_app_hist[index] += 1
+            break
+    else:
+        _tick_app_hist[-1] += 1
+    if ms > _tick_app_max_ms[0]:
+        _tick_app_max_ms[0] = ms
+
+
+def _format_tick_app_hist():
+    labels = []
+    previous = 0
+    for index, bound in enumerate(_TICK_APP_BUCKETS):
+        labels.append("%d-%dms=%d" % (previous, bound, _tick_app_hist[index]))
+        previous = bound
+    labels.append(">%dms=%d" % (_TICK_APP_BUCKETS[-1], _tick_app_hist[-1]))
+    return " ".join(labels)
+
+
 def _record_adjust_tick():
     """Track and periodically log the real interval between adjust triggers."""
     stats = _adjust_tick_stats
@@ -592,11 +657,14 @@ def _record_adjust_tick():
     stats["min"] = delta if stats["min"] <= 0 else min(stats["min"], delta)
     stats["max"] = max(stats["max"], delta)
     if now - stats["window_start"] >= 10.0 and stats["count"] > 0:
-        # avg = stats["sum"] / stats["count"]
-        # print(
-        #     "[bigqmt_signal_trader] adjust cadence: ticks=%d avg=%.3fs min=%.3fs max=%.3fs over %.0fs"
-        #     % (stats["count"], avg, stats["min"], stats["max"], now - stats["window_start"])
-        # )
+        avg = stats["sum"] / stats["count"]
+        print(
+            "[bigqmt_signal_trader] adjust cadence: ticks=%d avg=%.3fs min=%.3fs max=%.3fs over %.0fs"
+            % (stats["count"], avg, stats["min"], stats["max"], now - stats["window_start"])
+        )
+        if sum(_tick_app_hist) > 0:
+            print("[tick_app_hist] %s max=%.0fms"
+                  % (_format_tick_app_hist(), _tick_app_max_ms[0]))
         stats.update({"count": 0, "sum": 0.0, "min": 0.0, "max": 0.0, "window_start": now})
 
 
@@ -717,6 +785,46 @@ def _log_err(tag, message):
         pass
 
 
+def _diag_bar_driver(context_info):
+    """Report what drives handlebar: the strategy's own symbol, period, and
+    whether any quote subscription exists.
+
+    handlebar is documented as firing per incoming tick in live trading, but it
+    goes quiet here once the historical replay ends. This strategy never calls
+    subscribe_quote / subscribe_whole_quote / set_universe, so the leading
+    suspect is that nothing is feeding it ticks. Print what QMT actually has so
+    the next live session settles it instead of us guessing.
+    """
+    fields = (
+        ("stockcode", "品种"),
+        ("stock_code", "品种(alt)"),
+        ("period", "周期"),
+        ("do_back_test", "回测模式"),
+        ("start", "起始"),
+        ("end", "结束"),
+    )
+    parts = []
+    for name, label in fields:
+        try:
+            value = getattr(context_info, name, None)
+            if callable(value):
+                value = value()
+            if value not in (None, ""):
+                parts.append("%s=%s" % (label, value))
+        except Exception:
+            continue
+    print("[bigqmt_diag] bar driver: %s" % (" ".join(parts) or "<无法读取>"))
+
+    for name in ("subscribe_quote", "subscribe_whole_quote", "set_universe", "is_last_bar"):
+        print("[bigqmt_diag]   %-22s %s"
+              % (name, "可用" if callable(getattr(context_info, name, None)) else "不可用"))
+    try:
+        print("[bigqmt_diag]   is_last_bar() 当前值    %s" % context_info.is_last_bar())
+    except Exception as exc:
+        print("[bigqmt_diag]   is_last_bar() 调用失败  %s" % exc)
+    print("[bigqmt_diag]   本策略未订阅任何行情 -> handlebar 预计仅由历史回放驱动")
+
+
 def _diag_startup(ContextInfo, config):
     """Startup diagnostics: check service status and key function bindings.
 
@@ -727,6 +835,8 @@ def _diag_startup(ContextInfo, config):
     print("=" * 60)
     print("[bigqmt_diag] startup diagnostics")
     print("=" * 60)
+
+    _diag_bar_driver(ContextInfo)
 
     # 1. RPC service status
     rpc_config = dict(config.get("rpc") or {})
@@ -821,9 +931,10 @@ def _adjust_phase(name, fn, *args):
             pass
 
 
-def adjust(ContextInfo):
+def adjust(ContextInfo, _source="timer"):
     global _adjust_logged
     _record_adjust_tick()
+    _record_adjust_source(_source)
     config = _build_config()
     _adjust_phase("drain", _drain_rpc_service, config)
     _adjust_phase("full_tick", _refresh_full_tick_cache, ContextInfo, config)
@@ -836,12 +947,25 @@ def adjust(ContextInfo):
     if not _adjust_logged:
         print("[bigqmt_signal_trader] adjust ok")
         _adjust_logged = True
-    return _adjust_phase("tick_app", tick_app, ContextInfo, datetime.datetime.now())
+    _tick_app_t0 = time.perf_counter()
+    try:
+        return _adjust_phase("tick_app", tick_app, ContextInfo, datetime.datetime.now())
+    finally:
+        # Every call, not just the >50ms ones _adjust_phase prints: deciding
+        # whether ticks may drive this needs the whole distribution.
+        _record_tick_app_ms((time.perf_counter() - _tick_app_t0) * 1000.0)
 
 
 def handlebar(ContextInfo):
-    """Standard Big QMT bar callback."""
-    return adjust(ContextInfo)
+    """Standard Big QMT bar callback.
+
+    Documented as tick-driven during live trading ("再在每个tick数据来后驱动运行
+    一次"), but the observed cadence is a flat ~50/10s -- the run_time timer
+    alone. Tagging the source tells us whether this ever fires once the
+    historical replay ends; the strategy subscribes to no quote, which is the
+    leading suspect.
+    """
+    return adjust(ContextInfo, _source="handlebar")
 
 
 def _exec_event_redis(config):

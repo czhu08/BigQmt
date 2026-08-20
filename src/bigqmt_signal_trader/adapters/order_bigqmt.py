@@ -24,6 +24,67 @@ def _action_from_offset_flag(offset_flag):
     return SignalAction.BUY.value if int(offset_flag or 0) == 48 else SignalAction.SELL.value
 
 
+# 报单时间。大 QMT 的 ORDER 行把日期和时间分成两个字段, MiniQMT 的
+# XtOrder.order_time 是 Unix 秒, 所以要拼接后转换。成交那条路径早就读了
+# m_strTradeTime, 委托这边一直漏掉 (issue #48)。
+_ORDER_DATE_FIELDS = ("m_strInsertDate", "m_strOrderDate", "insert_date", "order_date")
+_ORDER_TIME_FIELDS = ("m_strInsertTime", "m_strOrderTime", "insert_time", "order_time")
+
+# 取不到时打印该行实际有哪些 m_*, 每进程一次。字段名无法离线核实,
+# 猜一个然后静默返回 0 正是订单方向那个 bug 的成因。
+_missing_order_time_reported = []
+
+
+def _report_missing_order_time(row):
+    if _missing_order_time_reported:
+        return
+    _missing_order_time_reported.append(True)
+    try:
+        available = sorted(n for n in dir(row) if n.startswith("m_"))
+    except Exception:
+        available = []
+    print(
+        "[bigqmt_order] order_time not found (tried %s / %s); ORDER row exposes: %s"
+        % (", ".join(_ORDER_DATE_FIELDS), ", ".join(_ORDER_TIME_FIELDS),
+           ", ".join(available) or "<none>")
+    )
+
+
+def _order_time_seconds(row):
+    """把 ORDER 行的报单日期+时间转成 Unix 秒, 拿不到返回 0。
+
+    容忍几种实际会遇到的写法: 日期 '20260819' 或 '2026-08-19',
+    时间 '093015'、'09:30:15' 或 '09:30:15.123'。已经是数字时间戳的直接用
+    (毫秒会被归一到秒)。
+    """
+    raw_time = _attr(row, _ORDER_TIME_FIELDS)
+    raw_date = _attr(row, _ORDER_DATE_FIELDS)
+    if raw_time is None and raw_date is None:
+        _report_missing_order_time(row)
+        return 0
+
+    # 已是数字: 当成时间戳 (>1e11 视为毫秒)。
+    if isinstance(raw_time, (int, float)) and not isinstance(raw_time, bool):
+        value = float(raw_time)
+        if value > 1e11:
+            value /= 1000.0
+        if value > 1e8:      # 像时间戳而不是 093015 这种时分秒
+            return int(value)
+
+    date_text = "".join(ch for ch in str(raw_date or "") if ch.isdigit())
+    time_text = "".join(ch for ch in str(raw_time or "") if ch.isdigit())
+    if not date_text or len(date_text) < 8:
+        return 0
+    time_text = (time_text + "000000")[:6]   # 补齐到 HHMMSS, 丢掉毫秒
+    try:
+        import time as _time
+
+        parsed = _time.strptime(date_text[:8] + time_text, "%Y%m%d%H%M%S")
+        return int(_time.mktime(parsed))
+    except Exception:
+        return 0
+
+
 def _price_type_value(value, default):
     if value is None or value == "":
         return int(default)
@@ -146,7 +207,7 @@ class BigQmtOrderGateway:
                     price=float(_attr(row, ("m_dLimitPrice", "m_dPrice", "price"), 0.0) or 0.0),
                     strategy_name=str(_attr(row, ("m_strOptName", "strategy_name"), "") or ""),
                     remark=str(_attr(row, ("m_strRemark", "remark"), "") or ""),
-                    created_at=dt,
+                    order_time=_order_time_seconds(row),
                     price_type=int(_attr(row, ["m_nOrderPriceType"])),
                     status_msg=str(_attr(row, "m_strCancelInfo", ""))
                 )

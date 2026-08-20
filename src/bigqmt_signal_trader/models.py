@@ -266,7 +266,7 @@ class OrderSnapshot:
         price=0.0,
         strategy_name="",
         remark="",
-        created_at="",
+        order_time=0,
         price_type=50,
         status_msg=""
     ):
@@ -280,7 +280,9 @@ class OrderSnapshot:
         self.price = price
         self.strategy_name = strategy_name
         self.remark = remark
-        self.created_at=created_at
+        # 报单时间, Unix 秒 -- MiniQMT XtOrder.order_time 的语义。0 = 未上报。
+        # 追加在末尾并给默认值, 保持既有位置参数调用不受影响。
+        self.order_time = order_time
         self.price_type=price_type
         self.status_msg=status_msg
 

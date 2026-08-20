@@ -2,6 +2,55 @@
 
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/) 和 [语义化版本](https://semver.org/)。
 
+## [Unreleased]
+
+### 修复
+
+- **qmt_launcher mode=login 打不进密码**：SendMessage 把键消息发给顶层窗口，但 Qt 对话框只在窗口持前台焦点时才把按键路由给输入框——后台进程发送等于静默丢弃。改为物理输入（keybd_event/mouse_event）：Alt 键解锁前台保护 → 置顶 + 前置 → 物理点击字段 → 打字。账号预填时先 Ctrl+A 再覆盖（否则变成追加）；密码框点击位置避开右侧虚拟键盘图标；控件坐标按窗口尺寸比例定位。已是大窗（主界面=自动登录完成）时跳过整个输入流程，避免密码打进主窗口控件。
+- **登录框就绪判定**：58600 端口在登录前就监听，launcher 的端口就绪不等于"已登录可用"——docstring 已注明，建议以 RPC ping 为真正就绪信号。
+
+---
+
+## [0.2.3] - 2026-08-19
+
+### 修复
+
+- **异步下单的 order/trade 事件先于 async_response 到达**（Issue #51）：两条回调走不同通道——`async_response` 在异步下单工作线程触发，`order`/`trade` 来自 Redis pub/sub 监听线程；服务端 `order_callback` 先推事件、后回 RPC，顺序颠倒是常态。客户端按 `order_remark` 设屏障：命中待响应委托的事件先暂存，response（或 error）触发后按到达顺序放行；10 秒超时兜底，提交失败的事件也不会被永久扣住（丢事件比顺序错乱更糟）。仅 `order_stock_async` 路径受影响，手工/同步/无 remark 委托直通。成交事件无 remark 时按委托事件学到的 `order_sys_id` 关联。已验证：9 个单测（含 4 个反向验证）+ 盘后真实 Redis 注入实测 + 盘中 3 轮真实买卖验证（async_response 均先于 order/trade 到达，买单 50→54 撤单成功，卖单无持仓 50→57 废单正确上报）。
+- **重复 order_remark 导致暂存事件丢失**（Issue #51 后续）：`order_remark` 不强制唯一（网格类策略常复用同一 remark），同 remark 的第二笔下单会让 `_arm_order_barrier` 直接覆盖前一笔的屏障，暂存事件被静默丢弃；且前一笔的 response 会误放后一笔的屏障，使后一笔失去保序。改为接管旧屏障时先放行其暂存事件；`_release_order_barrier` 增加 seq 校验，只有 arm 时的那笔委托的 response 才能放行对应屏障。回归测试对任一半修复回退均失败。
+- **download_history_data2 只下载当天数据**（Issue #54）：部分 QMT 版本只注入单股下载全局 `down_history_data`，而捕获列表只有 `download_history_data/2` → 下载 RPC 静默返回 False、什么都没下，读取只能看到当天数据。捕获列表补 `down_history_data`；`download_history_data2` 无批量全局时按代码循环调用单股全局（日期透传）；`_handle_download_history_data` 同步兜底。修正 DRYRUN 里恒为 False 的下载绑定诊断打印。
+- **get_financial_data 表名不兼容**（Issue #52）：MiniQMT 传整表名（Balance/Income/…），大 QMT 要 `"BIGTABLE.field"` 点分字段列表。服务端适配层新增 MiniQMT→大QMT 表名映射（8 张表）+ 整表名展开为全字段点分列表；点分条目前缀重映射、未知表名透传。实盘验证：`Balance`（展开 54 字段）与 `Capital`（6 字段）均返回真实数据（首调服务端自动下载财务数据较慢，之后毫秒级）。
+- **本地缓存丢时间轴导致日期窗口失效**（Issue #54 关联）：客户端规范化把 `stime` 列转成索引（MiniQMT 形态），而 local_cache 只在列里找时间轴 → `get_local_data` 的 start/end 完全不生效、按索引去重也失效。修复：缓存层识别索引形态时间轴（`write`/`read`/`covered`/count 截尾/占位行清理全链路保索引）；parquet 写盘带索引；老版写出的无时间轴缓存文件遇新版写入时自动废弃（行不可切片，留着只会污染窗口过滤）。新增 18 个读路径矩阵用例（形态 × 周期 × 窗口 × count × 复权隔离）。
+
+## [0.2.2] - 2026-08-19
+
+### 修复
+
+- **server_error 污染后续查询**（Issue #43）：`_last_server_error` 是实例状态，但每个成功响应都会读取它，而只有下单路径会重置。一次静默拒绝的委托会把错误盖到之后**所有** ping 和查询上，直到下一次下单。改为在 `handle()` 中每请求清空，且清空发生在方法校验之前，因此被拒绝的方法也不会携带上一次的诊断。
+- **order_remark 匹配的模糊兜底**（Issue #41）：那段 `stock_code + action` 的兜底并非用于*识别*委托，而是**告警闸门**——问题比报告描述的更严重。`order_tag` 是我们生成的唯一 id，匹配不上即真未进系统；模糊兜底唯一的作用是**压制真实告警**：账户中若有一笔无关的同股票同方向委托（手动下的或上一笔未成交的），会导致 `order_sys_id` 未回填、`server_error` 为空，客户端看到一次干净的成功，而该委托从未进入系统。已移除。
+- **order_stock_async 阻塞 QMT 主线程**（Issue #44）：`_handle_submit_order` 中的 `sleep(0.5)` 在 adjust 主线程执行（下单方法不在 `listener_methods` 中，走 deferred 路径），使其余请求串行等待，吞吐上限约 2 单/秒。改为**推迟响应而非推迟工作**：提交后登记 `OrderSettlement` 并停放响应，由每次 adjust drain 重试查询，委托号就绪即在同一 tick 内回复（零 sleep）。后台线程方案不可行——`get_trade_detail_data` 在非主策略线程返回空，会把每笔都误判为静默拒绝。
+- **order_stock_async 未立即返回**（Issue #50）：客户端内部同步调用 `order_stock`，阻塞整个 RPC 往返，加上 #44 后的结算等待，每笔 0.5~1 秒。服务端新增 `wait_settlement` 参数（false 时 passorder 一返回即回复，委托号由 `order_callback` 推送）；客户端提交移至工作线程，`order_stock_async` 不碰网络直接返回 seq。`on_order_error` 现在也携带 `seq`，此前无法判断是哪一笔异步委托失败。
+- **未复权下载实为空跑**（Issue #47，亦是 #39 的真正原因）：服务端下载此前只在请求复权时执行，未复权路径仅调用 `get_market_data_ex` 读取已有数据，却照常通过 callback 报告 `{finished: N}`——为一件没发生的事显示进度。而 1d/tick 默认即 `dividend_type="none"`。现在所有 `dividend_type` 都执行下载。实盘验证：601398.SH 本地日线从 0 根变为有数据。
+- **query_stock_orders 缺少 order_time**（Issue #48）：大 QMT 的 ORDER 行提供报单日期与时间，但三层均未读取。已贯通 `OrderSnapshot` → `order_bigqmt` → `_order_from_dict`，按 MiniQMT `XtOrder.order_time` 语义输出 Unix 秒。实盘验证：11 笔真实委托全部有值。
+
+### 新增
+
+- **qmt_launcher**（Issue #45）：`open` / `close` / `restart` / `status` 四个命令管理 QMT 终端。按 `bin.x64` 路径隔离（同机多实例并存时不会误关其他账户）、以 FormulaServer 端口可连接为就绪判据而非固定 sleep、窗口标题前缀匹配（不再写死版本号）、先优雅终止 20 秒后才强杀。登录路径用 `SendMessage` 投递窗口句柄，不依赖窗口置于前台。
+- **get_market_data_ex 分批**（Issue #47 评论）：宽 `stock_list` 此前共用一个 RPC 超时，要么装得下要么整批丢失。改为按 100 个代码一批，单批失败只损失自身代码，全部失败才抛异常。`chunk_size=0` 恢复原行为。
+- **bar driver 观测埋点**：`adjust()` 按触发来源分别计数、`tick_app` 全量耗时直方图、init 报告策略品种/周期/订阅能力。用于定位 RPC 读延迟的来源。
+
+### 变更
+
+- `AssetSnapshot` 补齐 `frozen_cash` / `market_value`，对齐 MiniQMT `XtAsset`；`market_value` 优先取 `m_dInstrumentValue`，仅在服务端未上报时才推导（推导会扣除冻结金额，此前未扣导致市值虚高）。
+- ZMQ 传输改为精确绑定配置端口，冲突时报错而非向上扫描——端口静默漂移会让客户端连不上。
+
+### 已知限制
+
+- Issue #44 / #50 的实盘下单验证尚未完成（单测已量化非阻塞行为：drain < 0.2s、20 单 < 1.0s）。
+- Issue #47 评论所述的 `get_market_data_ex` 超时未能复现；三组压测（300 只 × count=3、300 只 × 全历史、50 只 × 1m 全天）最慢 718ms，远在默认 6s 超时内。分批目前是防御性改动。
+- RPC 读延迟受 QMT 主线程 GIL 制约，延迟 ≈ 基础 + N × `schedule_adjust_interval`。实测该间隔 200ms → 100ms 可使 p50 从 374ms 降至 172ms，代价是 CPU 占用上升。
+
+---
+
 ## [0.2.1] - 2026-08-17
 
 ### 修复

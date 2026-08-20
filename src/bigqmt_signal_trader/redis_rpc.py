@@ -21,6 +21,11 @@ from .code_utils import normalize_stock_code
 from .models import AccountSnapshot, OrderRef, OrderRequest
 
 
+# time.monotonic: unaffected by wall-clock jumps, so a settle deadline
+# survives an NTP correction mid-session. Python 3.3+, fine on QMT's 3.6.
+_monotonic = time.monotonic
+
+
 RPC_REVISION = "20260715-execution-snapshot-v1"
 
 
@@ -351,6 +356,33 @@ def to_jsonable(value):
     return str(value)
 
 
+class OrderSettlement(object):
+    """One order awaiting its order_sys_id.
+
+    Why this cannot simply run on a background thread: get_trade_detail_data
+    returns EMPTY off the main strategy thread (see LISTENER_DEFERRED_METHODS),
+    so a background poll would find nothing and report every order as silently
+    rejected. The retries have to happen on the adjust thread -- just without
+    holding it.
+
+    server_error is carried here rather than on handlers._last_server_error:
+    that slot belongs to whichever request is in flight, and settling writes to
+    it long after this request left the handler (issue #43).
+    """
+
+    __slots__ = ("order_request", "result", "deadline", "attempts", "server_error",
+                 "request", "response")
+
+    def __init__(self, order_request, result, deadline):
+        self.order_request = order_request
+        self.result = result
+        self.deadline = deadline
+        self.attempts = 0
+        self.server_error = ""
+        self.request = None
+        self.response = None
+
+
 class BigQmtRpcHandlers:
     """Whitelisted RPC method handlers backed by replaceable adapters."""
 
@@ -364,6 +396,8 @@ class BigQmtRpcHandlers:
         allow_order_methods=False,
         allowed_methods=None,
         qmt_api=None,
+        settle_orders_inline=False,
+        order_settle_timeout_seconds=3.0,
         quote_subscription_manager=None,
     ):
         self.account_id = str(account_id or "")
@@ -377,6 +411,12 @@ class BigQmtRpcHandlers:
         # 融资融券查询等)。由 strategy._build_config 解析注入。
         self.qmt_api = dict(qmt_api or {})
         self._submit_journal = {}
+        # Order settlement. Async by default: blocking here holds the QMT main
+        # strategy thread, which serializes every other request behind it and
+        # caps throughput at ~2 orders/sec (issue #44).
+        self._pending_settlement = None
+        self.settle_orders_inline = bool(settle_orders_inline)
+        self.order_settle_timeout_seconds = float(order_settle_timeout_seconds)
         # Server-side diagnostic for silent failures (e.g. passorder submitted
         # but order not found in system). Surfaced to client via server_error.
         self._last_server_error = ""
@@ -405,6 +445,13 @@ class BigQmtRpcHandlers:
         requested_method = str(method or "").strip()
         method = self._canonical_method(requested_method)
         params = dict(params or {})
+        # Clear the diagnostic slot per request. It is instance state read by
+        # EVERY response (see _build_response), so without this a single failed
+        # submit_order stamps its server_error onto every later ping/query until
+        # the next order runs -- reporting a stale failure on requests that
+        # succeeded (issue #43).
+        self._last_server_error = ""
+        self._pending_settlement = None
         if not requested_method:
             raise ValueError("method is required")
         if method not in self.allowed_methods:
@@ -769,6 +816,9 @@ class BigQmtRpcHandlers:
         xtdata SDK then ContextInfo).
         """
         func = self.qmt_api.get("download_history_data")
+        # Some QMT builds only expose down_history_data (same signature, 4 args).
+        if func is None:
+            func = self.qmt_api.get("down_history_data")
         if func is not None:
             try:
                 stock_code = str(params.get("stock_code") or "")
@@ -791,14 +841,20 @@ class BigQmtRpcHandlers:
 
         Native signature includes an optional callback for progress; the QMT
         global may require it, so pass a no-op when the client didn't.
+
+        Some QMT builds expose only the single-stock download globals
+        (``download_history_data`` / ``down_history_data``) — fall back to a
+        per-code loop with those. Without this the RPC returned False and
+        nothing was downloaded, so reads only ever saw the latest day
+        (issue #54).
         """
+        stock_list = list(params.get("stock_list") or [])
+        period = str(params.get("period") or "1d")
+        start_time = str(params.get("start_time") or "")
+        end_time = str(params.get("end_time") or "")
         func = self.qmt_api.get("download_history_data2")
         if func is not None:
             try:
-                stock_list = list(params.get("stock_list") or [])
-                period = str(params.get("period") or "1d")
-                start_time = str(params.get("start_time") or "")
-                end_time = str(params.get("end_time") or "")
                 # Try with a no-op callback first (some QMT builds require it);
                 # fall back to 4-arg call if that raises TypeError.
                 try:
@@ -808,6 +864,15 @@ class BigQmtRpcHandlers:
                 return bool(result) if result is not None else True
             except Exception as exc:
                 raise RuntimeError("download_history_data2 failed: %s" % exc)
+        single = self.qmt_api.get("download_history_data") or self.qmt_api.get("down_history_data")
+        if single is not None:
+            try:
+                result = None
+                for code in stock_list:
+                    result = single(code, period, start_time, end_time)
+                return bool(result) if result is not None else True
+            except Exception as exc:
+                raise RuntimeError("download_history_data2 per-code fallback failed: %s" % exc)
         try:
             return self._handle_market_data_method("download_history_data2", params)
         except (NotImplementedError, AttributeError):
@@ -866,14 +931,57 @@ class BigQmtRpcHandlers:
         result = self.order_gateway.submit(request)
 
         # 委托后校验：确认委托是否真的进了系统。passorder 调用成功但委托没进
-        # 系统时（静默失败），记录 server_error 让客户端知道。
+        # 系统时（静默失败），记录 server_error 让客户端知道。匹配严格按
+        # user_order_id(remark) 精确比对，不做 stock_code+action 的模糊兜底。
         # QMT 的委托号是异步分配的（passorder 无返回值），这里按唯一
         # user_order_id(remark) 精确匹配并回填 order_sys_id，避免客户端把
         # 「已提交但暂无委托号」误判为下单失败（issue #38）。
         self._last_server_error = ""
+
+        # Async callers opt out of waiting for the order id. MiniQMT's
+        # order_stock_async returns a seq immediately and delivers the id through
+        # order_callback, so holding the reply until settlement is exactly the
+        # latency the async API exists to avoid (issue #50). The order_callback
+        # push already carries order_sys_id, so nothing is lost -- only the
+        # post-submit "did it land?" check is skipped, and a silent rejection
+        # surfaces as the absence of that push rather than as server_error.
+        if not _bool_value(params.get("wait_settlement"), True):
+            return result
+
+        if self.settle_orders_inline:
+            # Opt-out: block here the way this used to. Kept only for runtimes
+            # with no adjust drain to retry on.
+            try:
+                import time as _time
+                _time.sleep(self.order_settle_timeout_seconds)
+                self._apply_order_lookup(
+                    OrderSettlement(request, result, 0.0), final=True, inline=True)
+            except Exception:
+                pass
+            return result
+        # Hand the settlement to the caller rather than raising: handle() stays
+        # a plain function for anyone driving handlers directly, and only the
+        # service defers its reply.
+        self._pending_settlement = OrderSettlement(
+            request, result, _monotonic() + self.order_settle_timeout_seconds
+        )
+        return result
+
+    def take_pending_settlement(self):
+        """Pop the settlement the last submit_order registered, if any."""
+        settlement = self._pending_settlement
+        self._pending_settlement = None
+        return settlement
+
+    def _apply_order_lookup(self, settlement, final=False, inline=False):
+        """Look the order up by remark. True when settled, False to retry.
+
+        MUST run on the main strategy thread -- get_trade_detail_data returns
+        empty anywhere else.
+        """
+        request = settlement.order_request
+        settlement.attempts += 1
         try:
-            import time as _time
-            _time.sleep(0.5)  # 给 QMT 处理委托的时间
             orders = self.order_gateway.query_orders(request.account_id, "") or []
             by_remark = [
                 o for o in orders
@@ -883,24 +991,34 @@ class BigQmtRpcHandlers:
                 sysid = str(getattr(by_remark[0], "order_sys_id", "") or "")
                 if sysid:
                     try:
-                        result.order_sys_id = sysid
+                        settlement.result.order_sys_id = sysid
                     except Exception:
                         pass
-            elif not any(
-                str(getattr(o, "stock_code", "") or "").upper() == request.stock_code.upper()
-                and str(getattr(o, "action", "") or "").upper() == request.action.upper()
-                for o in orders
-            ):
-                self._last_server_error = (
-                    "passorder submitted but order not found in system "
-                    "(stock=%s action=%s price=%.2f volume=%d). "
-                    "QMT may have silently rejected it (check price range / permissions)."
-                    % (request.stock_code, request.action, request.price, request.volume)
-                )
+                return True
+            if not final:
+                # Not there yet. QMT assigns the id asynchronously, so an early
+                # miss is normal -- only a miss at the deadline is a real one.
+                return False
+            # Deadline reached with no remark match -> not in the system. Do NOT
+            # fall back to matching stock_code+action: order_tag is a unique id
+            # we generated, so a miss is always a real miss, while an unrelated
+            # order on the same stock and side (a manual one, or an earlier
+            # unfilled order) would silently suppress this warning and leave
+            # order_sys_id unfilled with no signal at all (issue #41).
+            message = (
+                "passorder submitted but order not found in system "
+                "(stock=%s action=%s price=%.2f volume=%d, %d lookup(s)). "
+                "QMT may have silently rejected it (check price range / permissions)."
+                % (request.stock_code, request.action, request.price,
+                   request.volume, settlement.attempts)
+            )
+            settlement.server_error = message
+            if inline:
+                self._last_server_error = message
+            return True
         except Exception:
-            # 校验失败不影响主流程（委托已提交）
-            pass
-        return result
+            # A failed lookup must not lose the order -- it is already submitted.
+            return True
 
     def _handle_submit_orders_batch(self, params):
         orders = params.get("orders") or []
@@ -1121,6 +1239,10 @@ class RedisPubSubRpcService:
         self._deferred_count = 0
         self.print_prefix = print_prefix
         self.pending = queue.Queue(maxsize=int(max_queue_size))
+        # Orders whose reply is waiting on QMT assigning an order id. Unbounded
+        # on purpose: every entry is an order that already reached the broker,
+        # so dropping one would strand a live order with no reply.
+        self._pending_settlements = queue.Queue()
         self._running = threading.Event()
         self._thread = None
         self._queue_thread = None
@@ -1310,7 +1432,53 @@ class RedisPubSubRpcService:
             raise ValueError("rpc payload must be a json object")
         return payload
 
+    def settle_pending_orders(self, max_items=100):
+        """Retry parked order lookups. MUST be called from the adjust thread.
+
+        A queue rather than a list because rpc_listener_methods is configurable:
+        if submit_order is ever put in it, the producer becomes the listener
+        thread while this consumer stays on adjust.
+
+        Unsettled entries go back on the queue, so each order costs one lookup
+        per adjust tick until it resolves or its deadline passes.
+        """
+        settled = 0
+        # Snapshot the size first. Unsettled entries go back on the same queue,
+        # so draining until empty would keep re-picking them and spin one adjust
+        # tick into many lookups per order.
+        batch = min(int(max_items), self._pending_settlements.qsize())
+        for _ in range(batch):
+            try:
+                settlement = self._pending_settlements.get_nowait()
+            except queue.Empty:
+                break
+            expired = _monotonic() >= settlement.deadline
+            try:
+                done = self.handlers._apply_order_lookup(settlement, final=expired)
+            except Exception:
+                done = True  # never strand a submitted order in the queue
+            if not done:
+                self._pending_settlements.put(settlement)
+                continue
+            response = settlement.response
+            response["data"] = to_jsonable(settlement.result)
+            response["ok"] = True
+            if settlement.server_error:
+                response["server_error"] = settlement.server_error
+            response["handled_at"] = _dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            try:
+                self._publish_response(settlement.request, response)
+            except Exception:
+                pass
+            settled += 1
+        return settled
+
+    def pending_settlement_count(self):
+        return self._pending_settlements.qsize()
+
     def drain_pending(self, max_items=20):
+        # Settle carry-overs from earlier ticks before taking on new work.
+        self.settle_pending_orders()
         processed = 0
         for _ in range(int(max_items)):
             try:
@@ -1324,6 +1492,10 @@ class RedisPubSubRpcService:
                 )
             self.process_request(request)
             processed += 1
+        # Settle again so an order submitted in THIS drain still replies on this
+        # tick. One lookup, no sleep -- if QMT has not assigned the id yet we
+        # simply retry next tick rather than holding the thread (issue #44).
+        self.settle_pending_orders()
         return processed
 
     def drain_request_queue(self, max_items=20):
@@ -1372,6 +1544,17 @@ class RedisPubSubRpcService:
             server_error = getattr(self.handlers, "_last_server_error", None)
             if server_error:
                 response["server_error"] = str(server_error)
+            # passorder already ran, but QMT assigns the order id asynchronously.
+            # Park the reply instead of sleeping on this thread; a later adjust
+            # tick settles and publishes it (issue #44).
+            take = getattr(self.handlers, "take_pending_settlement", None)
+            settlement = take() if callable(take) else None
+            if settlement is not None:
+                settlement.request = request
+                settlement.response = response
+                self._pending_settlements.put(settlement)
+                self._deferred_count += 1
+                return response
         except Exception as exc:
             response["error"] = "%s: %s" % (exc.__class__.__name__, exc)
         try:

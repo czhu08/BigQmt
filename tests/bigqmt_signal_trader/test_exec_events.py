@@ -1,4 +1,6 @@
 import json
+import time
+import threading
 import os
 import sys
 import unittest
@@ -449,22 +451,56 @@ class ExecEventsClientDispatchTest(unittest.TestCase):
         self.assertEqual(err.error_id, 99)
         self.assertEqual(err.error_msg, "撤单失败")
 
-    def test_order_stock_async_returns_seq_and_fires_response(self):
-        trader, cb = self._trader()
-        # order_stock is stubbed? No — it would do an RPC. Instead call the
-        # helper directly with a dict-like result via monkeypatching is heavy;
-        # here we only verify the seq increments and the async-response path
-        # fires when order_stock returns a dict (mocked below).
-        original_order_stock = trader.order_stock
+    def _run_async(self, trader, result=None, raises=None):
+        """Submit one async order with order_stock_result stubbed, and wait.
 
-        def fake_order_stock(*args, **kwargs):
-            return {"order_sys_id": "sys-ok-1", "user_order_id": "u-1"}
+        order_stock_async is fire-and-forget since issue #50: it returns the seq
+        without touching the network and the submit happens on a worker thread,
+        so the callback assertions need the queue drained first. The stub is
+        restored only after the worker is done with it.
+        """
+        original = trader.order_stock_result
 
-        trader.order_stock = fake_order_stock
+        def fake(*args, **kwargs):
+            if raises is not None:
+                raise raises
+            return result
+
+        trader.order_stock_result = fake
         try:
             seq = trader.order_stock_async("acct", "600654.SH", 23, 100, 11, 10.0, "s", "r")
+            self.assertTrue(trader.wait_async_orders(timeout=5.0), "async order did not finish")
         finally:
-            trader.order_stock = original_order_stock
+            trader.order_stock_result = original
+        return seq
+
+    def test_order_stock_async_returns_seq_without_submitting(self):
+        """issue #50: the seq must come back before any RPC happens."""
+        trader, _cb = self._trader()
+        started = threading.Event()
+        release = threading.Event()
+
+        def blocking(*args, **kwargs):
+            started.set()
+            release.wait(5.0)
+            return {"order_sys_id": "sys-slow"}
+
+        trader.order_stock_result = blocking
+        try:
+            t0 = time.time()
+            seq = trader.order_stock_async("acct", "600654.SH", 23, 100, 11, 10.0, "s", "r")
+            elapsed = time.time() - t0
+
+            self.assertGreater(seq, 0)
+            self.assertLess(elapsed, 0.2, "order_stock_async blocked for %.3fs" % elapsed)
+            self.assertTrue(started.wait(5.0), "submit never ran on the worker")
+        finally:
+            release.set()
+            trader.wait_async_orders(timeout=5.0)
+
+    def test_order_stock_async_fires_response_when_submitted(self):
+        trader, cb = self._trader()
+        seq = self._run_async(trader, result={"order_sys_id": "sys-ok-1", "user_order_id": "u-1"})
 
         self.assertGreater(seq, 0)
         self.assertEqual(len(cb.async_responses), 1)
@@ -472,41 +508,46 @@ class ExecEventsClientDispatchTest(unittest.TestCase):
         self.assertEqual(resp.order_id, "sys-ok-1")
         self.assertEqual(resp.account_id, "acct")
         self.assertEqual(resp.seq, seq)
+
+    def test_order_stock_async_requests_no_settlement_wait(self):
+        """The server must not hold the reply for the order id on this path."""
+        trader, _cb = self._trader()
+        seen = {}
+        original = trader.order_stock_result
+
+        def fake(*args, **kwargs):
+            seen.update(kwargs)
+            return {"order_sys_id": "sys-1"}
+
+        trader.order_stock_result = fake
+        try:
+            trader.order_stock_async("acct", "600654.SH", 23, 100, 11, 10.0, "s", "r")
+            trader.wait_async_orders(timeout=5.0)
+        finally:
+            trader.order_stock_result = original
+
+        self.assertIs(seen.get("wait_settlement"), False)
+
     def test_order_stock_async_minus_one_fires_order_error(self):
         trader, cb = self._trader()
-        original_order_stock = trader.order_stock
-
-        def fake_order_stock(*args, **kwargs):
-            return -1  # MiniQMT: submit failed
-
-        trader.order_stock = fake_order_stock
-        try:
-            seq = trader.order_stock_async("acct", "600654.SH", 23, 100, 11, 10.0, "s", "r")
-        finally:
-            trader.order_stock = original_order_stock
+        seq = self._run_async(trader, result=-1)  # MiniQMT: submit failed
 
         self.assertGreater(seq, 0)
         self.assertEqual(len(cb.order_errors), 1)
         err = cb.order_errors[0]
         self.assertEqual(err.error_id, -1)
         self.assertEqual(err.stock_code, "600654.SH")
+        self.assertEqual(err.seq, seq)          # correlate the failure to the seq
         # No success response for a failed submit.
         self.assertEqual(len(cb.async_responses), 0)
 
     def test_order_stock_async_submitted_without_sysid_fires_response_not_error(self):
         # issue #38: passorder 已提交但委托号还没分配到（order_sys_id 为空）时，
-        # 必须回调成功响应而不是误报 on_order_error。
+        # 必须回调成功响应而不是误报 on_order_error。issue #50 之后这是常态：
+        # 异步路径不再等待委托号，它由 order_callback 推送。
         trader, cb = self._trader()
-        original_order_stock = trader.order_stock
-
-        def fake_order_stock(*args, **kwargs):
-            return {"status": "SUBMITTED", "user_order_id": "u-1", "order_sys_id": ""}
-
-        trader.order_stock = fake_order_stock
-        try:
-            seq = trader.order_stock_async("acct", "600654.SH", 23, 100, 11, 10.0, "s", "r")
-        finally:
-            trader.order_stock = original_order_stock
+        seq = self._run_async(
+            trader, result={"status": "SUBMITTED", "user_order_id": "u-1", "order_sys_id": ""})
 
         self.assertGreater(seq, 0)
         self.assertEqual(len(cb.order_errors), 0)
@@ -519,20 +560,10 @@ class ExecEventsClientDispatchTest(unittest.TestCase):
         # server_error（委托没进系统）由 call() 转成异常后，async 必须把真实
         # 原因回调给 on_order_error（issue #38）。
         trader, cb = self._trader()
-        original_order_stock = trader.order_stock
-
-        def fake_order_stock(*args, **kwargs):
-            raise RuntimeError(
-                "Big QMT order_stock server_error: passorder submitted but "
-                "order not found in system (stock=600654.SH action=BUY price=10.00 "
-                "volume=100). QMT may have silently rejected it."
-            )
-
-        trader.order_stock = fake_order_stock
-        try:
-            seq = trader.order_stock_async("acct", "600654.SH", 23, 100, 11, 10.0, "s", "r")
-        finally:
-            trader.order_stock = original_order_stock
+        seq = self._run_async(trader, raises=RuntimeError(
+            "Big QMT order_stock server_error: passorder submitted but "
+            "order not found in system (stock=600654.SH action=BUY price=10.00 "
+            "volume=100). QMT may have silently rejected it."))
 
         self.assertGreater(seq, 0)
         self.assertEqual(len(cb.async_responses), 0)
@@ -540,6 +571,27 @@ class ExecEventsClientDispatchTest(unittest.TestCase):
         err = cb.order_errors[0]
         self.assertIn("not found in system", err.error_msg)
         self.assertEqual(err.stock_code, "600654.SH")
+
+    def test_async_orders_keep_submission_order(self):
+        """One worker, so responses arrive in the order the calls were made."""
+        trader, cb = self._trader()
+        original = trader.order_stock_result
+
+        def fake(*args, **kwargs):
+            return {"order_sys_id": "sys-%s" % args[1]}
+
+        trader.order_stock_result = fake
+        try:
+            for code in ("A.SH", "B.SH", "C.SH"):
+                trader.order_stock_async("acct", code, 23, 100, 11, 10.0, "s", "r")
+            self.assertTrue(trader.wait_async_orders(timeout=5.0))
+        finally:
+            trader.order_stock_result = original
+
+        self.assertEqual([r.order_id for r in cb.async_responses],
+                         ["sys-A.SH", "sys-B.SH", "sys-C.SH"])
+        self.assertEqual([r.seq for r in cb.async_responses],
+                         sorted(r.seq for r in cb.async_responses))
 
     def test_cancel_order_stock_async_fires_response(self):
         trader, cb = self._trader()

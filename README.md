@@ -114,6 +114,8 @@ seq = xt_trader.order_stock_async(acc, "600654.SH", 23, 100, 11, 2.95, "rpc_test
 | `on_cancel_error(err)` | 撤单失败 | ✅ |
 | `on_cancel_order_stock_async_response` | 异步撤单回报 | ✅ |
 
+**异步下单的事件顺序**（Issue #51）：`on_order_stock_async_response`（异步下单工作线程）与 `on_stock_order` / `on_stock_trade`（Redis pub/sub 监听线程）走不同通道，服务端在 `order_callback` 里先推事件、后回 RPC，事件先于响应是**常态**而非偶发竞态。客户端按 `order_remark` 设屏障：命中待响应委托的事件先暂存，response（或 error）触发后按到达顺序放行；屏障 10 秒超时兜底——丢事件比顺序错乱更糟。延迟只加在 `order_stock_async` 路径上：手工下单、同步下单、无 remark 的委托一律直通。成交事件可能没有 remark，此时按委托事件学到的 `order_sys_id` 关联。`order_remark` 不强制唯一（网格类策略常复用）：同 remark 的后一笔下单会接管前一笔的屏障并先放行其暂存事件，response 按 seq 精确匹配，前一笔的 response 不会误放后一笔的屏障。已验证：单测（含反向验证）+ 盘后真实 Redis 注入实测（部署环境保序成立）。
+
 **`*_async` 查询方法**（对齐 MiniQMT 签名，callback 可选）：
 
 ```python
@@ -223,6 +225,39 @@ BIGQMT_REDIS_CONFIG = {
 **失败一律自动回退 RPC**：方法未映射、参数translate 不了、服务没起、连接断——都退回原路径，
 所以连不上 58600 的客户端行为与改动前完全一致。BSON 编解码内置了无依赖实现（可选用
 pymongo 的 `bson`，两者输出实测逐字节一致），客户端不需要额外装包。
+
+### QMT 启停 / 自动重启（qmt_launcher）
+
+大 QMT 基本每天早上要重启一次，卡点在登录框。两条路绕过它：
+
+```bash
+python -m bigqmt_signal_trader.qmt_launcher status  --dir "D:\国金证券QMT交易端_lemo"
+python -m bigqmt_signal_trader.qmt_launcher restart --dir "D:\国金证券QMT交易端_lemo"
+```
+
+| mode | 做什么 | 需要登录框交互 |
+|------|--------|---------------|
+| `linkmini`（默认优先）| `XtMiniQmt.exe linkMini`，MiniQMT 免密启动 | 否 |
+| `bat` | 跑指定批处理（如 `免密登录qmt.bat`）| 否 |
+| `exe` | 直接起 `XtItClient.exe`，靠终端自身恢复会话 | 否 |
+| `login` | 起 exe 后向登录框输入账号密码 | 是，需 pywin32 |
+
+**关于「pywinauto/pyautogui 要求 Windows 处于登录状态」**：`login` 模式用的是
+`win32api.SendMessage` 直接投递到窗口句柄，不是 pyautogui 那种按屏幕坐标重放物理输入。
+前者不要求窗口置于前台，锁屏下也能工作（会话还在即可，完全注销则不行）。密码从
+环境变量 `BIGQMT_LOGIN_USER` / `BIGQMT_LOGIN_PASSWORD` 读，不走命令行参数——argv
+对同机任何进程可见。
+
+两个设计要点：
+
+- **按安装目录隔离**。同机常并行跑多个 QMT，`taskkill /im XtItClient.exe` 会误杀别人的
+  实盘。这里只终结 `--dir` 对应 `bin.x64` 下的进程；拿不到 exe 路径的进程直接跳过而不是
+  猜。
+- **等就绪而不是 sleep 固定秒数**。启动完成的判据是 FormulaServer 端口（58600）能接受连接，
+  超时抛 `QmtLauncherError` 而不是静默返回，避免定时任务在没起来的终端上继续跑。
+
+`restart` 默认在关闭后等 5 秒再启动：ZMQ 传输是精确绑定配置端口（不扫描），socket 没
+完全释放就重启会绑定失败。
 
 ### 独立 ZMQ 回测桥接
 
