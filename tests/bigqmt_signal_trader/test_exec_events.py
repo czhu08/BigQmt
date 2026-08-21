@@ -41,6 +41,22 @@ class FakeDeal:
     m_dComssion = 0.5
 
 
+class FakeDealWithOfficialDateTime:
+    """官方 Deal 字段: m_strTradeDate + m_strTradeTime 分离 (格式未注明,
+    按 QMT 惯例 'YYYYMMDD' / 'HHMMSS' 构造)。"""
+
+    m_strAccountID = "acct"
+    m_strInstrumentID = "600000.SH"
+    m_dPrice = 10.5
+    m_nVolume = 100
+    m_strTradeID = "T2"
+    m_strOrderSysID = "O2"
+    m_strTradeDate = "20260702"
+    m_strTradeTime = "100001"
+    m_nDirection = 48
+    m_dTradeAmount = 1050.0
+
+
 class FakeOrder:
     m_strAccountID = "acct"
     m_strInstrumentID = "000001.SZ"
@@ -53,6 +69,58 @@ class FakeOrder:
     strategyName = "s1"
     m_strRemark = "remark-1"
     m_strOptName = "限价买入"
+
+
+class FakeOrderWithInsertDateTime:
+    """官方 Order 字段: m_strInsertDate + m_strInsertTime (报单日期/时间)。"""
+
+    m_strAccountID = "acct"
+    m_strInstrumentID = "000001.SZ"
+    m_nOrderStatus = 50
+    m_nVolumeTotal = 200
+    m_nVolumeTraded = 50
+    m_dLimitPrice = 9.9
+    m_strOrderSysID = "O3"
+    m_nDirection = 49
+    strategyName = "s2"
+    m_strRemark = "remark-2"
+    m_strInsertDate = "20260702"
+    m_strInsertTime = "093000"
+
+
+class FakeOrderBareCodeLive:
+    """实盘 order_callback 观察到的形态: m_strInstrumentID 只带 6 位裸代码，
+    交易所在 m_strExchangeID；全部成交后 m_nVolumeTotal(剩余)=0 而
+    m_nVolumeTotalOriginal(原始委托量)=100。"""
+
+    m_strAccountID = "acct"
+    m_strInstrumentID = "600000"
+    m_strExchangeID = "SH"
+    m_nOrderStatus = 56
+    m_nVolumeTotalOriginal = 100
+    m_nVolumeTotal = 0
+    m_nVolumeTraded = 100
+    m_dLimitPrice = 9.14
+    m_strOrderSysID = "635005224"
+    m_nDirection = 48
+    m_strRemark = "live-remark-1"
+
+
+class FakeDealBareCodeLive:
+    """实盘 deal_callback 观察到的形态: 裸代码 + m_strExchangeID，
+    m_strTradeDate/m_strTradeTime 为 YYYYMMDD/HHMMSS。"""
+
+    m_strAccountID = "acct"
+    m_strInstrumentID = "600000"
+    m_strExchangeID = "SH"
+    m_dPrice = 9.06
+    m_nVolume = 100
+    m_strTradeID = "23808292"
+    m_strOrderSysID = "635005224"
+    m_strTradeDate = "20260821"
+    m_strTradeTime = "100952"
+    m_nDirection = 48
+    m_dTradeAmount = 906.0
 
 
 class FakeRedis:
@@ -123,6 +191,18 @@ class ExecEventsServerTest(unittest.TestCase):
         self.assertEqual(ev["traded_at"], "2026-07-02 10:00:00")
         self.assertEqual(ev["commission"], 0.5)
 
+    def test_normalize_trade_event_emits_real_traded_time(self):
+        # 官方 Deal 字段 m_strTradeDate + m_strTradeTime -> 真实成交 Unix 秒。
+        ev = normalize_trade_event(FakeDealWithOfficialDateTime(), "acct")
+        expected = int(time.mktime(time.strptime("20260702100001", "%Y%m%d%H%M%S")))
+        self.assertEqual(ev["traded_time"], expected)
+
+    def test_normalize_trade_event_parses_datetime_shaped_trade_time(self):
+        # m_strTradeTime 也可能是 'YYYY-MM-DD HH:MM:SS' 完整日期时间 (无 TradeDate)。
+        ev = normalize_trade_event(FakeDeal(), "acct")
+        expected = int(time.mktime(time.strptime("2026-07-02 10:00:00", "%Y-%m-%d %H:%M:%S")))
+        self.assertEqual(ev.get("traded_time"), expected)
+
     def test_normalize_order_event_maps_thinktrader_fields(self):
         ev = normalize_order_event(FakeOrder(), "acct")
 
@@ -137,6 +217,38 @@ class ExecEventsServerTest(unittest.TestCase):
         self.assertEqual(ev["remark"], "remark-1")
         self.assertEqual(ev["user_order_id"], "remark-1")
         self.assertEqual(ev["opt_name"], "限价买入")
+
+    def test_normalize_order_event_emits_real_order_time(self):
+        # 官方 Order 字段 m_strInsertDate + m_strInsertTime -> 真实报单 Unix 秒。
+        ev = normalize_order_event(FakeOrderWithInsertDateTime(), "acct")
+        expected = int(time.mktime(time.strptime("20260702093000", "%Y%m%d%H%M%S")))
+        self.assertEqual(ev["order_time"], expected)
+
+    def test_normalize_order_event_appends_exchange_suffix_to_bare_code(self):
+        # 实盘: order_callback 的 m_strInstrumentID 只有裸代码；交易所后缀必须
+        # 从 m_strExchangeID 补全，与 MiniQMT 契约及查询路径的代码形态一致。
+        ev = normalize_order_event(FakeOrderBareCodeLive(), "acct")
+        self.assertEqual(ev["stock_code"], "600000.SH")
+
+    def test_normalize_order_event_order_volume_prefers_original_not_remaining(self):
+        # MiniQMT XtOrder.order_volume 是原始委托量；全部成交推送里剩余量
+        # m_nVolumeTotal=0，若读剩余量会把已成交委托显示成 0 股。
+        ev = normalize_order_event(FakeOrderBareCodeLive(), "acct")
+        self.assertEqual(ev["order_volume"], 100)
+
+    def test_normalize_order_event_suffixed_code_unchanged_with_exchange(self):
+        # 已带后缀的代码不能因为对象带 m_strExchangeID 而重复追加。
+        class Suffixed(FakeOrderBareCodeLive):
+            m_strInstrumentID = "600000.SH"
+
+        ev = normalize_order_event(Suffixed(), "acct")
+        self.assertEqual(ev["stock_code"], "600000.SH")
+
+    def test_normalize_trade_event_appends_exchange_suffix_to_bare_code(self):
+        ev = normalize_trade_event(FakeDealBareCodeLive(), "acct")
+        self.assertEqual(ev["stock_code"], "600000.SH")
+        self.assertEqual(ev["trade_id"], "23808292")
+        self.assertEqual(ev["amount"], 906.0)
 
     def test_order_event_fills_strategy_from_remark_identity(self):
         class CallbackOrder:
@@ -408,6 +520,44 @@ class ExecEventsClientDispatchTest(unittest.TestCase):
         self.assertEqual(order.traded_volume, 50)
         self.assertEqual(order.order_status, 50)
         self.assertEqual(order.order_type, 24)  # SELL -> STOCK_SELL
+
+    def test_dispatch_order_bare_code_gets_inferred_suffix(self):
+        # 老服务端事件只带 6 位裸代码（无交易所信息可补全）时，客户端按
+        # A 股代码段推断后缀，保证回调对象与 MiniQMT 契约一致。
+        trader, cb = self._trader()
+        event = {
+            "event_type": "order",
+            "account_id": "acct",
+            "stock_code": "600000",
+            "order_sys_id": "sys-bare",
+            "order_volume": 100,
+            "traded_volume": 0,
+            "price": 9.14,
+            "status": 50,
+            "action": "BUY",
+        }
+        trader._dispatch_event(json.dumps(event).encode("utf-8"))
+
+        self.assertEqual(len(cb.orders), 1)
+        self.assertEqual(cb.orders[0].stock_code, "600000.SH")
+
+    def test_dispatch_trade_bare_code_gets_inferred_suffix(self):
+        trader, cb = self._trader()
+        event = {
+            "event_type": "trade",
+            "account_id": "acct",
+            "stock_code": "000001",
+            "order_sys_id": "sys-bare",
+            "trade_id": "t-bare",
+            "volume": 100,
+            "price": 10.5,
+            "action": "BUY",
+            "traded_at": "2026-07-02 10:00:00",
+        }
+        trader._dispatch_event(json.dumps(event).encode("utf-8"))
+
+        self.assertEqual(len(cb.trades), 1)
+        self.assertEqual(cb.trades[0].stock_code, "000001.SZ")
 
     def test_dispatch_without_callback_is_noop(self):
         trader = BigQmtXtTrader(account_id="acct")

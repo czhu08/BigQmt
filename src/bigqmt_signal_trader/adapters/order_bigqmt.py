@@ -6,6 +6,7 @@ The passorder signature follows src/api/qmt_jq_trade.
 import hashlib
 
 from ..code_utils import normalize_stock_code
+from ..exec_events import date_time_seconds
 from ..models import CancelResult, OrderSnapshot, OrderSubmitResult, SignalAction, TradeSnapshot
 from .position_bigqmt import _attr, _full_code
 
@@ -48,6 +49,29 @@ def _report_missing_order_time(row):
         % (", ".join(_ORDER_DATE_FIELDS), ", ".join(_ORDER_TIME_FIELDS),
            ", ".join(available) or "<none>")
     )
+
+
+# 委托状态描述。官方字段表 (docs/BIGQMT_INNER_PYTHON_API_REFERENCE.md):
+#   m_strCancelInfo  废单原因      <- 状态 57 时柜台的拒单理由在这里
+#   m_strErrorMsg    状态信息
+# 柜台消息形如 "[COUNTER] 资金可用余额不足，尚需[4789.630]"; 两个字段都空过,
+# 客户端就只能看到一个没有原因的失败 (issue #60)。废单原因优先, 它更具体。
+_STATUS_MSG_FIELDS = (
+    "m_strCancelInfo",
+    "m_strErrorMsg",
+    "m_strStatusMsg",
+    "status_msg",
+    "error_msg",
+)
+
+
+def _status_message(row):
+    for name in _STATUS_MSG_FIELDS:
+        value = _attr(row, (name,))
+        text = str(value or "").strip()
+        if text:
+            return text
+    return ""
 
 
 def _order_time_seconds(row):
@@ -209,7 +233,7 @@ class BigQmtOrderGateway:
                     remark=str(_attr(row, ("m_strRemark", "remark"), "") or ""),
                     order_time=_order_time_seconds(row),
                     price_type=int(_attr(row, ["m_nOrderPriceType"])),
-                    status_msg=str(_attr(row, "m_strCancelInfo", ""))
+                    status_msg=_status_message(row),
                 )
             )
         return result
@@ -238,11 +262,7 @@ class BigQmtOrderGateway:
             raise last_error
         result = []
         for row in rows:
-            date: str = str(_attr(row, "m_strTradeDate", ""))
-            if date:
-                dt = str(date) + " " + str(_attr(row, "m_strTradeTime", ""))
-            else:
-                dt = str(_attr(row, "m_strTradeTime", ""))
+            traded_at_raw = _attr(row, ("m_strTradeTime", "trade_time", "traded_at"), "")
             result.append(
                 TradeSnapshot(
                     trade_id=str(_attr(row, ("m_strTradeID", "trade_id"), "") or ""),
@@ -254,10 +274,17 @@ class BigQmtOrderGateway:
                     action=_action_from_offset_flag(_attr(row, ("m_nOffsetFlag", "offset_flag"), 0)),
                     volume=int(_attr(row, ("m_nVolume", "volume"), 0) or 0),
                     price=float(_attr(row, ("m_dPrice", "m_dTradePrice", "price"), 0.0) or 0.0),
-                    traded_at=dt,
-                    user_order_id=str(_attr(row, ["m_strRemark", "user_order_id", "remark"])),
-                    amount = float(_attr(row, ["m_dTradeAmount", "amount"])),
-                    commission=float(_attr(row, ["m_dCommission", "m_dComission", "commission"]))
+                    commission=float(_attr(row, ["m_dCommission", "m_dComission", "commission"])),
+                    traded_at=str(traded_at_raw or ""),
+                    user_order_id=str(_attr(row, ("m_strRemark", "user_order_id", "remark"), "") or ""),
+                    # 官方 Deal 字段: m_dTradeAmount 成交额; m_strTradeDate+
+                    # m_strTradeTime 合成 Unix 秒; 策略名来自查询过滤参数。
+                    amount=float(_attr(row, ("m_dTradeAmount", "amount"), 0.0) or 0.0),
+                    strategy_name=str(strategy_name or ""),
+                    traded_time=date_time_seconds(
+                        _attr(row, ("m_strTradeDate", "trade_date", "m_strDealDate")),
+                        traded_at_raw,
+                    ),
                 )
             )
         return result

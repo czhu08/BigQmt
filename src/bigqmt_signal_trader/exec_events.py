@@ -101,12 +101,63 @@ def _attr(obj, names, default=None):
     return default
 
 
+def _with_exchange_suffix(raw_code, obj):
+    """Append the exchange suffix to a bare instrument code.
+
+    Live order/deal callbacks carry ``m_strInstrumentID`` as the bare code
+    ('600000') while the exchange sits in ``m_strExchangeID`` — the same shape
+    ``get_trade_detail_data`` rows use. Native MiniQMT callback objects carry
+    the full '600000.SH' form, so events must match it. Codes that already
+    carry a suffix (or objects without exchange info) pass through unchanged.
+    """
+    text = str(raw_code or "")
+    if not text or "." in text:
+        return text
+    exchange = str(
+        _attr(obj, ["m_strExchangeID", "m_strMarketID", "exchange_id", "market"], "") or ""
+    ).strip().upper()
+    if exchange:
+        return "%s.%s" % (text, exchange)
+    return text
+
+
 def _action_from_direction(direction):
     if direction in _BUY_DIRECTIONS:
         return "BUY"
     if direction in _SELL_DIRECTIONS:
         return "SELL"
     return ""
+
+
+def date_time_seconds(raw_date, raw_time):
+    """Combine a QMT date + time pair into Unix seconds; 0 when unavailable.
+
+    Official docs (dict.thinktrader.net, data_structure) leave the format of
+    m_strTradeDate/m_strTradeTime/m_strInsertDate/m_strInsertTime unspecified,
+    so tolerate the shapes seen in practice: date '20260819' or '2026-08-19',
+    time '093015', '09:30:15(.123)', or a full 'YYYY-MM-DD HH:MM:SS' carried
+    in the time field alone. Numeric timestamps pass through (ms normalized).
+    """
+    if isinstance(raw_time, (int, float)) and not isinstance(raw_time, bool):
+        value = float(raw_time)
+        if value > 1e11:  # ms epoch
+            value /= 1000.0
+        if value > 1e8:   # looks like an epoch, not HHMMSS
+            return int(value)
+
+    date_digits = "".join(ch for ch in str(raw_date or "") if ch.isdigit())
+    time_digits = "".join(ch for ch in str(raw_time or "") if ch.isdigit())
+    # Time field carrying its own date ('YYYYMMDDHHMMSS' or the dashed form).
+    if len(time_digits) >= 14:
+        date_digits, time_digits = time_digits[:8], time_digits[8:14]
+    if not date_digits or len(date_digits) < 8:
+        return 0
+    time_digits = (time_digits + "000000")[:6]  # pad to HHMMSS, drop ms
+    try:
+        parsed = time.strptime(date_digits[:8] + time_digits, "%Y%m%d%H%M%S")
+        return int(time.mktime(parsed))
+    except ValueError:
+        return 0
 
 
 def _is_buy(val):
@@ -312,12 +363,19 @@ def normalize_order_event(order, account_id=""):
     return {
         "event_type": EVENT_ORDER,
         "account_id": str(_attr(order, ["m_strAccountID", "account_id"], account_id) or account_id or ""),
-        "stock_code": _full_code(
-            _attr(order, ("m_strInstrumentID", "instrument_id", "stock_code")),
-            _attr(order, ("m_strExchangeID", "exchange_id", "market")),
+        # "stock_code": _full_code(
+        #     _attr(order, ("m_strInstrumentID", "instrument_id", "stock_code")),
+        #     _attr(order, ("m_strExchangeID", "exchange_id", "market")),
+        # ),
+        "stock_code": _with_exchange_suffix(
+            _attr(order, ["m_strInstrumentID", "stock_code", "m_strInstrument"], ""), order
         ),
         "order_sys_id": str(_attr(order, ["m_strOrderSysID", "order_sys_id", "order_sysid", "order_id"], "") or ""),
-        "order_volume": _attr(order, ["m_nVolumeTotalOriginal", "order_volume", "volume"]),
+        # MiniQMT XtOrder.order_volume is the ORIGINAL ordered volume; the
+        # remaining volume (m_nVolumeTotal) drops to 0 on the filled push.
+        "order_volume": _attr(
+            order, ["m_nVolumeTotalOriginal", "m_nVolumeTotal", "order_volume", "volume"]
+        ),
         "traded_volume": _attr(order, ["m_nVolumeTraded", "traded_volume"]),
         "price": _attr(order, ["m_dLimitPrice", "price", "limit_price"]),
         "status": _attr(order, ["m_nOrderStatus", "order_status", "status"]),
@@ -328,10 +386,22 @@ def normalize_order_event(order, account_id=""):
         "remark": str(_attr(order, ["m_strRemark", "order_remark", "remark", "user_order_id"], "") or ""),
         "user_order_id": str(_attr(order, ["m_strRemark", "user_order_id", "order_remark", "remark"], "") or ""),
         "opt_name": str(_attr(order, ["m_strOptName", "opt_name"], "") or ""),
-        "created_at": dt,  # time.strftime("%Y-%m-%d %H:%M:%S"),  # dt
-        # "created_at_ts": time.time(),
         "price_type": _attr(order, "m_nOrderPriceType", 50),
-        "status_msg": str(_attr(order, "m_strCancelInfo", ""))
+        # 委托状态描述。官方字段表: m_strCancelInfo=废单原因, m_strErrorMsg=状态信息。
+        # 柜台的拒单理由 ("[COUNTER] 资金可用余额不足，尚需[...]") 只在这里,
+        # 此前完全没有透传, 客户端看到的是一个没有原因的失败 (issue #60)。
+        "status_msg": str(
+            _attr(order, ["m_strCancelInfo", "m_strErrorMsg", "m_strStatusMsg",
+                          "status_msg", "error_msg"], "") or ""
+        ),
+        # 官方 Order 字段 m_strInsertDate+m_strInsertTime -> 真实报单 Unix 秒。
+        # 0 = 回调对象未携带 (老版本), 客户端会退回 created_at_ts。
+        "order_time": date_time_seconds(
+            _attr(order, ["m_strInsertDate", "m_strOrderDate", "insert_date", "order_date"]),
+            _attr(order, ["m_strInsertTime", "m_strOrderTime", "insert_time", "order_time"]),
+        ),
+        "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "created_at_ts": time.time(),
     }
 
 
@@ -391,9 +461,11 @@ def normalize_trade_event(trade, account_id=""):
     return {
         "event_type": EVENT_TRADE,
         "account_id": str(_attr(trade, ["m_strAccountID", "account_id"], account_id) or account_id or ""),
-        "stock_code": _full_code(
-            _attr(trade, ("m_strInstrumentID", "instrument_id", "stock_code")),
-            _attr(trade, ("m_strExchangeID", "exchange_id", "market")),
+        # "stock_code": _full_code(
+        #     _attr(trade, ("m_strInstrumentID", "instrument_id", "stock_code")),
+        #     _attr(trade, ("m_strExchangeID", "exchange_id", "market")),
+        "stock_code": _with_exchange_suffix(
+            _attr(trade, ["m_strInstrumentID", "stock_code"], ""), trade
         ),
         "order_sys_id": str(_attr(trade, ["m_strOrderSysID", "order_sys_id", "order_sysid", "order_id"], "") or ""),
         "trade_id": str(_attr(trade, ["m_strTradeID", "trade_id"], "") or ""),
@@ -411,6 +483,12 @@ def normalize_trade_event(trade, account_id=""):
         # order_sys_id 关联。
         "remark": str(_attr(trade, ["m_strRemark", "order_remark", "remark", "user_order_id"], "") or ""),
         "user_order_id": str(_attr(trade, ["m_strRemark", "user_order_id", "order_remark", "remark"], "") or ""),
+        # 官方 Deal 字段 m_strTradeDate+m_strTradeTime -> 真实成交 Unix 秒。
+        # 0 = 未携带, 客户端会退回 created_at_ts。
+        "traded_time": date_time_seconds(
+            _attr(trade, ["m_strTradeDate", "trade_date", "m_strDealDate"]),
+            _attr(trade, ["m_strTradeTime", "trade_time", "traded_at"]),
+        ),
         "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
         "created_at_ts": time.time(),
     }
@@ -454,7 +532,13 @@ def normalize_order_error_event(order_error, account_id=""):
         "stock_code": str(_attr(order_error, ["m_strInstrumentID", "stock_code"], "") or ""),
         "order_sys_id": str(_attr(order_error, ["m_strOrderSysID", "order_sys_id", "order_sysid", "order_id"], "") or ""),
         "error_id": _attr(order_error, ["m_nErrorID", "error_id", "m_nOrderStatus"]),
-        "error_msg": str(_attr(order_error, ["m_strErrorMsg", "error_msg", "m_strMsg"], "") or ""),
+        # m_strCancelInfo 排在最前: 官方字段表把它标为「废单原因」, 而柜台的
+        # 拒单理由 ("[COUNTER] 资金可用余额不足，尚需[...]") 正是走这个字段。
+        # 之前只读 m_strErrorMsg, 于是 error_msg 常常是空的 (issue #60)。
+        "error_msg": str(
+            _attr(order_error, ["m_strCancelInfo", "m_strErrorMsg", "error_msg",
+                                "m_strMsg", "m_strStatusMsg", "status_msg"], "") or ""
+        ),
         "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
         "created_at_ts": time.time(),
     }

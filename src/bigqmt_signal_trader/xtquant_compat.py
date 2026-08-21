@@ -17,6 +17,10 @@ import datetime as _dt
 from .full_tick_cache import request_full_tick_cache, wait_full_tick_cache
 from .local_cache import LocalMarketCache
 from .redis_rpc import call_redis_rpc
+from .logging_setup import get_logger
+
+
+log = get_logger("xtquant_compat")
 
 
 # Default OHLCV fields pulled + cached by get_local_data fallback_rpc.
@@ -394,6 +398,25 @@ def _safe_float(value, default=0.0):
         return default
 
 
+def _to_unix_seconds(value, default=0):
+    """Normalize a trade/order time into Unix seconds (MiniQMT semantics).
+
+    Accepts numeric epochs, ``YYYY-MM-DD HH:MM:SS[.ffffff]`` and
+    ``YYYYMMDDHHMMSS`` strings. Anything else falls back to ``default``.
+    """
+    if value is None or value == "":
+        return default
+    if isinstance(value, (int, float)):
+        return int(value)
+    text = str(value).strip()
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M:%S.%f", "%Y%m%d%H%M%S"):
+        try:
+            return int(time.mktime(time.strptime(text, fmt)))
+        except ValueError:
+            continue
+    return default
+
+
 def _as_list(value):
     if value is None:
         return []
@@ -518,6 +541,25 @@ def _is_hs_a_share(code):
     return pure.startswith(
         ("000", "001", "002", "003", "300", "301", "600", "601", "603", "605", "688", "689")
     )
+
+
+def _full_a_share_code(code):
+    """Ensure a callback stock_code carries its exchange suffix.
+
+    Native MiniQMT XtOrder/XtTrade carry the full '600000.SH' form. Events from
+    an older server (or when the callback object exposes no exchange info) may
+    carry the bare 6-digit code; infer the suffix from the A-share code ranges
+    so consumers can key on the full form. Non-6-digit or already-suffixed
+    codes pass through unchanged.
+    """
+    text = str(code or "").strip().upper()
+    if "." in text or not (len(text) == 6 and text.isdigit()):
+        return text
+    if text.startswith(("600", "601", "603", "605", "688", "689")):
+        return text + ".SH"
+    if text.startswith(("000", "001", "002", "003", "300", "301")):
+        return text + ".SZ"
+    return text
 
 
 class BigQmtRpcClient:
@@ -1926,7 +1968,7 @@ class BigQmtXtTrader:
                 )
             )
         except Exception:
-            pass
+            log.exception("user callback failed: on_account_status")
 
     def _event_loop(self):
         from .exec_events import (
@@ -2006,6 +2048,7 @@ class BigQmtXtTrader:
                         order_sys_id=event.get("order_sys_id") or "",
                         order_id=event.get("order_sys_id") or "",
                         stock_code=event.get("stock_code") or "",
+                        order_remark=str(event.get("remark") or event.get("user_order_id") or ""),
                     )
                 )
             elif event_type == "cancel_error":
@@ -2019,7 +2062,12 @@ class BigQmtXtTrader:
                     )
                 )
         except Exception:
-            pass
+            # 业务回调异常不能打崩事件线程，但必须留痕（issue: 静默吞错）。
+            log.exception(
+                "user callback failed: event_type=%s account=%s",
+                event.get("event_type"),
+                account_id,
+            )
 
     def run_forever(self):
         while True:
@@ -2159,6 +2207,9 @@ class BigQmtXtTrader:
         return None
 
     def query_stock_trades(self, account, strategy_name=""):
+        # 默认 "" = 查询账户全部成交 (与服务端 _handle_query_trades 一致)。
+        # 旧默认 "bigqmt_signal_trader" 会过滤掉其他策略名的成交;
+        # 按策略过滤时由调用方显式传入。
         account_id = _account_id(account, self.client.account_id)
         data = self.client.call(
             "query_stock_trades",
@@ -2397,10 +2448,11 @@ class BigQmtXtTrader:
                             order_id="",
                             stock_code=stock_code,
                             seq=seq,
+                            order_remark=str(kwargs.get("order_remark") or (args[7] if len(args) > 7 else "") or ""),
                         )
                     )
                 except Exception:
-                    pass
+                    log.exception("user callback failed: on_order_error seq=%s", seq)
             self._release_order_barrier(remark, seq)
             return
 
@@ -2426,10 +2478,11 @@ class BigQmtXtTrader:
                             order_id="",
                             stock_code=stock_code,
                             seq=seq,
+                            order_remark=str(kwargs.get("order_remark") or (args[7] if len(args) > 7 else "") or ""),
                         )
                     )
                 except Exception:
-                    pass
+                    log.exception("user callback failed: on_order_error seq=%s", seq)
             self._release_order_barrier(remark, seq)
             return
 
@@ -2452,7 +2505,9 @@ class BigQmtXtTrader:
                     ),
                 )
             except Exception:
-                pass
+                log.exception(
+                    "user callback failed: on_order_stock_async_response seq=%s", seq
+                )
         # response 已触发 -> 放行这笔委托暂存的 order/trade (issue #51)。
         self._release_order_barrier(remark, seq)
 
@@ -2615,7 +2670,10 @@ class BigQmtXtTrader:
             try:
                 callback(result)
             except Exception:
-                pass
+                log.exception(
+                    "user callback failed: %s",
+                    getattr(sync_call, "__name__", "async_query_callback"),
+                )
             return None
         return self._next_async_seq()
 
@@ -2679,7 +2737,7 @@ class BigQmtXtTrader:
             try:
                 callback(result)
             except Exception:
-                pass
+                log.exception("user callback failed: query_ipo_data_async")
             return None
         return self._next_async_seq()
 
@@ -2705,11 +2763,12 @@ class BigQmtXtTrader:
                             error_id=getattr(exc, "errno", 0),
                             error_msg=str(exc),
                             order_sys_id=str(order_id or ""),
+                            order_id=str(order_id or ""),
                             stock_code="",
                         )
                     )
                 except Exception:
-                    pass
+                    log.exception("user callback failed: on_cancel_error")
             return seq
         callback = self.callback
         if callback is not None:
@@ -2719,12 +2778,18 @@ class BigQmtXtTrader:
                         account_id=self.client.account_id,
                         seq=seq,
                         success=bool(ok),
+                        # MiniQMT XtCancelOrderResponse 契约: cancel_result=0 成功,
+                        # 失败时给出非零错误码和可读 error_msg。
+                        cancel_result=0 if ok else -1,
+                        error_msg="" if ok else "cancel_order_stock rejected by server",
                         order_sys_id=str(order_id or ""),
                         order_id=str(order_id or ""),
                     ),
                 )
             except Exception:
-                pass
+                log.exception(
+                    "user callback failed: on_cancel_order_stock_async_response seq=%s", seq
+                )
         return seq
 
     def cancel_order_stock_sysid_async(self, account, market, order_sysid):
@@ -2742,11 +2807,12 @@ class BigQmtXtTrader:
                             error_id=getattr(exc, "errno", 0),
                             error_msg=str(exc),
                             order_sys_id=str(order_sysid or ""),
+                            order_id=str(order_sysid or ""),
                             stock_code="",
                         )
                     )
                 except Exception:
-                    pass
+                    log.exception("user callback failed: on_cancel_error")
             return seq
         callback = self.callback
         if callback is not None:
@@ -2756,12 +2822,18 @@ class BigQmtXtTrader:
                         account_id=self.client.account_id,
                         seq=seq,
                         success=bool(ok),
+                        # MiniQMT XtCancelOrderResponse 契约: cancel_result=0 成功,
+                        # 失败时给出非零错误码和可读 error_msg。
+                        cancel_result=0 if ok else -1,
+                        error_msg="" if ok else "cancel_order_stock rejected by server",
                         order_sys_id=str(order_sysid or ""),
                         order_id=str(order_sysid or ""),
                     ),
                 )
             except Exception:
-                pass
+                log.exception(
+                    "user callback failed: on_cancel_order_stock_async_response seq=%s", seq
+                )
         return seq
 
     def set_relaxed_response_order_enabled(self, enabled=True):
@@ -2793,9 +2865,11 @@ class BigQmtXtTrader:
                 strategy_name=str(item.get("strategy_name") or ""),  # 限价买入
                 order_remark=str(item.get("remark") or item.get("user_order_id") or ""),
                 price_type=_safe_int(item.get("price_type")),  # 50, 121 限价 83 市价
-                # MiniQMT XtOrder.order_time 是 Unix 秒。0 = 服务端未上报
-                # (旧服务端不带这个字段), 不要当成 1970 年 (issue #48)。
-                order_time=_safe_int(item.get("order_time"), 0),
+                # MiniQMT XtOrder.order_time 是 Unix 秒。服务端订单事件只发
+                # created_at_ts 不发 order_time，所以没有显式 order_time 时
+                # 用 created_at_ts 兜底；两者都没有才落到 0（不要当成 1970 年）。
+                order_time=_safe_int(item.get("order_time") or item.get("created_at_ts"), 0),
+                # MiniQMT XtOrder.status_msg —— 废单时柜台给的原因 (issue #60)。
                 status_msg=str(item.get("status_msg") or ""),
             )
         else:
@@ -2806,6 +2880,12 @@ class BigQmtXtTrader:
         order_type = _action_to_order_type(action)
         order_sysid = str(item.get("order_sys_id") or item.get("order_sysid") or "")
         trade_id = str(item.get("trade_id") or "")
+        traded_volume = _safe_int(item.get("volume", item.get("traded_volume")))
+        traded_price = _safe_float(item.get("price", item.get("traded_price")))
+        amount = item.get("amount")
+        if not amount:
+            # 服务端未取到金额（缺失或 0）时按 价格 * 数量 估算，保证盈亏统计不为 0。
+            amount = traded_price * traded_volume
         if trade_id:
             return CompatObject(
                 account_id=account_id,
@@ -2814,11 +2894,17 @@ class BigQmtXtTrader:
                 order_sysid=order_sysid,
                 order_id=order_sysid,
                 traded_id=trade_id,
-                traded_volume=_safe_int(item.get("volume", item.get("traded_volume"))),
-                traded_price=_safe_float(item.get("price", item.get("traded_price"))),
-                traded_time=str(item.get("traded_at") or ""),
+                traded_volume=traded_volume,
+                traded_price=traded_price,
+                # 优先级: 服务端真实成交时间(traded_time) -> 事件到达时间(created_at_ts)
+                # -> traded_at 字符串解析。
+                traded_time=_to_unix_seconds(
+                    item.get("traded_time") or item.get("created_at_ts") or item.get("traded_at")
+                ),
+                traded_amount=_safe_float(amount, 0.0),
+                traded_at=str(item.get("traded_at") or ""),
+                strategy_name=str(item.get("strategy_name") or ""),
                 order_remark=str(item.get("user_order_id") or item.get("remark") or ""),
-                traded_amount=float(item.get("amount") or 0),
                 commission=float(item.get("commission") or 0),
             )
         else:

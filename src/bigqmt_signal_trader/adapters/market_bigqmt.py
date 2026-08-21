@@ -424,9 +424,43 @@ class BigQmtMarketDataProvider:
         ]
 
     def get_ticks(self, codes):
-        normalized_codes = [normalize_market_or_stock_code(code) for code in codes]
-        data = self.context_info.get_full_tick(normalized_codes)
-        return data or {}
+        """Snapshot quotes, keyed the way the CALLER spelled each code.
+
+        Codes go to QMT upper-cased, but the futures exchanges use lower-case
+        instrument codes ('rb2708.SF', 'a2609.DF'), so returning QMT's keys made
+        ``code in result`` fail for every one of them and the level-2 book look
+        missing (issue #58). get_market_data_ex already echoes the caller's
+        spelling; this brings get_full_tick in line.
+
+        Only the CASE is restored, not the normalization: '600000' still comes
+        back as '600000.SH', because completing the suffix is useful and callers
+        rely on it. Only codes that differ from their normalized form purely by
+        case -- which is exactly the futures situation -- are mapped back.
+
+        A code QMT answers under a key we did not ask for is passed through
+        untouched rather than dropped: losing a quote is worse than an
+        unexpected key.
+        """
+        requested = list(codes or [])
+        normalized_codes = [normalize_market_or_stock_code(code) for code in requested]
+        data = self.context_info.get_full_tick(normalized_codes) or {}
+        if not isinstance(data, dict):
+            return data or {}
+
+        # Case-only differences map back; structural ones (added suffix) do not.
+        # Later duplicates keep the first spelling.
+        original_by_normalized = {}
+        for original, normalized in zip(requested, normalized_codes):
+            original, normalized = str(original), str(normalized)
+            if original != normalized and original.upper() == normalized.upper():
+                original_by_normalized.setdefault(normalized, original)
+
+        if not original_by_normalized:
+            return data
+        return dict(
+            (original_by_normalized.get(str(key), key), value)
+            for key, value in data.items()
+        )
 
     def get_instrument(self, code):
         normalized = normalize_stock_code(code)

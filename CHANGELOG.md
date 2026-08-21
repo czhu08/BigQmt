@@ -2,6 +2,28 @@
 
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/) 和 [语义化版本](https://semver.org/)。
 
+## [0.2.5] - 2026-08-21
+
+### 修复
+
+- **get_full_tick 返回 key 被全大写**（Issue #58）：代码 upper() 后传给 QMT，返回时未映射回调用方写法。期货交易所的合约代码是小写（`rb2708.SF`、`a2609.DF`、`nr2612`），导致 `code in result` 对每一个都失败、实时五档被误判缺失。现在只还原**大小写**，不动归一化——`600000` 仍补全为 `600000.SH`，补全后缀是调用方依赖的行为。QMT 主动返回而未被请求的 key 原样透传，不丢行情。
+- **柜台拒单原因没有传出**（Issue #60）：`status_msg` 与 `error_msg` 在废单时均为空，形如 `[COUNTER] 资金可用余额不足，尚需[4789.630]` 的原因完全丢失。两处缺口：`OrderSnapshot` 没有 `status_msg` 字段；`normalize_order_error_event` 只读 `m_strErrorMsg`。柜台文本实际在 `m_strCancelInfo`（官方字段表标注为「废单原因」，状态 57 明确指向它）。已贯通 `OrderSnapshot` → `order_bigqmt` → 委托事件 → `_order_from_dict`，`order_error` 事件改为优先读该字段。
+
+### 变更（PR #59，@cnwuwil）
+
+- **回调/成交对象对齐 MiniQMT 原生契约**：`XtTrade` 补齐 `traded_id` / `traded_time` / `traded_amount` / `strategy_name`，成交金额优先取 `m_dTradeAmount` 真值（实测限价 9.14 成交 9.06 时估算值偏高约 0.9%）；撤单响应补 `cancel_result` / `error_msg`；业务回调异常落日志不再静默吞掉。
+- **回调代码补全交易所后缀**：实盘 order/deal 回调的 `m_strInstrumentID` 只带 6 位裸代码，服务端事件构建时从 `m_strExchangeID` 补全，客户端分发层按 A 股代码段推断作兜底。
+- **`order_volume` 语义修正**：由剩余量 `m_nVolumeTotal`（全部成交时为 0）改为原始委托量 `m_nVolumeTotalOriginal`，对齐 `XtOrder.order_volume`。**对依赖「剩余量」的调用方是行为变化**。
+- **xtdata shim 签名对齐**：`get_instrument_detail` 接受并忽略第二参数 `is_detail`；`download_history_data(2)` 透传 `dividend_type`。
+- 新增官方《内置Python》API 精简参考文档，作为字段映射的依据留存。
+
+### 已知限制
+
+- `m_strCancelInfo` 的实际内容需一笔真实废单才能确认；字段名有官方文档背书，但尚无实盘样本。
+- Issue #56（单文件、无 Redis、仅 ZMQ 的 QMT 内嵌版本）未处理。
+
+---
+
 ## [0.2.4] - 2026-08-20
 
 ### 修复
