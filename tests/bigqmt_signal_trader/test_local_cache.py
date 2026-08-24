@@ -625,5 +625,67 @@ class AdjustedReadSelfHealTest(unittest.TestCase):
         self.assertEqual(method_calls.count("get_market_data_ex"), 1)
 
 
+class _AsyncLandingClient(FakeClient):
+    """模拟 QMT 下载全局的异步落地：前 N 次 get_market_data_ex 返回空，
+    之后才返回真实数据（issue #66 的下载后立读竞态）。"""
+
+    def __init__(self, cache_dir, empty_reads=2):
+        super().__init__(cache_dir)
+        self._empty_left = empty_reads
+        self.pull_count = 0
+
+    def call(self, method, params=None, account_id=None, timeout_seconds=None):
+        if method == "get_market_data_ex":
+            self.pull_count += 1
+            if self._empty_left > 0:
+                self._empty_left -= 1
+                self.calls.append(method)
+                self.call_params.append((method, params))
+                return {}
+        return super().call(method, params, account_id=account_id, timeout_seconds=timeout_seconds)
+
+
+class DownloadWaitForDataTest(unittest.TestCase):
+    """Issue #66：QMT 下载全局提交即返回、数据异步落地。download_history_data2
+    必须轮询等到真实数据出现（或超时），而不是拉一次空结果就缓存。"""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+
+    def tearDown(self):
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    def _xt(self, client):
+        from bigqmt_signal_trader.xtquant_compat import BigQmtXtData
+
+        return BigQmtXtData(client)
+
+    def test_download_waits_until_real_data_lands(self):
+        client = _AsyncLandingClient(self.dir, empty_reads=2)
+        xt = self._xt(client)
+        xt.download_history_data2(["600000.SH"], "1d", start_time="20260817", end_time="20260819")
+
+        # 空返回之后还在重试，最终拿到真实数据
+        self.assertEqual(client.pull_count, 3)
+        data = xt.get_local_data(["close"], ["600000.SH"], "1d")
+        self.assertEqual(list(data["600000.SH"]["close"]), [8.76, 8.73])
+
+    def test_download_gives_up_after_wait_timeout(self):
+        # 一直没数据（停牌/退市）：轮询到超时为止，不无限等，结果照常回报
+        client = _AsyncLandingClient(self.dir, empty_reads=99)
+        xt = self._xt(client)
+        import time as _t
+        t0 = _t.time()
+        res = xt.download_history_data2(["600000.SH"], "1d", data_wait_seconds=2.0)
+        elapsed = _t.time() - t0
+
+        self.assertEqual(res, {"finished": 1, "total": 1})
+        self.assertGreater(elapsed, 1.5)
+        self.assertLess(elapsed, 10.0)
+        self.assertGreater(client.pull_count, 1)
+        # 没数据不缓存
+        self.assertEqual(xt.get_local_data(["close"], ["600000.SH"], "1d"), {})
+
+
 if __name__ == "__main__":
     unittest.main()

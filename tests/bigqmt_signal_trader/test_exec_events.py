@@ -385,6 +385,24 @@ class ExecEventsServerTest(unittest.TestCase):
         self.assertEqual(ev["error_id"], 2147483647)
         self.assertEqual(ev["error_msg"], "废单")
 
+    def test_normalize_order_error_carries_remark_and_status(self):
+        # issue #64: 柜台拒单时 error_msg 已有原因（#60），但事件缺 order_remark
+        # 和 status，客户端关联不上是哪一笔委托。
+        class OrderError:
+            m_strAccountID = "acct"
+            m_strInstrumentID = "600654.SH"
+            m_strOrderSysID = "sys-err-2"
+            m_nOrderStatus = 57
+            m_strRemark = "grid-tag-7"
+            m_strCancelInfo = "[COUNTER] 资金可用余额不足"
+
+        ev = normalize_order_error_event(OrderError(), "acct")
+
+        self.assertEqual(ev["order_remark"], "grid-tag-7")
+        self.assertEqual(ev["user_order_id"], "grid-tag-7")
+        self.assertEqual(ev["status"], 57)
+        self.assertEqual(ev["error_msg"], "[COUNTER] 资金可用余额不足")
+
     def test_normalize_cancel_error_event_maps_fields(self):
         class CancelError:
             m_strAccountID = "acct"
@@ -600,6 +618,44 @@ class ExecEventsClientDispatchTest(unittest.TestCase):
         self.assertEqual(err.order_id, "sys-cancel-1")
         self.assertEqual(err.error_id, 99)
         self.assertEqual(err.error_msg, "撤单失败")
+
+    def test_error_callbacks_carry_miniqmt_order_sysid_alias(self):
+        # issue #65: on_stock_order/on_stock_trade 用 order_sysid（MiniQMT 名），
+        # on_order_error/on_cancel_error/async 回报却是 order_sys_id——不一致。
+        # 所有回调对象现在必须同时带 order_sysid 和 order_sys_id。
+        trader, cb = self._trader()
+        trader._dispatch_event(json.dumps({
+            "event_type": "order_error", "account_id": "acct",
+            "order_sys_id": "sys-err-1", "error_msg": "废单",
+        }).encode("utf-8"))
+        trader._dispatch_event(json.dumps({
+            "event_type": "cancel_error", "account_id": "acct",
+            "order_sys_id": "sys-cancel-1", "error_msg": "撤单失败",
+        }).encode("utf-8"))
+
+        err = cb.order_errors[0]
+        self.assertEqual(err.order_sysid, "sys-err-1")
+        self.assertEqual(err.order_sys_id, "sys-err-1")
+        self.assertEqual(err.order_id, "sys-err-1")
+        cerr = cb.cancel_errors[0]
+        self.assertEqual(cerr.order_sysid, "sys-cancel-1")
+        self.assertEqual(cerr.order_sys_id, "sys-cancel-1")
+
+    def test_order_error_carries_remark_and_status(self):
+        # issue #64: 柜台拒单时 error_msg 带原因（#60），但 order_remark 是空的、
+        # status 也没有，客户端无法关联是哪一笔委托被拒。
+        trader, cb = self._trader()
+        trader._dispatch_event(json.dumps({
+            "event_type": "order_error", "account_id": "acct",
+            "order_sys_id": "sys-err-2", "order_remark": "my-tag-1",
+            "status": 57, "error_id": 2147483647,
+            "error_msg": "[COUNTER] 资金可用余额不足",
+        }).encode("utf-8"))
+
+        err = cb.order_errors[0]
+        self.assertEqual(err.order_remark, "my-tag-1")
+        self.assertEqual(err.status, 57)
+
 
     def _run_async(self, trader, result=None, raises=None):
         """Submit one async order with order_stock_result stubbed, and wait.

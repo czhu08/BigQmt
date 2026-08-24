@@ -532,6 +532,11 @@ def normalize_order_error_event(order_error, account_id=""):
         "stock_code": str(_attr(order_error, ["m_strInstrumentID", "stock_code"], "") or ""),
         "order_sys_id": str(_attr(order_error, ["m_strOrderSysID", "order_sys_id", "order_sysid", "order_id"], "") or ""),
         "error_id": _attr(order_error, ["m_nErrorID", "error_id", "m_nOrderStatus"]),
+        # 废单状态和备注也要带上：客户端 on_order_error 需要 order_remark 关联
+        # 回报（issue #64），柜台拒单理由已在 error_msg（m_strCancelInfo，#60）。
+        "status": _attr(order_error, ["m_nOrderStatus", "status"]),
+        "order_remark": str(_attr(order_error, ["m_strRemark", "order_remark", "remark", "user_order_id"], "") or ""),
+        "user_order_id": str(_attr(order_error, ["m_strRemark", "user_order_id", "order_remark", "remark"], "") or ""),
         # m_strCancelInfo 排在最前: 官方字段表把它标为「废单原因」, 而柜台的
         # 拒单理由 ("[COUNTER] 资金可用余额不足，尚需[...]") 正是走这个字段。
         # 之前只读 m_strErrorMsg, 于是 error_msg 常常是空的 (issue #60)。
@@ -552,6 +557,8 @@ def normalize_cancel_error_event(cancel_error, account_id=""):
         "stock_code": str(_attr(cancel_error, ["m_strInstrumentID", "stock_code"], "") or ""),
         "order_sys_id": str(_attr(cancel_error, ["m_strOrderSysID", "order_sys_id", "order_sysid", "order_id"], "") or ""),
         "error_id": _attr(cancel_error, ["m_nErrorID", "error_id"]),
+        "order_remark": str(_attr(cancel_error, ["m_strRemark", "order_remark", "remark", "user_order_id"], "") or ""),
+        "user_order_id": str(_attr(cancel_error, ["m_strRemark", "user_order_id", "order_remark", "remark"], "") or ""),
         "error_msg": str(_attr(cancel_error, ["m_strErrorMsg", "error_msg", "m_strMsg"], "") or ""),
         "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
         "created_at_ts": time.time(),

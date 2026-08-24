@@ -498,6 +498,10 @@ def _market_data_params(params):
     if dividend_type not in ("", "none"):
         raise ValueError("adjusted bars (dividend_type=%s) are not served here" % dividend_type)
     period = str(params.get("period") or "1d")
+    # FormulaServer 只服务 K 线周期；tick（分笔）/L2 类周期它静默返回空——
+    # 数据明明在本地却读到 0 行（issue #66）。拒绝路由，让 RPC 桥回答。
+    if period == "tick" or period.startswith("l2"):
+        raise ValueError("period=%s is not served by FormulaServer" % period)
     count = params.get("count", -1)
     try:
         count = int(count)

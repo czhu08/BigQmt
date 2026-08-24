@@ -97,6 +97,22 @@ class AsyncCallbackOrderTest(unittest.TestCase):
 
         self.assertEqual(rec.names(), ["response", "order"])
 
+    def test_order_error_event_waits_for_the_response(self):
+        # 服务端在应答 RPC 之前就推送废单事件（order_error）——不拦的话它比
+        # async_response 先到（实盘实测倒挂）。order_error 走同一个屏障。
+        trader, rec, gate = self._trader()
+        self._submit(trader)
+
+        trader._dispatch_event(_event("order_error", remark="TAG-1", order_sys_id="sys-1",
+                                      error_msg="[COUNTER] rejected", status=57))
+        self.assertEqual(rec.names(), [], "order_error was delivered before the response")
+
+        gate.set()
+        trader.wait_async_orders(timeout=5.0)
+
+        self.assertEqual(rec.names(), ["response", "error"])
+
+
     def test_trade_without_remark_is_matched_through_the_order_sys_id(self):
         """QMT's deal row may not carry the remark, so the trade is correlated
         through the id learned from the order event."""

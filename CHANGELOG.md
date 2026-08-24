@@ -2,6 +2,18 @@
 
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/) 和 [语义化版本](https://semver.org/)。
 
+## [0.2.6] - 2026-08-24
+
+### 修复
+
+- **回调对象字段命名不一致**（Issue #65）：`on_order_error`/`on_cancel_error`/async 回报的委托号字段是 `order_sys_id`，而 `on_stock_order`/`on_stock_trade` 用 MiniQMT 规范名 `order_sysid`。全部回调对象现在同时携带两个名字（同值），另补 `order_remark`/`status`/`strategy_name`。
+- **on_order_error 缺 order_remark/status**（Issue #64）：服务端事件补上 `m_strRemark`→`order_remark`/`user_order_id` 与 `m_nOrderStatus`→`status`，撤单错误事件同步补齐。柜台的拒单理由此前已在 `error_msg`（m_strCancelInfo，#60）。
+- **tick 分笔下载后立读为空**（Issue #66）：两个叠加问题——①QMT 下载全局提交即返回、数据异步落地，下载后立即读读到的是落地前的空结果；②FormulaServer 快速路径不服务 tick/L2 周期却静默返回空，把 RPC 桥的正确答案挡在门外。修复：download_history_data2 分批轮询直到批内每个代码出现真实数据行（`data_wait_seconds` 超时容忍停牌/退市）；FormulaServer 对 tick/l2 周期拒绝路由、回落 RPC。实盘验证：tick 下载 0820 → 立读 1434 行全部属当日。
+- **拒单回报乱序**（Issue #51 屏障补全）：服务端在应答 RPC 之前就推送废单事件，order_error/cancel_error 此前不在屏障内，会比 async_response 先到（实盘实测倒挂）。屏障现在同时扣住 order/trade/order_error/cancel_error，实盘验证顺序：async_response → 已报(50) → 废单(57) → order_error。
+- **call_async 异步 RPC**（Issue #63）：`client.call_async(method, params, callback=None)` 立即返回 Future，不阻塞调用方；有界在途（64）+ 8 线程池；可选 callback 在单 dispatcher 线程按完成顺序串行派发。注意：下单类 RPC 在服务端仍由 QMT 主线程串行处理，客户端异步叠加的是往返延迟，不会并行化报单到交易所的环节。
+
+---
+
 ## [0.2.5] - 2026-08-21
 
 ### 修复
