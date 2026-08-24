@@ -2,6 +2,17 @@
 
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/) 和 [语义化版本](https://semver.org/)。
 
+## [Unreleased]
+
+### 新增
+
+- **Redis 5.x 兼容**（PR #67，@sunjian710）：`build_redis_client` 透传 `protocol`（默认 2/RESP2，可用 `protocol: 3` 或 `BIGQMT_REDIS_PROTOCOL` 覆盖）——redis-py 8.x 默认 RESP3 的 HELLO 握手在 Redis 5.0 上直接报错，现在开箱即用。客户端 `BigQmtRpcClient` 的 redis_config 同样透传。
+- **持仓/资产对象原生字段别名**（PR #67，@sunjian710）：`query_stock_positions`/`query_stock_asset` 返回对象新增 `m_` 前缀原生字段（`m_strStockCode`/`m_nVolume`/`m_dCash`/`m_dTotalAsset` 等），读原生 xtquant 字段名的客户端代码（如 miniqmt_redis 风格）不再 AttributeError。
+
+### 修复
+
+- PR #67 合入修正：`_position_object` 的 m_ 别名引用了未定义局部变量（`stock_code`/`stock_name` 只内联在 kwargs 里），持仓查询全挂——提取为局部变量并补回归测试钉住全部别名。
+
 ## [0.2.6] - 2026-08-24
 
 ### 修复

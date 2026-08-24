@@ -268,6 +268,39 @@ class XtquantCompatTest(unittest.TestCase):
         self.assertEqual(positions[0].direction, 48)
         self.assertEqual(single.stock_code, "600000.SH")
 
+    def test_asset_and_position_objects_carry_native_m_prefixed_aliases(self):
+        # PR #67: 原生 xtquant 客户端（如 miniqmt_redis）读 m_ 前缀字段。
+        # 回归锚点：别名引用的局部变量必须先定义（曾 NameError 漏网）。
+        trader = self._trader()
+        acc = StockAccount("acct")
+
+        asset = trader.query_stock_asset(acc)
+        positions = trader.query_stock_positions(acc)
+        single = trader.query_stock_position(acc, "600000")
+
+        self.assertEqual(asset.m_strAccountID, "acct")
+        self.assertEqual(asset.m_dCash, 100.5)
+        self.assertEqual(asset.m_dAvailableCash, 100.5)
+        self.assertEqual(asset.m_dTotalAsset, 1000.5)
+        self.assertEqual(asset.m_dMarketValue, 900.0)
+
+        pos = positions[0]
+        self.assertEqual(pos.m_strAccountID, "acct")
+        self.assertEqual(pos.m_strStockCode, "600000.SH")
+        self.assertEqual(pos.m_strStockName, "PF Bank")
+        self.assertEqual(pos.m_nVolume, 1000)
+        self.assertEqual(pos.m_nCanUseVolume, 800)
+        self.assertEqual(pos.m_nCanUseVol, 800)
+        self.assertEqual(pos.m_nEnableAmount, 800)
+        self.assertEqual(pos.m_dAvgPrice, 10.2)
+        self.assertEqual(pos.m_dLastPrice, 10.8)
+        self.assertEqual(pos.m_dMarketValue, 10800.0)
+        self.assertEqual(pos.m_nFrozenVolume, 200)
+        self.assertEqual(pos.m_nOnRoadVolume, 5)
+        self.assertEqual(pos.m_nYesterdayVolume, 900)
+        self.assertEqual(pos.m_nDirection, 48)
+        self.assertEqual(single.m_strStockCode, "600000.SH")
+
     def test_orders_trades_order_and_cancel_are_miniqmt_shaped(self):
         trader = self._trader()
         acc = StockAccount("acct")

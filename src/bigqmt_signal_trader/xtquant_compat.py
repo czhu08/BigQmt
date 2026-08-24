@@ -593,7 +593,8 @@ class BigQmtRpcClient:
             "db": int(merged_redis_config.get("db") or _env_int("BIGQMT_REDIS_DB", 5)),
             "username": merged_redis_config.get("username", os.environ.get("BIGQMT_REDIS_USERNAME") or ""),
             "password": merged_redis_config.get("password", os.environ.get("BIGQMT_REDIS_PASSWORD") or ""),
-            "protocol": int(protocol_value or 2),
+            # redis-py 8.x 默认 RESP3，Redis 5.0 只支持 RESP2 -> 透传 protocol
+            "protocol": merged_redis_config.get("protocol") or _env_int("BIGQMT_REDIS_PROTOCOL", 2),
         }
         config_timeout = client_config.get("timeout_seconds")
         self.timeout_seconds = float(
@@ -2204,6 +2205,13 @@ class BigQmtXtTrader:
             frozen_cash=_safe_float(frozen_cash, 0.0) if frozen_cash is not None else 0.0,
             total_asset=_safe_float(total_asset, 0.0) if total_asset is not None else None,
             market_value=_safe_float(market_value, 0.0) if market_value is not None else 0.0,
+            # ===== 原生 xtquant 字段名别名（兼容 m_ 前缀访问）=====
+            m_strAccountID=account_id,
+            m_dCash=_safe_float(cash, 0.0) if cash is not None else None,
+            m_dAvailableCash=_safe_float(cash, 0.0) if cash is not None else None,
+            m_dFrozenCash=_safe_float(frozen_cash, 0.0) if frozen_cash is not None else 0.0,
+            m_dTotalAsset=_safe_float(total_asset, 0.0) if total_asset is not None else None,
+            m_dMarketValue=_safe_float(market_value, 0.0) if market_value is not None else 0.0,
         )
 
     def _position_object(self, account_id, item):
@@ -2211,14 +2219,16 @@ class BigQmtXtTrader:
         available = _safe_int(item.get("available", item.get("can_use_volume")))
         cost = _safe_float(item.get("cost", item.get("avg_price")))
         price = _safe_float(item.get("price", item.get("last_price")), cost)
+        stock_code = str(item.get("stock_code") or "")
+        stock_name = str(item.get("stock_name") or "")
         market_value = item.get("market_value")
         if market_value is None:
             market_value = price * volume
         return CompatObject(
             account_type=2,
             account_id=account_id,
-            stock_code=str(item.get("stock_code") or ""),
-            stock_name=str(item.get("stock_name") or ""),
+            stock_code=stock_code,
+            stock_name=stock_name,
             volume=volume,
             can_use_volume=available,
             enable_amount=available,
@@ -2232,6 +2242,22 @@ class BigQmtXtTrader:
             on_road_volume=_safe_int(item.get("on_road_volume")),
             yesterday_volume=_safe_int(item.get("yesterday_volume"), volume),
             direction=_safe_int(item.get("direction"), 48),
+            # ===== 原生 xtquant 字段名别名（兼容 m_ 前缀访问）=====
+            m_strAccountID=account_id,
+            m_strStockCode=stock_code,
+            m_strStockName=stock_name,
+            m_nVolume=volume,
+            m_nCanUseVolume=available,
+            m_nCanUseVol=available,
+            m_nEnableAmount=available,
+            m_dOpenPrice=_safe_float(item.get("open_price"), cost),
+            m_dAvgPrice=cost,
+            m_dLastPrice=price,
+            m_dMarketValue=_safe_float(market_value, 0.0),
+            m_nFrozenVolume=_safe_int(item.get("frozen_volume")),
+            m_nOnRoadVolume=_safe_int(item.get("on_road_volume")),
+            m_nYesterdayVolume=_safe_int(item.get("yesterday_volume"), volume),
+            m_nDirection=_safe_int(item.get("direction"), 48),
         )
 
     @staticmethod
