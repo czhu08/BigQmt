@@ -24,11 +24,19 @@ Behavior:
 """
 
 import datetime as _dt
-import logging
-import logging.handlers
 import os
 import sys
 import time
+import traceback
+
+try:
+    import logging
+    import logging.handlers
+except ImportError:
+    # Some broker QMT Python bundles omit logging from python36.zip.  The
+    # bridge still needs a minimal file/stdout logger to start and report why
+    # later operations fail.
+    logging = None
 
 _LOGGER_NAME = "bigqmt"
 _initialized = False
@@ -72,14 +80,61 @@ def _resolve_log_dir():
     return None
 
 
-class _SafeStreamHandler(logging.Handler):
-    """print() the record so the QMT output panel shows it; never raises."""
+if logging is not None:
+    class _SafeStreamHandler(logging.Handler):
+        """print() the record so the QMT output panel shows it; never raises."""
 
-    def emit(self, record):
+        def emit(self, record):
+            try:
+                print(self.format(record))
+            except Exception:
+                pass
+
+
+class _FallbackLogger:
+    """Small logger used only when the broker Python omits stdlib logging."""
+
+    def __init__(self, name):
+        self.name = name
+
+    def _write(self, level, message, args, exception_text=None):
         try:
-            print(self.format(record))
+            rendered = str(message) % args if args else str(message)
         except Exception:
-            pass
+            rendered = "%s %s" % (message, args)
+        if exception_text:
+            rendered = "%s\n%s" % (rendered, exception_text)
+        line = "%s [%s] [%s] %s" % (
+            _dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"), level, self.name, rendered,
+        )
+        if _env_bool("BIGQMT_LOG_ENABLED", True):
+            log_dir = _resolve_log_dir()
+            if log_dir is not None:
+                try:
+                    with open(os.path.join(log_dir, "bigqmt.log"), "a") as log_file:
+                        log_file.write(line + "\n")
+                except Exception:
+                    pass
+        if _env_bool("BIGQMT_LOG_TO_STDOUT", True):
+            try:
+                print(line)
+            except Exception:
+                pass
+
+    def debug(self, message, *args):
+        self._write("DEBUG", message, args)
+
+    def info(self, message, *args):
+        self._write("INFO", message, args)
+
+    def warning(self, message, *args):
+        self._write("WARNING", message, args)
+
+    def error(self, message, *args):
+        self._write("ERROR", message, args)
+
+    def exception(self, message, *args):
+        self._write("ERROR", message, args, traceback.format_exc())
 
 
 def _cleanup_old_logs(log_dir, retention_days):
@@ -108,6 +163,8 @@ def _setup():
     if _initialized:
         return
     _initialized = True
+    if logging is None:
+        return
     logger = logging.getLogger(_LOGGER_NAME)
     logger.setLevel(logging.DEBUG)
     logger.propagate = False
@@ -159,6 +216,8 @@ def get_logger(name=""):
     _setup()
     suffix = str(name or "").strip(".")
     full = _LOGGER_NAME if not suffix else "%s.%s" % (_LOGGER_NAME, suffix)
+    if logging is None:
+        return _FallbackLogger(full)
     return logging.getLogger(full)
 
 

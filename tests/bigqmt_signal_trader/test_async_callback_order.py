@@ -112,6 +112,41 @@ class AsyncCallbackOrderTest(unittest.TestCase):
 
         self.assertEqual(rec.names(), ["response", "error"])
 
+    def test_response_carries_real_order_id_learned_from_events(self):
+        # issue #72: 委托号异步分配，RPC 应答时通常还没有（order_sys_id 空）。
+        # response 触发前等屏障从暂存的委托事件学到委托号，order_id 必须是真实
+        # 委托号而不是 remark。
+        trader, rec, gate = self._trader(
+            submit=lambda *a, **k: (gate.wait(5.0), {"order_sys_id": "", "user_order_id": "TAG-1"})[1]
+        )
+        self._submit(trader)
+
+        # 委托事件先到（携带委托号），被屏障暂存并学到 sysid
+        trader._dispatch_event(_event("order", remark="TAG-1", order_sys_id="xt-real-1"))
+        gate.set()
+        trader.wait_async_orders(timeout=5.0)
+
+        self.assertEqual(rec.names(), ["response", "order"])
+        resp = rec.seen[0][1]
+        self.assertEqual(resp.order_id, "xt-real-1")
+        self.assertEqual(resp.order_sysid, "xt-real-1")
+
+    def test_response_falls_back_to_remark_when_no_id_learned(self):
+        # 没有任何事件（极端慢/拒单无推送）：限时后按原样发，order_id 回落 remark
+        trader, rec, gate = self._trader(
+            submit=lambda *a, **k: (gate.wait(5.0), {"order_sys_id": "", "user_order_id": "TAG-1"})[1]
+        )
+        trader.ASYNC_SYSID_WAIT_SECONDS = 0.3  # 测试加速
+        self._submit(trader)
+        gate.set()
+        trader.wait_async_orders(timeout=5.0)
+
+        resp = rec.seen[0][1]
+        self.assertEqual(rec.names(), ["response"])
+        self.assertEqual(resp.order_id, "TAG-1")
+        self.assertEqual(resp.order_sysid, "")
+
+
 
     def test_trade_without_remark_is_matched_through_the_order_sys_id(self):
         """QMT's deal row may not carry the remark, so the trade is correlated

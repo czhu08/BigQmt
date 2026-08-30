@@ -3,7 +3,7 @@
 Covers the MiniQMT-facing contract on the bridge side:
 
 - trade objects carry traded_id / traded_time / traded_amount / strategy_name
-- order objects carry a real order_time (server sends created_at_ts only)
+- order objects carry traded_price and a real order_time (server sends created_at_ts only)
 - order-error objects carry order_remark (best effort)
 - cancel-error objects carry order_id on the local-exception path too
 - cancel responses carry cancel_result / error_msg (MiniQMT semantics)
@@ -138,6 +138,16 @@ class TradeObjectContractTest(unittest.TestCase):
         trader = self._trader()
         order = trader._order_from_dict("acct", {"created_at_ts": 1755655200.0})
         self.assertEqual(order.order_time, 1755655200)
+
+    def test_order_object_provides_traded_price_without_overloading_limit_price(self):
+        trader = self._trader()
+        order = trader._order_from_dict(
+            "acct",
+            {"price": 10.1, "traded_price": 10.05, "traded_volume": 100},
+        )
+        self.assertEqual(order.price, 10.1)
+        self.assertEqual(order.traded_price, 10.05)
+        self.assertEqual(order.traded_volume, 100)
 
 
 class CallbackContractTest(unittest.TestCase):
@@ -337,13 +347,17 @@ class QueryPathSerializationContractTest(unittest.TestCase):
             strategy_name="strat-a",
             remark="rmk-9",
             order_time=1755655200,
+            traded_price=10.05,
+            price_type=11,
         )
         item = to_jsonable(snapshot)
         order = self._trader()._order_from_dict("acct", item)
         self.assertEqual(order.order_id, "sys-9")
         self.assertEqual(order.order_time, 1755655200)
+        self.assertEqual(order.traded_price, 10.05)
         self.assertEqual(order.strategy_name, "strat-a")
         self.assertEqual(order.order_remark, "rmk-9")
+        self.assertEqual(order.price_type, 11)
 
 
     def test_query_trade_snapshot_with_official_fields_reaches_client(self):

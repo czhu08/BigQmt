@@ -10,6 +10,13 @@ Do not commit the real file. It may contain account ids and Redis credentials.
 
 BIGQMT_ACCOUNT_ID = "YOUR_ACCOUNT_ID"
 
+# STOCK(股票) / CREDIT(信用两融) / FUTURE(期货) / STOCK_OPTION(股票期权) ...
+# 信用账户务必设为 CREDIT：按 STOCK 查询不会报错，get_trade_detail_data 会返回
+# 一行全 0 的资产，表现为「信用账户资产全是 0」而日志里毫无线索（issue #92）。
+# 也可以写在下面 BIGQMT_REDIS_CONFIG 的 "account_type" 里，两处都认；解析结果
+# 会在启动时打印，冲突也会指出来。
+BIGQMT_ACCOUNT_TYPE = "STOCK"
+
 BIGQMT_REDIS_CONFIG = {
     "host": "127.0.0.1",
     "port": 6379,

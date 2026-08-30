@@ -27,18 +27,57 @@ This module does not make trading decisions.
 """
 
 import importlib
-import importlib.util
 
-from ..code_utils import normalize_stock_code
+from ..code_utils import (
+    EXCHANGE_TOKENS, FUTURES_MARKET_CODES, normalize_stock_code)
 
 
 MARKET_CODES = {"SH", "SZ", "BJ", "HK"}
 
+# A market token asks QMT for every instrument the exchange lists, and stocks
+# are a small minority: "SH" answers with 26744 instruments of which 2315 (8.7%)
+# are stocks -- the rest is bonds, repos and the like. At a measured ~0.29ms per
+# instrument that is 7.5s for the whole market against 0.88s for the stocks
+# alone, and the cost is strictly linear in instrument count (issue #104).
+#
+# So narrow the REQUEST, not the response: resolve the token to a sector listing
+# and ask QMT only for those codes. Filtering afterwards would still pay for
+# every instrument. The sector lookup is FormulaServer-served (~10ms measured),
+# so it costs nothing next to what it saves.
+#
+# Sector names are QMT's own, verified against a live terminal. Note "北证A股"
+# is NOT one of them -- the Beijing board is "京市A股".
+STOCK_SECTOR_BY_MARKET = {
+    "SH": "上证A股",
+    "SZ": "深证A股",
+    "BJ": "京市A股",
+}
+# Cross-market sectors; results are filtered back to the requested exchange.
+# Not narrowing at all: "all" keeps the market token, i.e. the pre-0.2.15
+# behaviour of returning every instrument the exchange lists.
+DEFAULT_TICK_TYPES = ("stock",)
+
+SECTOR_BY_TYPE = {
+    "stock": "沪深京A股",
+    "fund": "沪深基金",
+    "etf": "沪深ETF",
+    "index": "沪深指数",
+    "convertible": "沪深转债",
+}
+
 
 def normalize_market_or_stock_code(code):
-    text = str(code or "").strip().upper()
-    if text in MARKET_CODES:
-        return text
+    """Market token, or a normalised instrument code.
+
+    Only the market-token test uppercases. Handing an uppercased string to
+    normalize_stock_code would defeat its case preservation, which is what kept
+    the #95 fix from reaching get_full_tick: "rb2610.SF" arrived there as
+    "RB2610.SF", a code QMT does not recognise. Futures symbols follow each
+    exchange's own convention and the spellings are not interchangeable.
+    """
+    text = str(code or "").strip()
+    if text.upper() in EXCHANGE_TOKENS:
+        return text.upper()
     return normalize_stock_code(text)
 
 
@@ -423,7 +462,68 @@ class BigQmtMarketDataProvider:
             ),
         ]
 
-    def get_ticks(self, codes):
+    def _sector_codes(self, sector):
+        """Cached sector listing. Membership does not change intraday and the
+        lookup is FormulaServer-served, so once per sector per run is enough."""
+        cache = getattr(self, "_sector_cache", None)
+        if cache is None:
+            cache = self._sector_cache = {}
+        if sector not in cache:
+            try:
+                cache[sector] = list(self.get_stock_list_in_sector(sector) or [])
+            except Exception:
+                cache[sector] = []
+        return cache[sector]
+
+    def _expand_market_token(self, market, types):
+        """Codes of the requested types on one exchange, or None to give up.
+
+        None means "could not narrow", and the caller keeps the market token: a
+        slow answer beats an empty one, the same rule the key mapping below
+        follows.
+        """
+        collected = []
+        for kind in types:
+            kind = str(kind or "").strip().lower()
+            sector = None
+            if kind == "stock":
+                sector = STOCK_SECTOR_BY_MARKET.get(market)
+            if sector is None:
+                sector = SECTOR_BY_TYPE.get(kind)
+            if sector is None:
+                return None          # unknown type: do not silently drop it
+            listing = self._sector_codes(sector)
+            if not listing:
+                return None          # sector unavailable on this terminal
+            suffix = "." + market
+            collected.extend(c for c in listing if str(c).upper().endswith(suffix))
+        seen, unique = set(), []
+        for code in collected:
+            if code not in seen:
+                seen.add(code)
+                unique.append(code)
+        return unique or None
+
+    def _notice_narrowed(self, market, kept, total_hint):
+        """Say once per process that a market token was narrowed.
+
+        The default changed from "everything the exchange lists" to stocks, so
+        a caller who wanted bonds or repos would otherwise just see fewer rows
+        and no reason why.
+        """
+        seen = getattr(self, "_narrow_notified", None)
+        if seen is None:
+            seen = self._narrow_notified = set()
+        if market in seen:
+            return
+        seen.add(market)
+        try:
+            print("[bigqmt_market] %s narrowed to %d %s; pass types=['all'] for "
+                  "every instrument the exchange lists" % (market, kept, total_hint))
+        except Exception:
+            pass
+
+    def get_ticks(self, codes, types=None):
         """Snapshot quotes, keyed the way the CALLER spelled each code.
 
         Codes go to QMT upper-cased, but the futures exchanges use lower-case
@@ -443,22 +543,46 @@ class BigQmtMarketDataProvider:
         """
         requested = list(codes or [])
         normalized_codes = [normalize_market_or_stock_code(code) for code in requested]
+        # Default to stocks. A market token lists every instrument the exchange
+        # carries and stocks are 8.7% of it, so the old default made everyone pay
+        # 7.5s for a 0.9s answer. types=["all"] restores the full listing.
+        wanted = list(types) if types else list(DEFAULT_TICK_TYPES)
+        if not any(str(kind).strip().lower() == "all" for kind in wanted):
+            expanded = []
+            for code in normalized_codes:
+                # A futures exchange lists only futures, so its token already
+                # says what it holds -- there is nothing to narrow and no
+                # A-share sector to narrow it with.
+                narrowable = code in MARKET_CODES and code not in FUTURES_MARKET_CODES
+                narrowed = (self._expand_market_token(code, wanted)
+                            if narrowable else None)
+                if narrowed is None:
+                    expanded.append(code)     # not a token, or could not narrow
+                else:
+                    expanded.extend(narrowed)
+                    self._notice_narrowed(code, len(narrowed), "/".join(wanted))
+            normalized_codes = expanded
         data = self.context_info.get_full_tick(normalized_codes) or {}
         if not isinstance(data, dict):
             return data or {}
 
-        # Case-only differences map back; structural ones (added suffix) do not.
-        # Later duplicates keep the first spelling.
-        original_by_normalized = {}
+        # Map any answer key back to the caller's spelling when the two differ
+        # only by case. Keyed on the upper-cased form deliberately: we now send
+        # the caller's own spelling, so this must work whether QMT echoes that
+        # back or answers in a canonical case of its own -- and which of those
+        # it does could not be observed here (no futures data on this terminal).
+        # Structural differences (a completed suffix) are left alone, since
+        # "600000" -> "600000.SH" is normalization callers rely on.
+        original_by_upper = {}
         for original, normalized in zip(requested, normalized_codes):
             original, normalized = str(original), str(normalized)
-            if original != normalized and original.upper() == normalized.upper():
-                original_by_normalized.setdefault(normalized, original)
+            if original.upper() == normalized.upper():
+                original_by_upper.setdefault(original.upper(), original)
 
-        if not original_by_normalized:
+        if not original_by_upper:
             return data
         return dict(
-            (original_by_normalized.get(str(key), key), value)
+            (original_by_upper.get(str(key).upper(), key), value)
             for key, value in data.items()
         )
 
@@ -608,9 +732,10 @@ class BigQmtMarketDataProvider:
         # — note the FIRST argument differs (market vs stockcode). Every caller in
         # this codebase passes a market code, so the xtdata SDK is the correct path.
         def _via_context():
-            # ContextInfo's first arg is stockcode; pass market through anyway so
-            # backtest contexts still return something rather than crashing.
-            return self._call_context("get_trading_dates", market, start_time, end_time, count)
+            # ContextInfo 需要证券代码而不是市场代码；SH/SZ 使用代表指数，
+            # 调用方已经传入完整代码时保持原值。
+            context_stock = {"SH": "000001.SH", "SZ": "399001.SZ"}.get(str(market).upper(), market)
+            return self._call_context("get_trading_dates", context_stock, start_time, end_time, count)
 
         return self._native_or_context(
             "get_trading_dates", _via_context, market, start_time, end_time, count

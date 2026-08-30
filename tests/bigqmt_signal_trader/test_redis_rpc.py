@@ -66,6 +66,41 @@ class FakePositionProvider:
         return AssetSnapshot(account_id=account_id, cash=100.0, total_asset=1000.0)
 
 
+class CreditCompactQueryTest(unittest.TestCase):
+    def test_compact_queries_pass_configured_account_type(self):
+        calls = []
+
+        def query(*args):
+            calls.append(args)
+            return []
+
+        gateway = DryRunOrderGateway()
+        gateway.account_type = "credit"
+        handlers = BigQmtRpcHandlers(
+            account_id="acct",
+            market_data=FakeMarketData(),
+            position_provider=FakePositionProvider(),
+            order_gateway=gateway,
+            qmt_api={
+                "get_unclosed_compacts": query,
+                "get_closed_compacts": query,
+            },
+        )
+
+        handlers._handle_query_stk_compacts({})
+        handlers._handle_get_unclosed_compacts({})
+        handlers._handle_get_closed_compacts({})
+
+        self.assertEqual(
+            calls,
+            [
+                ("acct", "CREDIT"),
+                ("acct", "CREDIT"),
+                ("acct", "CREDIT"),
+            ],
+        )
+
+
 def _service(allow_order_methods=False, process_in_listener=False):
     return _service_with_listener_methods(
         allow_order_methods=allow_order_methods,

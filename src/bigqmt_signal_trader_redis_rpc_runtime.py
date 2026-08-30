@@ -60,6 +60,9 @@ else:
 
 
 ACCOUNT_ID = ""
+# 账号类型：STOCK(股票) / CREDIT(信用/两融) / FUTURE(期货) / OPTION(期权)
+# 对应 xtconstant 枚举：SECURITY_ACCOUNT=2 / CREDIT_ACCOUNT=3 / FUTURE_ACCOUNT=1
+ACCOUNT_TYPE = "STOCK"
 REDIS_HOST = "127.0.0.1"
 REDIS_PORT = 6379
 REDIS_DB = 5
@@ -115,12 +118,84 @@ EXEC_EVENTS_ENABLED = True
 EXEC_EVENTS_DEBUG_RAW_FIELDS = False
 
 try:
+    # Keep optional account-type config backward compatible: an old local
+    # config without BIGQMT_ACCOUNT_TYPE must not discard the account ID or
+    # Redis settings that are present in that same module.
     from bigqmt_signal_trader_local_config import BIGQMT_ACCOUNT_ID, BIGQMT_REDIS_CONFIG
 except Exception:
     BIGQMT_ACCOUNT_ID = ""
     BIGQMT_REDIS_CONFIG = {}
+try:
+    from bigqmt_signal_trader_local_config import BIGQMT_ACCOUNT_TYPE
+except Exception:
+    BIGQMT_ACCOUNT_TYPE = ""
 
 ACCOUNT_ID = str(BIGQMT_ACCOUNT_ID or ACCOUNT_ID or "")
+
+# Account type. A credit account read as STOCK returns an all-zero asset row
+# rather than an error, so getting this wrong is silent (issue #92).
+#
+# Three places look plausible and only one used to work:
+#   - BIGQMT_ACCOUNT_TYPE in the local config          -- worked
+#   - account_type inside BIGQMT_REDIS_CONFIG          -- was ignored
+#   - editing ACCOUNT_TYPE in this file                -- silently overwritten
+#     below, because the shipped example config sets BIGQMT_ACCOUNT_TYPE.
+# Both of the others are now honoured, and the resolved value is printed at
+# startup so a setting that did not take effect is visible instead of showing
+# up later as zero assets.
+# The constant above ships as "STOCK", so it only counts as something the user
+# chose once it has been edited away from that; otherwise every credit setup
+# would report a phantom conflict with it.
+_ACCOUNT_TYPE_EDITED_HERE = ACCOUNT_TYPE if ACCOUNT_TYPE != "STOCK" else ""
+_account_type_sources = [
+    ("BIGQMT_ACCOUNT_TYPE", BIGQMT_ACCOUNT_TYPE),
+    ("BIGQMT_REDIS_CONFIG['account_type']", BIGQMT_REDIS_CONFIG.get("account_type")),
+    ("ACCOUNT_TYPE in bigqmt_signal_trader_redis_rpc_runtime.py",
+     _ACCOUNT_TYPE_EDITED_HERE),
+]
+ACCOUNT_TYPE_SOURCE = "default"
+ACCOUNT_TYPE = "STOCK"
+for _source_name, _source_value in _account_type_sources:
+    if _source_value:
+        ACCOUNT_TYPE = str(_source_value).strip().upper()
+        ACCOUNT_TYPE_SOURCE = _source_name
+        break
+
+
+def _report_deployment():
+    """Print which build is actually running, before anything else happens.
+
+    A deploy is a file copy and QMT keeps modules across strategy re-runs, so
+    "the copy never happened" and "the copy happened but was not picked up"
+    look identical from the outside. This line tells them apart at a glance.
+    """
+    try:
+        # Submodule, not the root package: the QMT sandbox never execs
+        # bigqmt_signal_trader/__init__.py, so anything defined there is
+        # invisible in exactly the environment this line describes.
+        from bigqmt_signal_trader.version import deployment_report
+
+        version, directory = deployment_report()
+        print("[bigqmt_shell] bigqmt_signal_trader %s loaded from %s"
+              % (version, directory))
+    except Exception as exc:
+        print("[bigqmt_shell] version report unavailable: %s" % exc)
+
+
+def _report_account_type():
+    """Say which account type won and where it came from."""
+    print("[bigqmt_shell] account_type=%s (from %s)" % (ACCOUNT_TYPE, ACCOUNT_TYPE_SOURCE))
+    conflicting = [
+        name for name, value in _account_type_sources
+        if value and str(value).strip().upper() != ACCOUNT_TYPE
+    ]
+    if conflicting:
+        print("[bigqmt_shell] ignored conflicting account_type from: %s"
+              % ", ".join(conflicting))
+
+
+_report_deployment()
+_report_account_type()
 REDIS_HOST = BIGQMT_REDIS_CONFIG.get("host", REDIS_HOST)
 REDIS_PORT = int(BIGQMT_REDIS_CONFIG.get("port", REDIS_PORT))
 REDIS_DB = int(BIGQMT_REDIS_CONFIG.get("db", REDIS_DB))
@@ -172,6 +247,7 @@ def _apply_config(account_id):
     configure(
         mode="bigqmt",
         account_id=account_id,
+        account_type=ACCOUNT_TYPE,
         position_sync_type="redis" if RPC_TRANSPORT in ("redis", "", "default") else "",
         enable_rpc=True,
         schedule_adjust=SCHEDULE_ADJUST_ENABLED,

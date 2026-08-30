@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "xtquant-big-convert"
-version = "0.2.7"
+version = "0.3.1"
 description = "Big QMT RPC bridge and MiniQMT-compatible adapter layer (redis/zmq/mysql transports)"
 readme = "README.md"
 requires-python = ">=3.8"
@@ -38,6 +38,9 @@ dev = [
     "pytest-cov>=4.0.0",
 ]
 
+[project.scripts]
+bigqmt-init = "bigqmt_signal_trader.init_config:main"
+
 [project.urls]
 Homepage = "https://github.com/litaolemo/xtquant_big_convert"
 Repository = "https://github.com/litaolemo/xtquant_big_convert.git"
@@ -47,6 +50,7 @@ Issues = "https://github.com/litaolemo/xtquant_big_convert/issues"
 package-dir = {"" = "src"}
 py-modules = [
     "BIGQMT_REDIS_DRYRUN",
+    "BIGQMT_ZMQ_DRYRUN",
     "BIGQMT_ZMQ_BACKTEST",
     "bigqmt_signal_trader_strategy",
     "bigqmt_signal_trader_redis_rpc_runtime",

@@ -64,6 +64,7 @@ class FakeOrder:
     m_nVolumeTotal = 200
     m_nVolumeTraded = 50
     m_dLimitPrice = 9.9
+    m_dTradedPrice = 9.8
     m_strOrderSysID = "O2"
     m_nDirection = 49
     strategyName = "s1"
@@ -211,6 +212,8 @@ class ExecEventsServerTest(unittest.TestCase):
         self.assertEqual(ev["order_sys_id"], "O2")
         self.assertEqual(ev["order_volume"], 200)
         self.assertEqual(ev["traded_volume"], 50)
+        self.assertEqual(ev["price"], 9.9)
+        self.assertEqual(ev["traded_price"], 9.8)
         self.assertEqual(ev["status"], 50)
         self.assertEqual(ev["action"], "SELL")  # m_nDirection 49 -> sell
         self.assertEqual(ev["strategy_name"], "s1")
@@ -526,6 +529,7 @@ class ExecEventsClientDispatchTest(unittest.TestCase):
             "order_volume": 200,
             "traded_volume": 50,
             "price": 9.9,
+            "traded_price": 9.8,
             "status": 50,
             "action": "SELL",
         }
@@ -536,6 +540,8 @@ class ExecEventsClientDispatchTest(unittest.TestCase):
         self.assertEqual(order.stock_code, "000001.SZ")
         self.assertEqual(order.order_volume, 200)
         self.assertEqual(order.traded_volume, 50)
+        self.assertEqual(order.price, 9.9)
+        self.assertEqual(order.traded_price, 9.8)
         self.assertEqual(order.order_status, 50)
         self.assertEqual(order.order_type, 24)  # SELL -> STOCK_SELL
 

@@ -13,14 +13,40 @@ import queue as _queue
 import threading
 import importlib
 import datetime as _dt
+from typing import Any, Dict, Iterable, List, Optional
+# Only these three are used below, but every public constant is re-exported
+# further down: docs/XTQUANT_COMPAT_REPLACEMENT.md tells callers to do
+# ``from bigqmt_signal_trader import xtquant_compat as xtconstant`` and read
+# e.g. ``xtconstant.ORDER_SUCCEEDED`` off this module.
+#
+# This is deliberately not ``from xtquant.xtconstant import *``. That form is a
+# SyntaxError ("import * only allowed at module level") in the single-file QMT
+# builds, which exec each module inside a function body (issue #76).
+from xtquant import xtconstant as _xtconstant
+from xtquant.xtconstant import ORDER_UNKNOWN, STOCK_BUY, STOCK_SELL
+from xtquant.xttype import StockAccount
 
 from .full_tick_cache import request_full_tick_cache, wait_full_tick_cache
 from .local_cache import LocalMarketCache
 from .redis_rpc import call_redis_rpc
 from .logging_setup import get_logger
 
-
 log = get_logger("xtquant_compat")
+
+
+# Re-export every public xtconstant name on this module, replacing what
+# ``import *`` used to do implicitly. Before #73 these 110-odd constants were
+# defined here outright, and the documented "approach 1" migration path binds
+# this module as ``xtconstant``, so dropping them would break callers that read
+# e.g. ``xtquant_compat.FIX_PRICE``.
+#
+# Written as an explicit loop rather than ``import *`` (a SyntaxError inside the
+# single-file builds' function-scope exec, issue #76) and rather than a
+# module-level ``__getattr__`` (PEP 562, Python 3.7+, while QMT ships 3.6).
+for _const_name in dir(_xtconstant):
+    if not _const_name.startswith("_"):
+        globals().setdefault(_const_name, getattr(_xtconstant, _const_name))
+del _const_name
 
 
 # Default OHLCV fields pulled + cached by get_local_data fallback_rpc.
@@ -39,15 +65,6 @@ def _as_list(value):
     return list(value)
 
 
-STOCK_BUY = 23
-STOCK_SELL = 24
-FIX_PRICE = 11
-LATEST_PRICE = 5
-MARKET_PEER_PRICE_FIRST = 44
-MARKET_SH_CONVERT_5_LIMIT = 43
-MARKET_SZ_CONVERT_5_CANCEL = 47
-SZ_MARKET = 1
-SH_MARKET = 0
 
 CLIENT_CONFIG_MODULE_ENV = "BIGQMT_CLIENT_CONFIG_MODULE"
 DEFAULT_CLIENT_CONFIG_MODULES = (
@@ -55,134 +72,6 @@ DEFAULT_CLIENT_CONFIG_MODULES = (
     "bigqmt_signal_trader_local_config",
 )
 
-ORDER_UNREPORTED = 48
-ORDER_WAIT_REPORTING = 49
-ORDER_REPORTED = 50
-ORDER_REPORTED_CANCEL = 51
-ORDER_PARTSUCC_CANCEL = 52
-ORDER_PART_CANCEL = 53
-ORDER_CANCELED = 54
-ORDER_PART_SUCC = 55
-ORDER_SUCCEEDED = 56
-ORDER_JUNK = 57
-ORDER_UNKNOWN = 255
-
-# ---------------------------------------------------------------------------
-# xtconstant 枚举常量（对齐原生 MiniQMT xtquant/xtconstant.py，91 个全量）
-# ---------------------------------------------------------------------------
-
-# 账号类型
-FUTURE_ACCOUNT = 1            # 期货
-SECURITY_ACCOUNT = 2          # 股票
-CREDIT_ACCOUNT = 3            # 信用
-FUTURE_OPTION_ACCOUNT = 5     # 期货期权
-STOCK_OPTION_ACCOUNT = 6      # 股票期权
-HUGANGTONG_ACCOUNT = 7        # 沪港通
-SHENGANGTONG_ACCOUNT = 11     # 深港通
-
-# 委托类型 - 期货六键风格
-FUTURE_OPEN_LONG = 0                  # 开多
-FUTURE_CLOSE_LONG_HISTORY = 1         # 平昨多
-FUTURE_CLOSE_LONG_TODAY = 2           # 平今多
-FUTURE_OPEN_SHORT = 3                 # 开空
-FUTURE_CLOSE_SHORT_HISTORY = 4        # 平昨空
-FUTURE_CLOSE_SHORT_TODAY = 5          # 平今空
-# 委托类型 - 期货四键风格
-FUTURE_CLOSE_LONG_TODAY_FIRST = 6     # 平多，优先平今
-FUTURE_CLOSE_LONG_HISTORY_FIRST = 7   # 平多，优先平昨
-FUTURE_CLOSE_SHORT_TODAY_FIRST = 8    # 平空，优先平今
-FUTURE_CLOSE_SHORT_HISTORY_FIRST = 9  # 平空，优先平昨
-# 委托类型 - 期货两键风格
-FUTURE_CLOSE_LONG_TODAY_HISTORY_THEN_OPEN_SHORT = 10  # 卖出，优先平仓平今，余量开空
-FUTURE_CLOSE_LONG_HISTORY_TODAY_THEN_OPEN_SHORT = 11  # 卖出，优先平仓平昨，余量开空
-FUTURE_CLOSE_SHORT_TODAY_HISTORY_THEN_OPEN_LONG = 12  # 买入，优先平仓平今，余量开多
-FUTURE_CLOSE_SHORT_HISTORY_TODAY_THEN_OPEN_LONG = 13  # 买入，优先平仓平昨，余量开多
-FUTURE_OPEN = 14               # 买入，不优先平仓
-FUTURE_CLOSE = 15              # 卖出，不优先平仓
-# 委托类型 - 期货跨商品套利
-FUTURE_ARBITRAGE_OPEN = 16               # 开仓
-FUTURE_ARBITRAGE_CLOSE_HISTORY_FIRST = 17  # 平，优先平昨
-FUTURE_ARBITRAGE_CLOSE_TODAY_FIRST = 18    # 平，优先平今
-# 委托类型 - 期货展期
-FUTURE_RENEW_LONG_CLOSE_HISTORY_FIRST = 19   # 看多，优先平昨
-FUTURE_RENEW_LONG_CLOSE_TODAY_FIRST = 20     # 看多，优先平今
-FUTURE_RENEW_SHORT_CLOSE_HISTORY_FIRST = 21  # 看空，优先平昨
-FUTURE_RENEW_SHORT_CLOSE_TODAY_FIRST = 22    # 看空，优先平今
-
-# 委托类型 - 股票
-STOCK_BUY = 23
-STOCK_SELL = 24
-# 委托类型 - 信用交易
-CREDIT_BUY = 23                       # 担保品买入
-CREDIT_SELL = 24                      # 担保品卖出
-CREDIT_FIN_BUY = 27                   # 融资买入
-CREDIT_SLO_SELL = 28                  # 融券卖出
-CREDIT_BUY_SECU_REPAY = 29            # 买券还券
-CREDIT_DIRECT_SECU_REPAY = 30         # 直接还券
-CREDIT_SELL_SECU_REPAY = 31           # 卖券还款
-CREDIT_DIRECT_CASH_REPAY = 32         # 直接还款
-CREDIT_FIN_BUY_SPECIAL = 40           # 专项融资买入
-CREDIT_SLO_SELL_SPECIAL = 41          # 专项融券卖出
-CREDIT_BUY_SECU_REPAY_SPECIAL = 42    # 专项买券还券
-CREDIT_DIRECT_SECU_REPAY_SPECIAL = 43  # 专项直接还券
-CREDIT_SELL_SECU_REPAY_SPECIAL = 44   # 专项卖券还款
-CREDIT_DIRECT_CASH_REPAY_SPECIAL = 45  # 专项直接还款
-
-# 委托类型 - 股票期权
-STOCK_OPTION_BUY_OPEN = 48       # 买入开仓
-STOCK_OPTION_SELL_CLOSE = 49     # 卖出平仓
-STOCK_OPTION_SELL_OPEN = 50      # 卖出开仓
-STOCK_OPTION_BUY_CLOSE = 51      # 买入平仓
-STOCK_OPTION_COVERED_OPEN = 52   # 备兑开仓
-STOCK_OPTION_COVERED_CLOSE = 53  # 备兑平仓
-STOCK_OPTION_CALL_EXERCISE = 54  # 认购行权
-STOCK_OPTION_PUT_EXERCISE = 55   # 认沽行权
-STOCK_OPTION_SECU_LOCK = 56      # 证券锁定
-STOCK_OPTION_SECU_UNLOCK = 57    # 证券解锁
-
-# 委托类型 - 期货期权
-OPTION_FUTURE_OPTION_EXERCISE = 100  # 期货期权行权
-
-# 报价类型（市价）
-LATEST_PRICE = 5                        # 最新价
-FIX_PRICE = 11                          # 指定价/限价
-MARKET_SH_CONVERT_5_CANCEL = 42         # 最优五档即时成交剩余撤销[上交所][股票]
-MARKET_SH_CONVERT_5_LIMIT = 43          # 最优五档即时成交剩转限价[上交所][股票]
-MARKET_PEER_PRICE_FIRST = 44            # 对手方最优价格委托
-MARKET_MINE_PRICE_FIRST = 45            # 本方最优价格委托
-MARKET_SZ_INSTBUSI_RESTCANCEL = 46      # 即时成交剩余撤销委托[深交所][股票][期权]
-MARKET_SZ_CONVERT_5_CANCEL = 47         # 最优五档即时成交剩余撤销[深交所][股票][期权]
-MARKET_SZ_FULL_OR_CANCEL = 48           # 全额成交或撤销委托[深交所][股票][期权]
-
-# 市场代码
-SH_MARKET = 0
-SZ_MARKET = 1
-
-# 委托状态
-ORDER_UNREPORTED = 48
-ORDER_WAIT_REPORTING = 49
-ORDER_REPORTED = 50
-ORDER_REPORTED_CANCEL = 51
-ORDER_PARTSUCC_CANCEL = 52
-ORDER_PART_CANCEL = 53
-ORDER_CANCELED = 54
-ORDER_PART_SUCC = 55
-ORDER_SUCCEEDED = 56
-ORDER_JUNK = 57
-ORDER_UNKNOWN = 255
-
-# 账号状态
-ACCOUNT_STATUS_INVALID = -1       # 无效
-ACCOUNT_STATUS_OK = 0             # 正常
-ACCOUNT_STATUS_WAITING_LOGIN = 1  # 连接中
-ACCOUNT_STATUSING = 2             # 登陆中
-ACCOUNT_STATUS_FAIL = 3           # 失败
-ACCOUNT_STATUS_INITING = 4        # 初始化中
-ACCOUNT_STATUS_CORRECTING = 5     # 数据刷新校正中
-ACCOUNT_STATUS_CLOSED = 6         # 收盘后
-ACCOUNT_STATUS_ASSIS_FAIL = 7     # 穿透副链接断开
-ACCOUNT_STATUS_DISABLEBYSYS = 8   # 系统停用
-ACCOUNT_STATUS_DISABLEBYUSER = 9  # 用户停用
 
 
 class CompatObject:
@@ -196,10 +85,7 @@ class CompatObject:
         return "%s(%s)" % (self.__class__.__name__, items)
 
 
-class StockAccount:
-    def __init__(self, account_id, account_type="STOCK"):
-        self.account_id = str(account_id or "")
-        self.account_type = str(account_type or "STOCK")
+
 
 
 class XtQuantTraderCallback:
@@ -305,6 +191,45 @@ def _quote_push_zmq_address(client):
     port = zmq_config.get("port")
     base_port = int(port) if port is not None else _default_zmq_port(client.account_id)
     return "tcp://%s:%d" % (host, base_port + 1)
+
+
+def _missing_account_id_message():
+    """Say what was searched and what to do, not just that something is missing.
+
+    "Big QMT account_id is required" told the reader nothing about where the
+    config was looked for, so a config file placed one sys.path away from the
+    running interpreter looked identical to no config at all (issue #90).
+    """
+    searched = list(DEFAULT_CLIENT_CONFIG_MODULES)
+    selected = os.environ.get(CLIENT_CONFIG_MODULE_ENV)
+    if selected and selected not in searched:
+        searched.insert(0, selected)
+    found = None
+    try:
+        config = load_client_config()
+        found = (config or {}).get("module")
+    except Exception:
+        pass
+
+    if found:
+        detail = ("imported %s, but it defines no BIGQMT_ACCOUNT_ID"
+                  % found)
+    else:
+        detail = ("none of these modules could be imported: %s"
+                  % ", ".join(searched))
+    lines = [
+        "Big QMT account_id is required -- %s." % detail,
+        "Fix it in any one of these ways:",
+        "  1. put bigqmt_signal_trader_client_config.py somewhere on sys.path"
+        " (the current working directory counts), with BIGQMT_ACCOUNT_ID set;",
+        "  2. set the BIGQMT_ACCOUNT_ID environment variable;",
+        "  3. call bigqmt_signal_trader.xtquant_compat.configure(account_id=...)"
+        " before use;",
+        "  or run `bigqmt-init`, which writes both config files for you.",
+        "configure() also runs at import time, so a config put in place after"
+        " importing this module needs configure() called again.",
+    ]
+    return "\n".join(lines)
 
 
 def load_client_config(module_name=None):
@@ -699,11 +624,16 @@ class BigQmtRpcClient:
         if self.redis_client is None:
             import redis
 
+            from .adapters.redis_common import redis_supports_protocol_kw
+
             cfg = dict(self.redis_config)
             if not cfg.get("username"):
                 cfg.pop("username", None)
             if not cfg.get("password"):
                 cfg.pop("password", None)
+            if not redis_supports_protocol_kw():
+                # QMT 自带 redis-py 3.5.3 不认 protocol（issue #71）
+                cfg.pop("protocol", None)
             self.redis_client = redis.Redis(**cfg)
         return self.redis_client
 
@@ -760,7 +690,7 @@ class BigQmtRpcClient:
     def call(self, method, params=None, account_id=None, timeout_seconds=None):
         target_account = str(account_id or self.account_id or "")
         if not target_account:
-            raise ValueError("Big QMT account_id is required")
+            raise ValueError(_missing_account_id_message())
         wait_seconds = self.timeout_seconds if timeout_seconds is None else timeout_seconds
         # Fast path: reference/history reads answered straight by QMT's
         # FormulaServer, bypassing the strategy process and its GIL. Anything it
@@ -877,6 +807,9 @@ class BigQmtRpcClient:
             "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
             "payload": payload or {},
         }
+        # 显式地址且未启用 Redis discovery 的 ZMQ 是纯 ZMQ 模式，不应隐式连接 Redis。
+        if self.transport_name == "zmq" and not bool(self.zmq_config.get("redis_discovery_enabled", False)):
+            return event
         raw = json.dumps(event, ensure_ascii=False, default=str)
         stream_key = stream_template.format(account_id=account_id)
         redis_client = self._redis()
@@ -891,6 +824,9 @@ class BigQmtRpcClient:
         return event
 
     def save_quote_subscription(self, seq, payload, active=True):
+        # MySQL、SHM 和混合 ZMQ 继续保留既有 Redis subscription metadata 行为。
+        if self.transport_name == "zmq" and not bool(self.zmq_config.get("redis_discovery_enabled", False)):
+            return
         account_id = str(self.account_id or "")
         key = "bigqmt:quote_subscriptions:%s" % account_id
         redis_client = self._redis()
@@ -907,6 +843,218 @@ class BigQmtRpcClient:
                 pass
 
 
+# IPO subscription codes are their own numbering, distinct from the listed
+# share's code. Classification is FAIL-CLOSED: an unrecognised code returns None
+# and the caller skips it. The version this replaced ended in `return True`
+# ("默认放行"), i.e. it guessed in favour of placing an order -- on a path whose
+# whole job was to keep BJ subscriptions, which freeze cash, out.
+_IPO_SH_PREFIXES = ("730", "732", "780", "787", "789", "707")
+_IPO_SZ_PREFIXES = ("00", "30")
+_IPO_BJ_PREFIXES = ("920", "889", "8", "4")
+
+
+def ipo_market_of(code):
+    """Return "SH" / "SZ" / "BJ", or None when the code is not recognised."""
+    text = str(code or "").strip().upper()
+    if not text:
+        return None
+    for suffix, market in ((".SH", "SH"), (".SZ", "SZ"), (".BJ", "BJ")):
+        if text.endswith(suffix):
+            return market
+    if not text.isdigit():
+        return None
+    # Order matters: BJ 920/889 would otherwise be caught by a looser rule.
+    if text.startswith(_IPO_BJ_PREFIXES):
+        return "BJ"
+    if text.startswith(_IPO_SH_PREFIXES):
+        return "SH"
+    if text.startswith(_IPO_SZ_PREFIXES):
+        return "SZ"
+    return None
+
+
+MARKET_TOKENS = frozenset({"SH", "SZ", "BJ", "HK"})
+# Above this many explicit codes, one RPC's single timeout starts to matter more
+# than the extra payload of reading the exchange and filtering (issue #104).
+LARGE_CODE_LIST = 1000
+# What the fallback reads first. Stocks are 8.7% of an exchange listing, so
+# starting narrow is 1.08s against 7.4s; it widens to "all" only if that misses.
+DEFAULT_FALLBACK_TYPES = ("stock",)
+
+
+def _markets_of(codes):
+    """Market tokens the given suffixed codes live on, or empty if any code
+    carries no recognised suffix -- filtering an exchange read cannot recover a
+    code we cannot place."""
+    markets = set()
+    for code in codes or []:
+        _, _, suffix = str(code).rpartition(".")
+        suffix = suffix.upper()
+        if suffix not in MARKET_TOKENS:
+            return set()
+        markets.add(suffix)
+    return markets
+
+
+def _full_tick_params(codes, types=None):
+    """RPC params for get_full_tick. `types` narrows a whole-market token to one
+    instrument kind at REQUEST time -- filtering the reply would still pay QMT's
+    per-instrument cost for everything the exchange lists (issue #104)."""
+    params = {"codes": codes}
+    if types:
+        params["types"] = [types] if isinstance(types, str) else list(types)
+    return params
+
+
+_FIELD_LIST_NOTICE = {"shown": False}
+DIRECT_PATH_FIELDS = ("open", "high", "low", "close", "volume", "amount")
+
+
+def _notice_field_list_cost(field_list):
+    """Say once that naming fields is what enables the fast path.
+
+    Not a warning about a mistake: an empty field_list correctly returns all 11
+    columns and only RPC can do that. But the 30x is invisible unless someone
+    tells you it exists (issue #104)."""
+    if field_list or _FIELD_LIST_NOTICE["shown"]:
+        return
+    _FIELD_LIST_NOTICE["shown"] = True
+    try:
+        log.info(
+            "get_market_data_ex with an empty field_list returns all 11 columns "
+            "and must go over RPC. If the six OHLCV columns %s are enough, pass "
+            "them as field_list -- that path is served by FormulaServer, ~30x "
+            "faster (0.03s vs 0.97s measured).", ", ".join(DIRECT_PATH_FIELDS))
+    except Exception:
+        pass
+
+
+# Bar subscriptions poll, because there is no server-side push for K-lines: the
+# bridge only exposes ContextInfo.subscribe_whole_quote, which carries ticks.
+# Interval is a floor on how stale a bar can be, not a promise of freshness.
+DEFAULT_BAR_POLL_INTERVAL_SECONDS = 3.0
+
+
+class _BarPoller(object):
+    """Emit a K-line callback when the newest bar changes.
+
+    MiniQMT's subscribe_quote pushes each bar update. We approximate it by
+    re-reading the last bars and firing only when the newest one differs, so a
+    caller written against MiniQMT keeps working. Every callback is wrapped:
+    a raising subscriber must not kill the polling thread and silently end the
+    subscription.
+    """
+
+    def __init__(self, fetch, callback, interval_seconds, on_error=None,
+                 on_no_data=None):
+        self._fetch = fetch
+        self._callback = callback
+        self._interval = max(0.2, float(interval_seconds))
+        self._on_error = on_error
+        self._on_no_data = on_no_data
+        self._stop = threading.Event()
+        self._last_signature = None
+        self._reported_no_data = False
+        self._thread = threading.Thread(target=self._loop)
+        self._thread.daemon = True
+
+    def start(self):
+        self._thread.start()
+        return self
+
+    def stop(self):
+        self._stop.set()
+
+    @staticmethod
+    def _signature(data):
+        """Identify the newest bar cheaply, without assuming a container type."""
+        try:
+            for value in (data or {}).values():
+                if value is None:
+                    continue
+                if hasattr(value, "empty"):          # pandas DataFrame
+                    if getattr(value, "empty", True):
+                        continue
+                    return str(value.index[-1]), int(len(value))
+                if isinstance(value, (list, tuple)) and value:
+                    return repr(value[-1]), len(value)
+                if isinstance(value, dict) and value:
+                    key = sorted(value.keys())[-1]
+                    return repr(key), len(value)
+        except Exception:
+            return None
+        return None
+
+    def _loop(self):
+        while not self._stop.is_set():
+            try:
+                data = self._fetch()
+                signature = self._signature(data)
+                if signature is None:
+                    # No bars for this period. The subscription is live and will
+                    # start firing if data appears, but until then the caller
+                    # gets nothing -- which is indistinguishable from a broken
+                    # subscription unless we say so. Reported once, not per poll.
+                    if not self._reported_no_data:
+                        self._reported_no_data = True
+                        if self._on_no_data is not None:
+                            self._on_no_data()
+                elif signature != self._last_signature:
+                    self._reported_no_data = False
+                    self._last_signature = signature
+                    if self._callback is not None:
+                        self._callback(data)
+            except Exception as exc:
+                if self._on_error is not None:
+                    try:
+                        self._on_error(exc)
+                    except Exception:
+                        pass
+            self._stop.wait(self._interval)
+
+
+_VERSION_WARNED = {"shown": False}
+
+
+def warn_on_version_mismatch(ping_response):
+    """Warn once when the QMT-side bridge is not the build this client is.
+
+    Deploying into QMT is a file copy and QMT keeps modules across strategy
+    re-runs, so a stale server behaves like a fix that "did not work". Say so on
+    connect instead of leaving it to be discovered by debugging.
+
+    Silent when the versions agree, when the server is too old to report one, or
+    when it has already been said. Never raises: this is on the connect path.
+    """
+    if _VERSION_WARNED["shown"]:
+        return None
+    try:
+        server = str((ping_response or {}).get("version") or "")
+        if not server:
+            return None      # server predates version reporting; nothing to compare
+        from .version import __version__ as local
+
+        if server == local:
+            return None
+        _VERSION_WARNED["shown"] = True
+        log.warning(
+            "version mismatch: this client is %s, the QMT-side bridge is %s. "
+            "A copy alone does not take effect -- QMT keeps modules across "
+            "strategy re-runs, so the strategy must be restarted too. Set "
+            "BIGQMT_AUTO_SYNC=1 (or call xt_trader.sync_deployment()) to push "
+            "this client's package into the QMT python directory.",
+            local, server)
+        return (local, server)
+    except Exception:
+        return None
+
+
+def auto_sync_enabled():
+    """Writing into a live trading terminal is opt-in, not a side effect of
+    connecting."""
+    return _bool_value(os.environ.get("BIGQMT_AUTO_SYNC"), False)
+
+
 class BigQmtXtData:
     def __init__(self, client):
         self.client = client
@@ -914,6 +1062,8 @@ class BigQmtXtData:
         self._cache_obj = None
         self._quote_session = None          # lazily built WholeQuoteClientSession
         self._quote_session_factory = None  # test hook: returns a session-like object
+        self._bar_pollers = {}              # seq -> _BarPoller, for K-line periods
+        self._bar_poller_lock = threading.Lock()
 
         self._subscription_thread = None
         self._subscription_stop_event = None
@@ -1018,7 +1168,7 @@ class BigQmtXtData:
     def _call(self, method, **params):
         return self.client.call(method, params)
 
-    def get_full_tick(self, code_list, timeout_seconds=None):
+    def get_full_tick(self, code_list, timeout_seconds=None, types=None):
         """Fetch full tick data for a list of codes.
 
         Args:
@@ -1058,14 +1208,103 @@ class BigQmtXtData:
             # Symbol-list miss (cold start / expired snapshot): fall back to a live
             # RPC so the first call is ~ms instead of a hard wait_seconds stall.
             rpc_timeout = timeout_seconds if timeout_seconds is not None else None
-            return self.client.call("get_full_tick", {"codes": codes}, timeout_seconds=rpc_timeout) or {}
+            return self.client.call("get_full_tick", _full_tick_params(codes, types), timeout_seconds=rpc_timeout) or {}
         upper_codes = {str(code).strip().upper() for code in codes}
         # Caller-provided timeout takes priority; otherwise auto-detect whole-market.
         if timeout_seconds is not None:
             rpc_timeout = timeout_seconds
         else:
             rpc_timeout = 30 if upper_codes & {"SH", "SZ", "BJ", "HK"} else None
-        return self.client.call("get_full_tick", {"codes": codes}, timeout_seconds=rpc_timeout) or {}
+        try:
+            data = self.client.call(
+                "get_full_tick", _full_tick_params(codes, types),
+                timeout_seconds=rpc_timeout) or {}
+        except Exception:
+            data = None
+            if not self._can_fall_back_to_markets(codes, upper_codes):
+                raise
+        if self._should_fall_back(codes, upper_codes, data):
+            recovered = self._full_tick_via_markets(codes, rpc_timeout, types)
+            if recovered is not None:
+                return recovered
+            if data is None:
+                raise
+        return data or {}
+
+    def _can_fall_back_to_markets(self, codes, upper_codes):
+        """Only an explicit list of suffixed codes can be recovered this way."""
+        if upper_codes & MARKET_TOKENS:
+            return False          # already a whole-market request
+        if len(codes) <= LARGE_CODE_LIST:
+            return False          # small list: a failure here is a real failure
+        return bool(_markets_of(codes))
+
+    def _should_fall_back(self, codes, upper_codes, data):
+        if data is None:
+            return True           # the request raised
+        if not self._can_fall_back_to_markets(codes, upper_codes):
+            return False
+        # Short answer: the server dropped codes, or truncated. Anything missing
+        # is worth one whole-market read rather than silently returning less
+        # than was asked for (issue #104).
+        return len(data) < len(set(str(c) for c in codes))
+
+    def _full_tick_via_markets(self, codes, rpc_timeout, types=None):
+        """Read the exchange(s) these codes live on, then filter to them.
+
+        A long explicit list is one RPC carrying one timeout, so it either fits
+        or loses everything; a market token is a single cheap argument that
+        cannot truncate.
+
+        Narrowed first, "all" only if that came up short. An exchange listing is
+        mostly bonds -- "SH" is 26744 instruments of which 2315 are stocks -- so
+        reading all of it costs 7.4s against 1.08s for the stocks. No reason to
+        pay that when the codes being recovered are stocks (issue #104).
+        """
+        markets = _markets_of(codes)
+        if not markets:
+            return None
+        wanted = set(str(code) for code in codes)
+
+        attempts = [list(types) if types else list(DEFAULT_FALLBACK_TYPES)]
+        if not any(str(k).lower() == "all" for k in attempts[0]):
+            attempts.append(["all"])
+
+        merged = {}
+        for attempt in attempts:
+            merged = {}
+            try:
+                for market in sorted(markets):
+                    snapshot = self.client.call(
+                        "get_full_tick", _full_tick_params([market], attempt),
+                        timeout_seconds=max(rpc_timeout or 0, 60)) or {}
+                    for key, value in snapshot.items():
+                        if str(key) in wanted:
+                            merged[key] = value
+            except Exception:
+                return None
+            if len(merged) >= len(wanted):
+                break          # everything asked for; no need to widen
+
+        log.warning(
+            "get_full_tick: %d codes did not come back directly; re-read %s as "
+            "%s and filtered to %d. A market token with types= is cheaper than "
+            "a list this long.",
+            len(wanted), "/".join(sorted(markets)), "/".join(attempts[-1]
+                                                             if len(merged) < len(wanted)
+                                                             else attempts[0]),
+            len(merged))
+        return merged
+
+    def get_deployment_info(self):
+        """Where the QMT-side bridge is running from, and which build it is.
+
+        Returns version / package_dir / qmt_python_dir / strategy_dir /
+        python_version. Use it to check a deploy landed before hunting for a
+        fix that was never actually there -- QMT keeps modules across strategy
+        re-runs, so a forgotten copy and an un-reloaded one look the same.
+        """
+        return self.client.call("get_deployment_info", {}) or {}
 
     def get_instrument_detail(self, stock_code):
         return self.client.call("get_instrument_detail", {"code": stock_code}) or {}
@@ -1114,9 +1353,9 @@ class BigQmtXtData:
 
     def _get_market_data_ex_batch(self, params, timeout_seconds=None):
         """One RPC's worth of bars, healed and normalized. No caching."""
-        data = self._call("get_market_data_ex", timeout_seconds=timeout_seconds, **params)
+        data = self.client.call("get_market_data_ex", params, timeout_seconds=timeout_seconds)
         # Self-heal adjusted reads (all-zero bars -> server raw download + retry).
-        data = self._heal_adjusted("get_market_data_ex", params, data)
+        data = self._heal_adjusted("get_market_data_ex", params, data, timeout_seconds=timeout_seconds)
         # Normalize Big QMT's stime-indexed frame to MiniQMT shape (time-indexed).
         if isinstance(data, dict):
             data = _normalize_market_data_result(data, field_list=params.get("field_list"))
@@ -1148,7 +1387,15 @@ class BigQmtXtData:
         its own codes -- the rest are returned.
 
         ``chunk_size=0`` restores the old single-request behaviour.
+
+        An empty ``field_list`` means "every field", which only the RPC path can
+        answer -- FormulaServer serves the six OHLCV columns and returns NaN for
+        settelementPrice / openInterest / preClose / suspendFlag, where RPC has
+        real values (preClose 9.07 against nan, measured). So the default stays
+        on RPC rather than quietly handing back NaN; naming the six fields you
+        actually want is what unlocks the ~30x direct path (issue #104).
         """
+        _notice_field_list_cost(field_list)
         codes = list(stock_list or [])
         base = dict(
             field_list=list(field_list or []),
@@ -1312,7 +1559,7 @@ class BigQmtXtData:
         except Exception:
             pass
 
-    def _heal_adjusted(self, method, params, data, wait_seconds=2.0):
+    def _heal_adjusted(self, method, params, data, wait_seconds=2.0, timeout_seconds=None):
         """Self-heal adjusted reads: if the adjusted pull came back all-zero,
         trigger a server-side raw download, wait for async landing, retry once."""
         dividend_type = str(params.get("dividend_type") or "none").lower()
@@ -1330,6 +1577,8 @@ class BigQmtXtData:
             params.get("end_time", ""),
         )
         time.sleep(wait_seconds)
+        if timeout_seconds is not None:
+            return self.client.call(method, params, timeout_seconds=timeout_seconds)
         return self._call(method, **params)
 
     def _pull_and_cache(self, codes, period, start_time, end_time, count, dividend_type="none"):
@@ -1351,35 +1600,83 @@ class BigQmtXtData:
         return out
 
     def subscribe_quote(self, stock_code, period="1d", start_time="", end_time="", count=0, callback=None):
-        seq = self._next_seq()
+        """Subscribe to one instrument, MiniQMT-style: the callback keeps firing.
+
+        This used to invoke the callback exactly once and never again -- a
+        one-shot fetch wearing a subscription's name, which is worse than not
+        having it, because it looks like it works (issue #95).
+
+        Ticks ride the whole-quote push channel; a single code is just a
+        one-element code list. K-lines have no server-side push -- the bridge
+        only exposes ContextInfo.subscribe_whole_quote, which carries ticks --
+        so they are polled and emitted when the newest bar changes.
+        """
         payload = {
-            "seq": seq,
             "stock_code": stock_code,
             "period": period,
             "start_time": start_time,
             "end_time": end_time,
             "count": count,
         }
-        self.client.save_quote_subscription(seq, payload, active=True)
-        self.client.publish_event("subscribe_quote", payload)
-        if callback is not None:
-            try:
-                if str(period).lower() in ("tick", "full_tick"):
+
+        if str(period).lower() in ("tick", "full_tick"):
+            session = self._whole_quote_session()
+            session.start()
+            seq = session.subscribe_whole_quote([stock_code], callback=callback)
+            # The whole-quote callback is incremental; prime it with a snapshot
+            # so a subscriber is not left with nothing until the first change.
+            if callback is not None:
+                try:
                     callback(self.get_full_tick([stock_code]))
-                    self._register_subscription(stock_code, callback)
-                else:  # history K data
-                    callback(
-                        self.get_market_data_ex(
-                            stock_list=[stock_code],
-                            period=period,
-                            start_time=start_time,
-                            end_time=end_time,
-                            count=count,
-                        )
-                    )
-            except Exception:
-                pass
+                    # self._register_subscription(stock_code, callback)
+                except Exception:
+                    pass
+            self._record_subscription(seq, payload)
+            return seq
+
+        seq = self._next_seq()
+
+        def fetch():
+            return self.get_market_data_ex(
+                stock_list=[stock_code], period=period,
+                start_time=start_time, end_time=end_time, count=count or 1)
+
+        poller = _BarPoller(
+            fetch, callback, self._bar_poll_interval_seconds(),
+            on_error=lambda exc: log.debug(
+                "subscribe_quote poll failed code=%s period=%s: %s",
+                stock_code, period, exc),
+            on_no_data=lambda: log.warning(
+                "subscribe_quote: no %s bars for %s -- the subscription is live "
+                "but stays silent until this terminal has data for that period. "
+                "Check the period is downloaded (get_market_data_ex returns an "
+                "empty frame for it).", period, stock_code))
+        with self._bar_poller_lock:
+            self._bar_pollers[seq] = poller
+        poller.start()
+        self._record_subscription(seq, payload)
         return seq
+
+    def _bar_poll_interval_seconds(self):
+        config = dict(getattr(self.client, "full_tick_cache_config", {}) or {})
+        value = (config.get("bar_poll_interval_seconds")
+                 or os.environ.get("BIGQMT_BAR_POLL_INTERVAL_SECONDS"))
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return DEFAULT_BAR_POLL_INTERVAL_SECONDS
+
+    def _record_subscription(self, seq, payload, active=True):
+        """Bookkeeping only -- nothing on the server consumes it, and it needs a
+        Redis client, which a zmq deployment does not have. Never let it break
+        an otherwise working subscription."""
+        try:
+            self.client.save_quote_subscription(seq, dict(payload, seq=seq), active=active)
+            self.client.publish_event(
+                "subscribe_quote" if active else "unsubscribe_quote",
+                dict(payload, seq=seq))
+        except Exception:
+            pass
 
     def subscribe_quote2(self, stock_code, period="1d", start_time="", end_time="", count=0, dividend_type=None, callback=None):
         return self.subscribe_quote(
@@ -1434,24 +1731,48 @@ class BigQmtXtData:
         sub_id = session.subscribe_whole_quote(code_list, callback=callback)
         # The big-QMT whole-quote callback is incremental (changed symbols only),
         # so prime the callback once with a full get_full_tick snapshot.
+        #
+        # types=["all"] deliberately: the push side is ContextInfo's own
+        # subscribe_whole_quote, which is not narrowed, so a narrowed snapshot
+        # would hand the subscriber 2315 stocks and then start pushing all
+        # 26744 instruments. The primer has to cover what the push covers.
         if callback is not None:
             try:
-                callback(self.get_full_tick(code_list))
+                callback(self.get_full_tick(code_list, types=["all"]))
             except Exception:
                 pass
         return sub_id
 
     def unsubscribe_quote(self, seq):
-        # subscribe_whole_quote handles are owned by the push session; single-stock
-        # subscribe_quote seqs still retire through the legacy redis-event path.
+        # Three kinds of handle now: whole-quote / tick subscriptions owned by
+        # the push session, K-line pollers owned here, and legacy seqs that only
+        # ever existed as redis bookkeeping.
+        with self._bar_poller_lock:
+            poller = self._bar_pollers.pop(seq, None)
+        if poller is not None:
+            poller.stop()
+            self._record_subscription(seq, {}, active=False)
+            return 0
+
         session = self._quote_session
         if session is not None and session.has_subscription(seq):
             session.unsubscribe_quote(seq)
-        else:
-            payload = {"seq": seq}
-            self.client.save_quote_subscription(seq, payload, active=False)
-            self.client.publish_event("unsubscribe_quote", payload)
+            self._record_subscription(seq, {}, active=False)
+            return 0
+
+        self._record_subscription(seq, {}, active=False)
         return 0
+
+    def stop_all_subscriptions(self):
+        """Stop every K-line poller this object owns. Daemon threads die with
+        the process anyway; this is for tests and for callers that recycle a
+        client without exiting."""
+        with self._bar_poller_lock:
+            pollers = list(self._bar_pollers.values())
+            self._bar_pollers.clear()
+        for poller in pollers:
+            poller.stop()
+        return len(pollers)
 
     def run(self):
         while True:
@@ -1546,6 +1867,7 @@ class BigQmtXtData:
                     count=-1,
                     dividend_type=dividend_type,
                     fill_data=False,  # fill 会用全 0 占位行冒充数据，轮询判定必须关掉
+                    timeout_seconds=float(data_wait_seconds),
                 )
                 ready = 0
                 for code in batch:
@@ -2001,9 +2323,47 @@ class BigQmtXtTrader:
 
     def connect(self):
         if self.client.account_id:
-            self.client.call("ping")
+            mismatch = warn_on_version_mismatch(self.client.call("ping"))
+            if mismatch and auto_sync_enabled():
+                self.sync_deployment()
         self._fire_account_status()
         return 0
+
+    def sync_deployment(self, dry_run=False):
+        """Push this client's package into the QMT python directory.
+
+        The copy runs here, not inside QMT: a trading process rewriting its own
+        code mid-session would put whatever is in the source tree, half-finished
+        edits included, straight onto the live terminal.
+
+        Config files are never written. The strategy still has to be restarted
+        afterwards -- QMT keeps modules in sys.modules across re-runs, so a copy
+        on its own changes nothing.
+        """
+        from .sync import sync_deployment as _sync
+
+        info = self.get_deployment_info()
+        target = info.get("qmt_python_dir") or ""
+        if not target:
+            log.warning("sync_deployment: the bridge did not report a "
+                        "qmt_python_dir (server too old?); nothing copied")
+            return {"updated": [], "error": "no qmt_python_dir reported"}
+
+        result = _sync(target, dry_run=dry_run)
+        if result.get("error"):
+            log.warning("sync_deployment: %s", result["error"])
+        elif result["updated"]:
+            log.warning(
+                "sync_deployment: %d file(s) %s in %s. RESTART THE STRATEGY -- "
+                "QMT keeps modules across re-runs, so this has no effect until "
+                "you do. Config files untouched: %s",
+                len(result["updated"]),
+                "would be updated" if dry_run else "updated",
+                target, ", ".join(result["skipped_config"]) or "none present")
+        else:
+            log.info("sync_deployment: already up to date (%d files identical)",
+                     result["identical"])
+        return result
 
     def subscribe(self, account):
         if not self.client.account_id:
@@ -2052,7 +2412,56 @@ class BigQmtXtTrader:
         except Exception:
             log.exception("user callback failed: on_account_status")
 
+    def _event_loop_push_channel(self):
+        """zmq: exec events arrive on the same PUB socket as whole-quote data.
+
+        Reuses _build_quote_push_channel so the address derivation stays in one
+        place. The subscriber runs its own thread, so this loop only keeps the
+        channel alive and rebuilds it if the account changes or it dies.
+        """
+        from .exec_events import EXEC_TOPICS
+
+        topics = sorted(set(EXEC_TOPICS.values()))
+        while self._event_running:
+            channel = None
+            account_id = str(self.client.account_id or "")
+            try:
+                channel = self._build_quote_push_channel()
+                channel.start_subscriber(topics, self._on_push_exec_event)
+                while self._event_running:
+                    if str(self.client.account_id or "") != account_id:
+                        break      # account changed -> rebuild against the new address
+                    time.sleep(0.5)
+            except Exception:
+                time.sleep(1.0)
+            finally:
+                if channel is not None:
+                    try:
+                        channel.stop()
+                    except Exception:
+                        pass
+
+    def _on_push_exec_event(self, topic, data):
+        """Push-channel callback. The payload is already a decoded dict, unlike
+        the Redis path which hands over raw bytes."""
+        try:
+            self._dispatch_event(data)
+        except Exception:
+            pass
+
     def _event_loop(self):
+        """Receive exec events. Redis deployments subscribe to the per-account
+        channels; zmq deployments ride the quote push channel.
+
+        Exec events used to be Redis-only, so a zmq deployment received no
+        order/trade callbacks at all -- silently, since the loop just failed to
+        connect and retried forever (issue #76).
+        """
+        transport = str(getattr(self.client, "transport_name", "redis") or "redis").lower()
+        if transport == "zmq":
+            self._event_loop_push_channel()
+            return
+
         from .exec_events import (
             order_channel,
             trade_channel,
@@ -2088,14 +2497,22 @@ class BigQmtXtTrader:
                     pass
 
     def _dispatch_event(self, raw):
+        """Accepts raw bytes/str (Redis pub/sub) or an already-decoded dict.
+
+        The push channel decodes msgpack/json itself, so it hands over a dict --
+        str(dict) is not valid JSON and would be silently dropped here.
+        """
         callback = self.callback
         if callback is None:
             return
-        try:
-            text = raw.decode("utf-8") if isinstance(raw, (bytes, bytearray)) else str(raw)
-            event = json.loads(text)
-        except Exception:
-            return
+        if isinstance(raw, dict):
+            event = raw
+        else:
+            try:
+                text = raw.decode("utf-8") if isinstance(raw, (bytes, bytearray)) else str(raw)
+                event = json.loads(text)
+            except Exception:
+                return
         if not isinstance(event, dict):
             return
         # 放行超时的屏障, 再决定这条事件是直通还是暂存 (issue #51)。
@@ -2277,6 +2694,119 @@ class BigQmtXtTrader:
             if not data:
                 raise
         return [self._position_object(account_id, item) for item in self._position_items(data)]
+
+    def query_position_statistics(self, account):
+        """Intraday position statistics (futures), mirroring MiniQMT ``query_position_statistics``.
+
+        Returns a list of :class:`XtPositionStatistics`-style :class:`CompatObject`.
+        The server queries via ``get_trade_detail_data(..., "POSITION_STATISTICS")``.
+        """
+        account_id = _account_id(account, self.client.account_id)
+        data = self.client.call(
+            "query_position_statistics",
+            {"account_id": account_id},
+            account_id=account_id,
+        ) or {}
+        return [self._position_statistics_object(account_id, item) for item in _as_list(data)]
+
+    def _position_statistics_object(self, account_id, item):
+        return CompatObject(
+            account_id=account_id,
+            exchange_id=str(item.get("exchange_id") or ""),
+            exchange_name=str(item.get("exchange_name") or ""),
+            product_id=str(item.get("product_id") or ""),
+            instrument_id=str(item.get("instrument_id") or ""),
+            instrument_name=str(item.get("instrument_name") or ""),
+            stock_code=str(item.get("stock_code") or ""),
+            direction=_safe_int(item.get("direction"), 0),
+            hedge_flag=_safe_int(item.get("hedge_flag"), 0),
+            position=_safe_int(item.get("position"), 0),
+            yesterday_position=_safe_int(item.get("yesterday_position"), 0),
+            today_position=_safe_int(item.get("today_position"), 0),
+            can_close_vol=_safe_int(item.get("can_close_vol"), 0),
+            position_cost=_safe_float(item.get("position_cost"), None),
+            avg_price=_safe_float(item.get("avg_price"), None),
+            position_profit=_safe_float(item.get("position_profit"), None),
+            float_profit=_safe_float(item.get("float_profit"), None),
+            open_price=_safe_float(item.get("open_price"), None),
+            used_margin=_safe_float(item.get("used_margin"), None),
+            used_commission=_safe_float(item.get("used_commission"), None),
+            frozen_margin=_safe_float(item.get("frozen_margin"), None),
+            frozen_commission=_safe_float(item.get("frozen_commission"), None),
+            instrument_value=_safe_float(item.get("instrument_value"), None),
+            open_times=_safe_int(item.get("open_times"), 0),
+            open_volume=_safe_int(item.get("open_volume"), 0),
+            cancel_times=_safe_int(item.get("cancel_times"), 0),
+            last_price=_safe_float(item.get("last_price"), None),
+            rise_ratio=_safe_float(item.get("rise_ratio"), None),
+            product_name=str(item.get("product_name") or ""),
+            royalty=_safe_float(item.get("royalty"), None),
+            expire_date=str(item.get("expire_date") or ""),
+            assest_weight=_safe_float(item.get("assest_weight"), None),
+            increase_by_settlement=_safe_float(item.get("increase_by_settlement"), None),
+            margin_ratio=_safe_float(item.get("margin_ratio"), None),
+            float_profit_divide_by_used_margin=_safe_float(
+                item.get("float_profit_divide_by_used_margin"), None
+            ),
+            float_profit_divide_by_balance=_safe_float(
+                item.get("float_profit_divide_by_balance"), None
+            ),
+            today_profit_loss=_safe_float(item.get("today_profit_loss"), None),
+            yesterday_init_position=_safe_int(item.get("yesterday_init_position"), 0),
+            frozen_royalty=_safe_float(item.get("frozen_royalty"), None),
+            today_close_profit_loss=_safe_float(item.get("today_close_profit_loss"), None),
+            close_profit=_safe_float(item.get("close_profit"), None),
+            ft_product_name=str(item.get("ft_product_name") or ""),
+            open_cost=_safe_float(item.get("open_cost"), None),
+            # ===== native xtquant field-name aliases (m_-prefixed access) =====
+            m_strAccountID=account_id,
+            m_strStockCode=str(item.get("stock_code") or ""),
+            m_strExchangeID=str(item.get("exchange_id") or ""),
+            m_strExchangeName=str(item.get("exchange_name") or ""),
+            m_strProductID=str(item.get("product_id") or ""),
+            m_strInstrumentID=str(item.get("instrument_id") or ""),
+            m_strInstrumentName=str(item.get("instrument_name") or ""),
+            m_nDirection=_safe_int(item.get("direction"), 0),
+            m_nHedgeFlag=_safe_int(item.get("hedge_flag"), 0),
+            m_nPosition=_safe_int(item.get("position"), 0),
+            m_nYestodayPosition=_safe_int(item.get("yesterday_position"), 0),
+            m_nTodayPosition=_safe_int(item.get("today_position"), 0),
+            m_nCanCloseVol=_safe_int(item.get("can_close_vol"), 0),
+            m_dPositionCost=_safe_float(item.get("position_cost"), None),
+            m_dAvgPrice=_safe_float(item.get("avg_price"), None),
+            m_dPositionProfit=_safe_float(item.get("position_profit"), None),
+            m_dFloatProfit=_safe_float(item.get("float_profit"), None),
+            m_dOpenPrice=_safe_float(item.get("open_price"), None),
+            m_dUsedMargin=_safe_float(item.get("used_margin"), None),
+            m_dUsedCommission=_safe_float(item.get("used_commission"), None),
+            m_dFrozenMargin=_safe_float(item.get("frozen_margin"), None),
+            m_dFrozenCommission=_safe_float(item.get("frozen_commission"), None),
+            m_dInstrumentValue=_safe_float(item.get("instrument_value"), None),
+            m_nOpenTimes=_safe_int(item.get("open_times"), 0),
+            m_nOpenVolume=_safe_int(item.get("open_volume"), 0),
+            m_nCancelTimes=_safe_int(item.get("cancel_times"), 0),
+            m_dLastPrice=_safe_float(item.get("last_price"), None),
+            m_dRiseRatio=_safe_float(item.get("rise_ratio"), None),
+            m_strProductName=str(item.get("product_name") or ""),
+            m_dRoyalty=_safe_float(item.get("royalty"), None),
+            m_strExpireDate=str(item.get("expire_date") or ""),
+            m_dAssestWeight=_safe_float(item.get("assest_weight"), None),
+            m_dIncreaseBySettlement=_safe_float(item.get("increase_by_settlement"), None),
+            m_dMarginRatio=_safe_float(item.get("margin_ratio"), None),
+            m_dFloatProfitDivideByUsedMargin=_safe_float(
+                item.get("float_profit_divide_by_used_margin"), None
+            ),
+            m_dFloatProfitDivideByBalance=_safe_float(
+                item.get("float_profit_divide_by_balance"), None
+            ),
+            m_dTodayProfitLoss=_safe_float(item.get("today_profit_loss"), None),
+            m_nYestodayInitPosition=_safe_int(item.get("yesterday_init_position"), 0),
+            m_dFrozenRoyalty=_safe_float(item.get("frozen_royalty"), None),
+            m_dTodayCloseProfitLoss=_safe_float(item.get("today_close_profit_loss"), None),
+            m_dCloseProfit=_safe_float(item.get("close_profit"), None),
+            m_strFtProductName=str(item.get("ft_product_name") or ""),
+            m_dOpenCost=_safe_float(item.get("open_cost"), None),
+        )
 
     def query_stock_position(self, account, stock_code):
         account_id = _account_id(account, self.client.account_id)
@@ -2462,6 +2992,10 @@ class BigQmtXtTrader:
     # 异步下单这一条路径上——手工下单、同步下单、以及任何未登记的委托一律直通。
     # ------------------------------------------------------------------
     ASYNC_BARRIER_TIMEOUT_SECONDS = 10.0
+    # response 触发前等屏障从暂存的委托事件里学到委托号的上限（issue #72）。
+    # 委托号异步分配：推送通常比 RPC 应答快，几百毫秒内就能学到；超时则按
+    # 原样发 response（order_id 回落 remark），不拖住回调。
+    ASYNC_SYSID_WAIT_SECONDS = 2.0
 
     def _order_barrier(self):
         barrier = getattr(self, "_async_barrier", None)
@@ -2554,8 +3088,9 @@ class BigQmtXtTrader:
         remark = self._async_remark(args, kwargs)
         callback = self.callback
         try:
-            # wait_settlement=False: return as soon as passorder ran. The order
-            # id arrives via order_callback, which is what MiniQMT does too.
+            # wait_settlement=False：passorder 一返回就应答，不在 worker 里等
+            # 服务端结算（那是 #69 要的吞吐）。委托号从推送事件学——屏障暂存的
+            # 委托事件里会带上（触发 response 前至多等 2s，学不到就回落 remark）。
             result = self.order_stock_result(*args, wait_settlement=False, **kwargs)
         except Exception as exc:
             if callback is not None:
@@ -2611,9 +3146,24 @@ class BigQmtXtTrader:
         if callback is not None:
             try:
                 # Native XtOrderResponse shape: one argument carrying
-                # account_id/order_id/seq/error_msg. order_id may be empty here
-                # -- the id is assigned asynchronously and lands in the
-                # order_callback push (issue #50).
+                # account_id/order_id/seq/error_msg.
+                #
+                # 委托号异步分配（#50）：服务端应答时通常还没有。触发 response 前
+                # 先等屏障从暂存的委托事件里学到委托号（事件推送一般比 RPC 应答
+                # 快，bounded 2s），否则 order_id 只能回落成 remark，调用方按
+                # order_id 管理委托时会拿不到真实委托号（issue #72）。
+                if not order_sys_id and remark:
+                    wait_deadline = time.time() + self.ASYNC_SYSID_WAIT_SECONDS
+                    while time.time() < wait_deadline:
+                        learned = ""
+                        with self._async_barrier_lock:
+                            entry = self._async_barrier.get(remark)
+                            if entry and entry["sys_ids"]:
+                                learned = sorted(entry["sys_ids"])[0]
+                        if learned:
+                            order_sys_id = learned
+                            break
+                        time.sleep(0.05)
                 callback.on_order_stock_async_response(
                     CompatObject(
                         account_id=self.client.account_id,
@@ -2760,11 +3310,116 @@ class BigQmtXtTrader:
         except Exception:
             return []
 
-    def query_ipo_data(self, account=None):
-        return self._query_account_list(account, "query_appointment_info")
+    def query_ipo_data(self, account=None, stock_type=""):
+        """新股申购信息 (大 QMT get_ipo_data).
+        stock_type: "" 全部, "STOCK" 新股, "BOND" 新债.
+        8-28 修复: 直接调 get_ipo_data 带 type 参数 (原走 query_appointment_info
+        传 account_id 导致返回空)."""
+        account_id = _account_id(account, self.client.account_id)
+        try:
+            data = self.client.call(
+                "get_ipo_data",
+                {"type": stock_type},
+                account_id=account_id,
+            )
+            # get_ipo_data answers with a dict keyed by subscription code.
+            if isinstance(data, dict):
+                return data
+            if data:
+                # Non-empty and not a dict: an older server is still routing
+                # this through the detail-row normaliser, which iterates the
+                # dict by key and discards every value -- real IPOs arrive as
+                # [{}, {}]. Coercing that to {} silently reports "no IPOs
+                # today", so say so instead of swallowing it.
+                log.warning(
+                    "query_ipo_data: server returned %s, not a mapping -- the "
+                    "QMT-side bridge is too old to preserve get_ipo_data's "
+                    "shape and the rows are empty. Update the server side.",
+                    type(data).__name__)
+            return {}
+        except Exception:
+            return {}
 
     def query_new_purchase_limit(self, account):
-        return {}
+        """新股申购额度 (大 QMT get_new_purchase_limit).
+        返回 {板块: 额度} 或 {} (失败/无权限)."""
+        account_id = _account_id(account, self.client.account_id)
+        try:
+            data = self.client.call(
+                "get_new_purchase_limit",
+                {"account_id": account_id},
+                account_id=account_id,
+            ) or {}
+            if isinstance(data, dict):
+                return data
+            return {}
+        except Exception:
+            return {}
+
+    def ipo_subscribe_all(self, account=None, stock_type="STOCK",
+                          markets=("SH", "SZ"), dry_run=False,
+                          strategy_name="ipo"):
+        """Subscribe to today's IPOs. Nothing here runs on a timer.
+
+        This is deliberately a call you make, not a behaviour the bridge takes
+        on: it places real orders, so it must be something the operator asked
+        for on that day. It also goes through order_stock, which means it obeys
+        rpc_allow_order_methods and inherits the gateway's passorder settings
+        (orderType 1101, prType 11 指定价, quickTrade 2 -- 2 being the value the
+        API reference requires for a non-bar context).
+
+        markets: exchanges to subscribe on. SH/SZ subscriptions are backed by
+            market value and freeze no cash; BJ freezes cash, so it is excluded
+            by default. A code whose market cannot be identified is SKIPPED,
+            never subscribed on a guess.
+        dry_run: return the plan without placing anything.
+
+        Returns one dict per candidate: stock_code, name, price, volume,
+        action ("subscribed" / "skipped" / "failed") and reason.
+        """
+        allowed = set(str(m).upper() for m in (markets or ()))
+        results = []
+        for code, info in (self.query_ipo_data(account, stock_type=stock_type) or {}).items():
+            info = info or {}
+            entry = {
+                "stock_code": code,
+                "name": str(info.get("name") or ""),
+                "price": _safe_float(info.get("issuePrice"), 0.0),
+                "volume": _safe_int(info.get("maxPurchaseNum"), 0),
+                "action": "skipped",
+                "reason": "",
+            }
+            market = ipo_market_of(code)
+            if market is None:
+                entry["reason"] = "market not identified"
+            elif market not in allowed:
+                entry["reason"] = "%s not in %s" % (market, sorted(allowed))
+            elif entry["price"] <= 0 or entry["volume"] <= 0:
+                entry["reason"] = "issuePrice/maxPurchaseNum missing or non-positive"
+            elif dry_run:
+                entry["action"] = "planned"
+            else:
+                try:
+                    entry["result"] = self.ipo_subscribe(
+                        account, code, entry["volume"], entry["price"],
+                        strategy_name=strategy_name,
+                        order_remark="ipo:%s" % code)
+                    entry["action"] = "subscribed"
+                except Exception as exc:
+                    entry["action"] = "failed"
+                    entry["reason"] = "%s: %s" % (exc.__class__.__name__, exc)
+            results.append(entry)
+        return results
+
+    def ipo_subscribe(self, account, stock_code, volume, price, strategy_name="ipo",
+                      order_remark="ipo_sub"):
+        """新股申购 (打新). 复用现有 order_stock RPC (passorder opType=23 指定价).
+        stock_code 应为 get_ipo_data 返回的申购代码 (带后缀), price=发行价.
+        返回 {order_sys_id} 或 {} (失败)."""
+        return self.order_stock_result(
+            account, stock_code, STOCK_BUY, int(volume),
+            FIX_PRICE, float(price), strategy_name, order_remark,
+        )
 
     # ------------------------------------------------------------------
     # async 变体：MiniQMT 的 *_async 方法返回 seq 后异步回调。
@@ -2977,30 +3632,29 @@ class BigQmtXtTrader:
         action = item.get("action")
         order_type = _action_to_order_type(action)
         order_sysid = str(item.get("order_sys_id") or item.get("order_sysid") or item.get("order_id") or "")
-        if order_sysid:
-            # print(f"price_type: {item.get('price_type')}")
-            return CompatObject(
-                account_id=account_id,
-                stock_code=str(item.get("stock_code") or ""),
-                order_type=order_type,
-                order_status=_safe_int(item.get("status", item.get("order_status")), ORDER_UNKNOWN),
-                order_volume=_safe_int(item.get("volume", item.get("order_volume"))),
-                traded_volume=_safe_int(item.get("traded_volume")),
-                price=_safe_float(item.get("price")),
-                order_sysid=order_sysid,
-                order_id=order_sysid,
-                strategy_name=str(item.get("strategy_name") or ""),  # 限价买入
-                order_remark=str(item.get("remark") or item.get("user_order_id") or ""),
-                price_type=_safe_int(item.get("price_type")),  # 50, 121 限价 83 市价
-                # MiniQMT XtOrder.order_time 是 Unix 秒。服务端订单事件只发
-                # created_at_ts 不发 order_time，所以没有显式 order_time 时
-                # 用 created_at_ts 兜底；两者都没有才落到 0（不要当成 1970 年）。
-                order_time=_safe_int(item.get("order_time") or item.get("created_at_ts"), 0),
-                # MiniQMT XtOrder.status_msg —— 废单时柜台给的原因 (issue #60)。
-                status_msg=str(item.get("status_msg") or ""),
-            )
-        else:
-            return None
+        return CompatObject(
+            account_id=account_id,
+            stock_code=_full_a_share_code(item.get("stock_code")),
+            order_type=order_type,
+            order_status=_safe_int(item.get("status", item.get("order_status")), ORDER_UNKNOWN),
+            order_volume=_safe_int(item.get("volume", item.get("order_volume"))),
+            traded_volume=_safe_int(item.get("traded_volume")),
+            price=_safe_float(item.get("price")),
+            traded_price=_safe_float(
+                item.get("traded_price", item.get("avg_traded_price", item.get("m_dTradedPrice")))
+            ),
+            order_sysid=order_sysid,
+            order_id=order_sysid or str(item.get("user_order_id") or ""),
+            strategy_name=str(item.get("strategy_name") or ""),
+            order_remark=str(item.get("remark") or item.get("user_order_id") or ""),
+            # MiniQMT XtOrder.order_time 是 Unix 秒。服务端订单事件只发
+            # created_at_ts 不发 order_time，所以没有显式 order_time 时
+            # 用 created_at_ts 兜底；两者都没有才落到 0（不要当成 1970 年）。
+            order_time=_safe_int(item.get("order_time") or item.get("created_at_ts"), 0),
+            # MiniQMT XtOrder.status_msg —— 废单时柜台给的原因 (issue #60)。
+            status_msg=str(item.get("status_msg") or ""),
+            price_type=item.get("price_type"),
+        )
 
     def _trade_from_dict(self, account_id, item):
         action = item.get("action")

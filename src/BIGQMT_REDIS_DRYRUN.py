@@ -11,10 +11,28 @@ package imports, so local bridge files are compiled explicitly after resolving
 their path.
 """
 import builtins as _builtins
-import importlib as _importlib
 import os
 import sys
 import types
+
+try:
+    import importlib as _importlib
+except ImportError:
+    # Some QMT python36.zip builds omit importlib. The local loader only needs
+    # import_module and reload, so provide the smallest compatible fallback.
+    _importlib = types.ModuleType("importlib")
+
+    def _fallback_import_module(name, package=None):
+        if package or str(name).startswith("."):
+            raise ImportError("relative import requires the standard importlib package")
+        return _builtins.__import__(name, globals(), locals(), ("*",), 0)
+
+    def _fallback_reload(module):
+        return module
+
+    _importlib.import_module = _fallback_import_module
+    _importlib.reload = _fallback_reload
+    sys.modules["importlib"] = _importlib
 
 
 _LOCAL_ROOTS = (
@@ -208,10 +226,24 @@ def _load_local_config():
 try:
     _config = _load_local_config()
     BIGQMT_REDIS_CONFIG = getattr(_config, "BIGQMT_REDIS_CONFIG", {})
-    print("[bigqmt_shell] local redis config loaded keys=%s" % sorted((BIGQMT_REDIS_CONFIG or {}).keys()))
+    forced_transport = globals().get("BIGQMT_FORCE_TRANSPORT")
+    if forced_transport:
+        BIGQMT_REDIS_CONFIG = dict(BIGQMT_REDIS_CONFIG or {})
+        BIGQMT_REDIS_CONFIG["transport"] = str(forced_transport)
+        if str(forced_transport).lower() == "zmq":
+            BIGQMT_REDIS_CONFIG["rpc_background_threads"] = True
+            BIGQMT_REDIS_CONFIG["download_jobs_enabled"] = False
+            BIGQMT_REDIS_CONFIG["exec_events_enabled"] = False
+            BIGQMT_REDIS_CONFIG["full_tick_cache_enabled"] = False
+    print("[bigqmt_shell] local rpc config loaded transport=%s keys=%s" % (
+        (BIGQMT_REDIS_CONFIG or {}).get("transport", "redis"),
+        sorted((BIGQMT_REDIS_CONFIG or {}).keys()),
+    ))
     _runtime.configure_runtime_redis(BIGQMT_REDIS_CONFIG)
-except Exception as redis_config_error:
-    print("[bigqmt_shell] local redis config load failed: %s" % redis_config_error)
+except Exception as rpc_config_error:
+    print("[bigqmt_shell] local rpc config load failed: %s" % rpc_config_error)
+    if str(globals().get("BIGQMT_FORCE_TRANSPORT") or "").lower() == "zmq":
+        raise RuntimeError("ZMQ bridge requires a valid local QMT config: %s" % rpc_config_error)
 
 try:
     _config = _load_local_config()

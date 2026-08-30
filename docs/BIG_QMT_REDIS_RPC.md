@@ -285,7 +285,7 @@ bigqmt:order_events:{account_id}
 bigqmt:trade_events:{account_id}
 ```
 
-成交事件字段（由 `deal_callback` 的 `m_*` 映射）：`stock_code`(`m_strInstrumentID`)、`trade_id`(`m_strTradeID`)、`order_sys_id`(`m_strOrderSysID`)、`volume`(`m_nVolume`)、`price`(`m_dPrice`)、`amount`(`m_dTradeAmount`)、`commission`(`m_dComssion`)、`direction`(`m_nDirection`) 及 `action`(尽力映射 BUY/SELL)、`traded_at`(`m_strTradeTime`)。委托事件类似（`m_nOrderStatus`→`status`、`m_nVolumeTotal`→`order_volume`、`m_nVolumeTraded`→`traded_volume`、`m_dLimitPrice`→`price`）。
+成交事件字段（由 `deal_callback` 的 `m_*` 映射）：`stock_code`(`m_strInstrumentID`)、`trade_id`(`m_strTradeID`)、`order_sys_id`(`m_strOrderSysID`)、`volume`(`m_nVolume`)、`price`(`m_dPrice`)、`amount`(`m_dTradeAmount`)、`commission`(`m_dComssion`)、`direction`(`m_nDirection`) 及 `action`(尽力映射 BUY/SELL)、`traded_at`(`m_strTradeTime`)。委托事件类似（`m_nOrderStatus`→`status`、`m_nVolumeTotal`→`order_volume`、`m_nVolumeTraded`→`traded_volume`、`m_dLimitPrice`→`price`、`m_dTradedPrice`→`traded_price`）。
 
 客户端用法（MiniQMT 风格，回调实时触发）：
 
@@ -383,6 +383,7 @@ QMT 终端自身的 C++ 主循环占着 GIL**,`setswitchinterval`/精简 adjust 
 - **redis**(默认,跨机):`rpc_process_in_listener=True`。
 - **zmq**(同机低延迟):只加 `transport="zmq"` 一行;非 redis 传输 `_build_rpc_service` 会自动开
   `background_threads`,端口按账号派生 `tcp://127.0.0.1:1556x`。
+- QMT 编辑器可直接加载 `BIGQMT_ZMQ_DRYRUN.py`；该入口强制使用 ZMQ，并复用原有 Bridge 加载逻辑。
 - 内置 Redis 客户端读取含股票代码的原始 JSON 会触发 `Sensitive Data Detected`;客户端 helper 默认
   对请求做安全编码。
 

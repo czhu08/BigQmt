@@ -31,6 +31,7 @@ RPC_REVISION = "20260715-execution-snapshot-v1"
 
 READ_METHODS = {
     "ping",
+    "get_deployment_info",
     "get_ticks",
     "get_instrument",
     "get_instrument_type",
@@ -63,6 +64,7 @@ READ_METHODS = {
     "get_formula_result",
     "gen_factor_index",
     "get_positions",
+    "get_position_statistics",
     "get_asset",
     "query_orders",
     "query_trades",
@@ -125,6 +127,7 @@ LISTENER_DEFERRED_METHODS = {
     # data. Asset queries use the same QMT detail API and must follow this rule.
     "get_asset",
     "get_positions",
+    "get_position_statistics",
     "query_stock_position",
     "query_orders",
     "query_trades",
@@ -136,6 +139,7 @@ LISTENER_DEFERRED_METHODS = {
     "query_credit_slo_code",
     "query_credit_assure",
     "query_appointment_info",
+    "get_ipo_data",   # 8-28: 交易类查询, 需主线程上下文 (后台线程返回空)
     "query_smt_secu_info",
     "query_smt_secu_rate",
     "get_value_by_order_id",
@@ -164,6 +168,7 @@ METHOD_ALIASES = {
     "getDividFactors": "get_divid_factors",
     "query_stock_asset": "get_asset",
     "query_stock_positions": "get_positions",
+    "query_position_statistics": "get_position_statistics",
     "query_stock_orders": "query_orders",
     "query_stock_trades": "query_trades",
     "order_stock": "submit_order",
@@ -471,8 +476,56 @@ class BigQmtRpcHandlers:
             "account_id": self.account_id,
             "allow_order_methods": bool(self.allow_order_methods),
             "rpc_revision": RPC_REVISION,
+            "version": _deployed_version(),
             "server_time": _dt.datetime.now(),
         }
+
+    def _handle_get_deployment_info(self, params):
+        """Where this bridge is running from, and which build it is.
+
+        Deploying into QMT is a file copy, and QMT keeps modules in sys.modules
+        across strategy re-runs -- so "the copy never happened" and "the copy
+        landed but was not picked up" are indistinguishable from the client
+        side. This lets the client ask instead of guessing, and gives a sync
+        tool somewhere to copy to without the trading process rewriting its own
+        code.
+        """
+        import os
+        import sys as _sys
+
+        info = {
+            "version": "",
+            "package_dir": "",
+            "qmt_python_dir": "",
+            "strategy_dir": "",
+            "python_version": "",
+            "rpc_revision": RPC_REVISION,
+        }
+        try:
+            info["python_version"] = ".".join(
+                str(part) for part in _sys.version_info[:3])
+        except Exception:
+            pass
+        try:
+            # Submodule: the QMT sandbox never execs the root package.
+            from bigqmt_signal_trader.version import deployment_report
+
+            version, package_dir = deployment_report()
+            info["version"] = version
+            info["package_dir"] = package_dir
+            # The QMT python directory is the package's parent: that is where a
+            # sync tool writes, and where the top-level modules live.
+            info["qmt_python_dir"] = os.path.dirname(package_dir)
+        except Exception as exc:
+            info["error"] = "%s: %s" % (exc.__class__.__name__, exc)
+        try:
+            strategy = _sys.modules.get("bigqmt_signal_trader_strategy")
+            path = getattr(strategy, "__file__", "")
+            if path:
+                info["strategy_dir"] = os.path.dirname(os.path.abspath(path))
+        except Exception:
+            pass
+        return info
 
     # ------------------------------------------------------------------
     # 全推行情订阅控制（引用计数共享 ContextInfo.subscribe_whole_quote）。
@@ -582,7 +635,14 @@ class BigQmtRpcHandlers:
             codes = [code] if code else []
         if not codes:
             raise ValueError("codes or code is required")
-        return self.market_data.get_ticks(codes)
+        types = params.get("types")
+        if isinstance(types, str):
+            types = [types]
+        if not types:
+            # Pass one argument when nothing was asked for, so a market-data
+            # provider whose get_ticks takes only `codes` keeps working.
+            return self.market_data.get_ticks(codes)
+        return self.market_data.get_ticks(codes, types=list(types))
 
     def _handle_get_instrument(self, params):
         code = params.get("code")
@@ -598,6 +658,9 @@ class BigQmtRpcHandlers:
 
     def _handle_get_positions(self, params):
         return self.position_provider.get_positions(self._request_account_id(params))
+
+    def _handle_get_position_statistics(self, params):
+        return self.position_provider.get_position_statistics(self._request_account_id(params))
 
     def _handle_query_stock_position(self, params):
         stock_code = str(params.get("stock_code") or params.get("code") or "").strip()
@@ -696,6 +759,32 @@ class BigQmtRpcHandlers:
         except Exception:
             return []
 
+    def _call_qmt_mapping(self, func_name, *args, **kwargs):
+        """Same as _call_qmt_global, for the QMT globals that answer with a
+        mapping rather than a row list -- get_ipo_data, get_new_purchase_limit.
+
+        The row normaliser would iterate such a dict by key and throw the values
+        away, so these keep their shape and only have their values made
+        JSON-safe.
+        """
+        func = self.qmt_api.get(func_name)
+        if func is None:
+            return {}
+        try:
+            data = func(*args, **kwargs)
+        except Exception:
+            return {}
+        if isinstance(data, dict):
+            return dict((str(key), _normalize_mapping_value(value))
+                        for key, value in data.items())
+        # Some brokers hand back rows even here; normalise rather than drop.
+        return _normalize_detail_rows(data)
+
+    def _configured_account_type(self):
+        return str(
+            getattr(self.order_gateway, "account_type", "CREDIT") or "CREDIT"
+        ).strip().upper()
+
     def _query_trade_detail(self, params, detail_type, strategy_name=""):
         """get_trade_detail_data with one of the 6 official detail types.
 
@@ -727,7 +816,11 @@ class BigQmtRpcHandlers:
 
     def _handle_query_stk_compacts(self, params):
         # 未平仓合约（负债）— 官方 get_unclosed_compacts
-        return self._call_qmt_global("get_unclosed_compacts", self._request_account_id(params))
+        return self._call_qmt_global(
+            "get_unclosed_compacts",
+            self._request_account_id(params),
+            self._configured_account_type(),
+        )
 
     def _handle_query_credit_subjects(self, params):
         # 融资标的（担保品）— 官方 get_assure_contract
@@ -742,8 +835,11 @@ class BigQmtRpcHandlers:
         return self._call_qmt_global("get_assure_contract", self._request_account_id(params))
 
     def _handle_query_appointment_info(self, params):
-        # 新股数据 — 官方 get_ipo_data
-        return self._call_qmt_global("get_ipo_data", self._request_account_id(params))
+        # 新股数据 — 官方 get_ipo_data(type)
+        # 8-28 修复: 原实现把 account_id 当第一个参数传给 get_ipo_data (期望 type),
+        # 导致返回 [{}]. 改为透传 type 参数 ("STOCK"/"BOND"/缺省全部).
+        return self._call_qmt_global(
+            "get_ipo_data", str(params.get("type") or params.get("stock_type") or ""))
 
     def _handle_query_smt_secu_info(self, params):
         # 期权标的持仓 — 官方 get_option_subject_position
@@ -768,10 +864,20 @@ class BigQmtRpcHandlers:
         return self._call_qmt_global("get_last_order_id", self._request_account_id(params))
 
     def _handle_get_ipo_data(self, params):
-        return self._call_qmt_global("get_ipo_data", self._request_account_id(params))
+        # get_ipo_data answers with a dict KEYED BY SUBSCRIPTION CODE, not with
+        # detail rows. Sending it through _normalize_detail_rows iterates the
+        # dict, i.e. its keys, and attribute-scrapes each code string -- so
+        # {"730001": {...}, "001234": {...}} came out as [{}, {}]: codes, issue
+        # prices and quantities all gone. #96 fixed the `type` argument but the
+        # response was still being destroyed here.
+        return self._call_qmt_mapping(
+            "get_ipo_data", str(params.get("type") or params.get("stock_type") or ""))
 
     def _handle_get_new_purchase_limit(self, params):
-        return self._call_qmt_global("get_new_purchase_limit", self._request_account_id(params))
+        # Documented as returning a dict of 板块 -> 额度, so it has the same
+        # shape problem get_ipo_data had (6.10 in the API reference).
+        return self._call_qmt_mapping(
+            "get_new_purchase_limit", self._request_account_id(params))
 
     def _handle_get_history_trade_detail_data(self, params):
         account_id = self._request_account_id(params)
@@ -790,10 +896,18 @@ class BigQmtRpcHandlers:
         return self._call_qmt_global("get_enable_short_contract", self._request_account_id(params))
 
     def _handle_get_unclosed_compacts(self, params):
-        return self._call_qmt_global("get_unclosed_compacts", self._request_account_id(params))
+        return self._call_qmt_global(
+            "get_unclosed_compacts",
+            self._request_account_id(params),
+            self._configured_account_type(),
+        )
 
     def _handle_get_closed_compacts(self, params):
-        return self._call_qmt_global("get_closed_compacts", self._request_account_id(params))
+        return self._call_qmt_global(
+            "get_closed_compacts",
+            self._request_account_id(params),
+            self._configured_account_type(),
+        )
 
     def _handle_get_debt_contract(self, params):
         return self._call_qmt_global("get_debt_contract", self._request_account_id(params))
@@ -882,12 +996,28 @@ class BigQmtRpcHandlers:
         action = str(params.get("action") or "").upper()
         if action:
             return action
-        order_type = str(params.get("order_type") or "").upper()
+        raw = params.get("order_type")
+        order_type = str(raw or "").upper()
         if order_type in BUY_ORDER_TYPES:
             return "BUY"
         if order_type in SELL_ORDER_TYPES:
             return "SELL"
+        # Credit operations carry their side in the type itself (issue #103).
+        # 直接还款 moves cash rather than securities and has no side, so it
+        # still needs an explicit action rather than being guessed at.
+        credit = _credit_action_of(raw)
+        if credit:
+            return credit
+        if _credit_optype_of(raw) is not None:
+            raise ValueError(
+                "order_type %s has no implicit buy/sell side; pass action "
+                "explicitly" % raw)
         raise ValueError("action or order_type is required")
+
+    def _credit_order_type_from_params(self, params):
+        """The MiniQMT order_type to forward, when it is a credit operation."""
+        raw = params.get("order_type")
+        return raw if _credit_optype_of(raw) is not None else None
 
     def _handle_submit_order(self, params):
         if self.order_gateway is None:
@@ -907,6 +1037,7 @@ class BigQmtRpcHandlers:
             price_type=params.get("price_type") or "LIMIT",
             strategy_name=str(params.get("strategy_name") or "bigqmt_rpc"),
             remark=order_tag,
+            order_type=self._credit_order_type_from_params(params),
         )
         if request.action not in ("BUY", "SELL"):
             raise ValueError("action must be BUY or SELL")
@@ -1146,6 +1277,46 @@ def _bool_value(value, default=False):
     if isinstance(value, bool):
         return value
     return str(value).strip().lower() in ("1", "true", "yes", "y", "on")
+
+
+def _credit_action_of(order_type):
+    try:
+        from bigqmt_signal_trader.adapters.order_bigqmt import credit_action_of
+
+        return credit_action_of(order_type)
+    except Exception:
+        return None
+
+
+def _credit_optype_of(order_type):
+    try:
+        from bigqmt_signal_trader.adapters.order_bigqmt import credit_optype_of
+
+        return credit_optype_of(order_type)
+    except Exception:
+        return None
+
+
+def _deployed_version():
+    """Version of the bridge actually running here, or "" if unknown."""
+    try:
+        from bigqmt_signal_trader.version import __version__
+
+        return __version__
+    except Exception:
+        return ""
+
+
+def _normalize_mapping_value(value):
+    """Make one mapping value JSON-safe without flattening its shape."""
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    if isinstance(value, dict):
+        return dict((str(k), _normalize_mapping_value(v)) for k, v in value.items())
+    if isinstance(value, (list, tuple)):
+        return [_normalize_mapping_value(v) for v in value]
+    rows = _normalize_detail_rows([value])
+    return rows[0] if rows else {}
 
 
 def _normalize_detail_rows(rows):

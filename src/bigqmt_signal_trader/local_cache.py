@@ -52,6 +52,15 @@ def _pad_end(value):
     return text + "9" * (14 - len(text)) if 0 < len(text) < 14 else text
 
 
+def _align_start(value, sample):
+    """Align a timestamp lower bound to an eight-digit daily cache axis."""
+    text = str(value)
+    sample_text = str(sample)
+    if sample_text.isdigit() and len(sample_text) == 8 and text.isdigit() and len(text) > 8:
+        return text[:8]
+    return text
+
+
 def _drop_placeholder_rows(df):
     """Big QMT fills dates it has no local data for with all-zero rows. A real bar
     never has close/open == 0, so drop those placeholders — the cache should hold
@@ -206,7 +215,8 @@ class LocalMarketCache:
             # 复用旧 mask 会长度不匹配（索引形态直接报错）。
             if start_time:
                 series = df.index.astype(str) if on_index else df[axis].astype(str)
-                df = df[series >= str(start_time)]
+                start_bound = _align_start(start_time, next(iter(series))) if len(series) else str(start_time)
+                df = df[series >= start_bound]
             if end_time:
                 series = df.index.astype(str) if on_index else df[axis].astype(str)
                 df = df[series <= _pad_end(end_time)]

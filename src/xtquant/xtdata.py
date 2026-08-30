@@ -104,6 +104,10 @@ def get_trading_dates(market, start_time="", end_time="", count=-1):
     return _compat.xtdata.get_trading_dates(market, start_time, end_time, count)
 
 
+def get_stock_type(stock):
+    return _compat.xtdata.call_method("get_stock_type", stock=stock)
+
+
 def get_holidays():
     return _compat.xtdata.get_holidays()
 

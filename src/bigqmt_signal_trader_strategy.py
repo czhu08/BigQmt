@@ -11,6 +11,7 @@ import importlib as _importlib
 import sys
 import threading
 import time
+import traceback as _traceback
 
 # The DRYRUN entry reloads strategy/runtime/redis_rpc/redis_common but NOT the
 # other package submodules. Without this, the "from adapter_factory import build_app"
@@ -54,6 +55,59 @@ else:
         tick_app,
     )
     from bigqmt_signal_trader.runtime_bigqmt import BigQmtRuntimeAdapter
+
+
+# exec_events is loaded here, at module load, and never from inside the
+# order/deal callback. QMT runs those callbacks on a C++ thread entered via
+# PyGILState_Ensure; the first exec of a not-yet-imported module on such a
+# thread fails down in the C layer WITHOUT setting a Python exception, which
+# surfaces as SystemError "error return without exception set" (issue #76,
+# live repro 2026-08-27). Modules already in sys.modules resolve fine there --
+# which is why this only bites deployments where the init-time reload could not
+# preload it, i.e. the single-file QMT sandbox build.
+def _import_exec_events():
+    # In the QMT sandbox a package-level "from bigqmt_signal_trader import x"
+    # goes through the C-level __import__ and fails the same way; the local
+    # loader that already serves the adapter modules does not.
+    if _load_bridge_module is not None:
+        return _load_bridge_module("bigqmt_signal_trader.exec_events")
+    from bigqmt_signal_trader import exec_events
+
+    return exec_events
+
+
+def _load_exec_events():
+    try:
+        return _import_exec_events()
+    except Exception:
+        direct_error = _traceback.format_exc()
+    # Only reached when the direct load failed. A plain threading.Thread always
+    # has a full Python thread state, so the exec that just failed succeeds
+    # there; the import lock makes handing the result back safe.
+    holder = {}
+
+    def _target():
+        try:
+            holder["module"] = _import_exec_events()
+        except Exception:
+            pass
+
+    try:
+        worker = threading.Thread(target=_target)
+        worker.start()
+        worker.join()
+    except Exception:
+        pass
+    if holder.get("module") is not None:
+        return holder["module"]
+    print(
+        "[bigqmt_signal_trader] exec_events load failed; exec-event push is "
+        "disabled for this run:\n%s" % direct_error
+    )
+    return None
+
+
+_exec_events = _load_exec_events()
 
 
 _app_factory = None
@@ -875,14 +929,20 @@ def _pump_download_jobs(context_info, config):
     account_id = str(job_config.get("account_id") or config.get("account_id") or _account_id or "")
     if not account_id:
         return None
-    redis_client = getattr(_rpc_service, "redis", None)
+    # Reuse one client. This runs on every adjust tick, so building a client
+    # here leaked one connection pool per tick -- at a 100ms interval that is
+    # ten per second. The symptom is easy to miss: the pools are garbage
+    # collected, and redis-py's __del__ then raises
+    # "AttributeError: 'Redis' object has no attribute 'connection'", which
+    # Python swallows as "Exception ignored in". It never reaches a log the
+    # package writes; it only shows up in the QMT panel.
+    #
+    # _exec_event_redis already learned this lesson and caches; this path was
+    # missed. Both only build a client when _rpc_service has none, which is the
+    # zmq-transport case.
+    redis_client = _exec_event_redis(config)
     if redis_client is None:
-        redis_config = dict(config.get("redis") or {})
-        if not redis_config:
-            return None
-        from bigqmt_signal_trader.adapters.redis_common import build_redis_client
-
-        redis_client = build_redis_client(redis_config)
+        return None
     market_data = getattr(getattr(_rpc_service, "handlers", None), "market_data", None)
     if market_data is None:
         from bigqmt_signal_trader.adapters.market_bigqmt import BigQmtMarketDataProvider
@@ -968,6 +1028,28 @@ def handlebar(ContextInfo):
     return adjust(ContextInfo, _source="handlebar")
 
 
+def _exec_event_sink(config):
+    """Where exec events go: a Redis client, or the quote push channel.
+
+    Exec events were Redis-only, so a zmq deployment with no Redis configured
+    silently delivered no order/trade callbacks at all -- _publish_exec_event
+    simply returned (issue #76). zmq deployments already run a push channel for
+    whole-quote data, so reuse it rather than opening a second socket.
+
+    Redis stays first when available: its channels carry streams for short
+    replay, which the push channel has no equivalent of.
+    """
+    redis_client = _exec_event_redis(config)
+    if redis_client is not None:
+        return redis_client
+    if _quote_subscription_service is not None:
+        try:
+            return _quote_subscription_service[1]      # (manager, channel)
+        except Exception:
+            pass
+    return None
+
+
 def _exec_event_redis(config):
     """Return a redis client for exec-event publishing, reusing one instance.
 
@@ -988,7 +1070,15 @@ def _exec_event_redis(config):
         from bigqmt_signal_trader.adapters.redis_common import build_redis_client
 
         _exec_event_redis_client = build_redis_client(redis_config)
-    except Exception:
+    except Exception as exc:
+        # 静默 None 会让事件悄悄全丢（issue #71 的 protocol 崩溃就是这样没的），
+        # 必须留痕。
+        try:
+            from bigqmt_signal_trader.logging_setup import get_logger
+
+            get_logger("strategy").error("exec-event redis client build failed: %s", exc)
+        except Exception:
+            pass
         return None
     return _exec_event_redis_client
 
@@ -1001,10 +1091,12 @@ def _publish_exec_event(kind, obj):
     # enabled/account_id early returns), because the point is to observe the
     # object exactly as QMT handed it over — even when publishing is off.
     raw_fields = None
+    exec_events = _exec_events
+    if exec_events is None:
+        # Already reported once at module load; a per-callback log would flood.
+        return
     if _config_bool(event_config.get("debug_raw_fields"), False):
         try:
-            from bigqmt_signal_trader import exec_events
-
             print(exec_events.format_raw_snapshot(kind, obj))
             raw_fields = exec_events.raw_field_snapshot(obj)
         except Exception as exc:
@@ -1014,23 +1106,27 @@ def _publish_exec_event(kind, obj):
     account_id = str(event_config.get("account_id") or config.get("account_id") or _account_id or "")
     if not account_id:
         return
-    redis_client = _exec_event_redis(config)
-    if redis_client is None:
+    sink = _exec_event_sink(config)
+    if sink is None:
         return
     try:
-        from bigqmt_signal_trader import exec_events
-
         if kind == "trade":
             event = exec_events.normalize_trade_event(obj, account_id)
             if raw_fields:
                 event["raw_fields"] = raw_fields
-            exec_events.publish_trade_event(redis_client, account_id, event)
+            exec_events.publish_exec_event(sink, account_id, event)
         else:
             event = exec_events.normalize_order_event(obj, account_id)
-            event = exec_events.enrich_order_identity(redis_client, account_id, event)
+            # Identity enrichment reads the remark->identity map that
+            # remember_order_identity wrote, which only exists in Redis. On a
+            # push channel the event goes out un-enriched rather than not at
+            # all; order_sys_id and remark are already on it.
+            redis_client = _exec_event_redis(config)
+            if redis_client is not None:
+                event = exec_events.enrich_order_identity(redis_client, account_id, event)
             if raw_fields:
                 event["raw_fields"] = raw_fields
-            exec_events.publish_order_event(redis_client, account_id, event)
+            exec_events.publish_exec_event(sink, account_id, event)
             # 废单 (status=57 ENTRUST_STATUS_JUNK) 推送 order_error，让客户端
             # on_order_error 能感知下单被拒。
             try:
@@ -1041,9 +1137,16 @@ def _publish_exec_event(kind, obj):
                 err_event = exec_events.normalize_order_error_event(obj, account_id)
                 if raw_fields:
                     err_event["raw_fields"] = raw_fields
-                exec_events.publish_order_error_event(redis_client, account_id, err_event)
+                exec_events.publish_exec_event(sink, account_id, err_event)
     except Exception as exc:
-        _log_err("exec_events", "publish %s failed: %s" % (kind, exc))
+        # str(exc) alone reads "error return without exception set" with no hint
+        # of where it came from -- that is what made issue #76 take a day to
+        # pin down. Carry the exception class and the traceback.
+        _log_err(
+            "exec_events",
+            "publish %s failed: %s (%s)\n%s"
+            % (kind, exc, exc.__class__.__name__, _traceback.format_exc()),
+        )
 
 
 def order_callback(ContextInfo, orderInfo):

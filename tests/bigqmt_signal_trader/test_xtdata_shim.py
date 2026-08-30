@@ -44,6 +44,10 @@ class _FakeXtData:
         ))
         return True
 
+    def call_method(self, method, **params):
+        self.calls.append(("call_method", (method, params)))
+        return "ETF"
+
 
 class XtdataShimSignatureTest(unittest.TestCase):
     def setUp(self):
@@ -86,6 +90,11 @@ class XtdataShimSignatureTest(unittest.TestCase):
         name, args = self.fake.calls[-1]
         self.assertEqual(name, "download_history_data2")
         self.assertEqual(args[-1], "front")
+
+    def test_get_stock_type_forwards_through_generic_compat_method(self):
+        """顶层 shim 只转发现有通用 RPC，不复制证券分类逻辑。"""
+        self.assertEqual(shim.get_stock_type("510300.SH"), "ETF")
+        self.assertEqual(self.fake.calls, [("call_method", ("get_stock_type", {"stock": "510300.SH"}))])
 
 
 if __name__ == "__main__":

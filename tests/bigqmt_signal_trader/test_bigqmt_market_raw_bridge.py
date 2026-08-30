@@ -68,6 +68,28 @@ class BigQmtRawMarketBridgeTest(unittest.TestCase):
         self.assertEqual([], data["600276.SH"]["records"])
         self.assertEqual(["stime", "close"], data["600276.SH"]["columns"])
 
+    def test_trading_date_context_fallback_maps_market_to_representative_stock(self):
+        """ContextInfo 路径必须把市场代码转换为其要求的证券代码。"""
+        class CalendarContext:
+            def __init__(self):
+                self.calls = []
+
+            def get_trading_dates(self, stock_code, start_time, end_time, count):
+                self.calls.append((stock_code, start_time, end_time, count))
+                return ["20260826"]
+
+        class UnavailableNativeXtData:
+            def get_trading_dates(self, *_args):
+                raise RuntimeError("native quote service unavailable")
+
+        context = CalendarContext()
+        provider = BigQmtMarketDataProvider(context, native_xtdata=UnavailableNativeXtData())
+
+        for market, expected_stock in (("SH", "000001.SH"), ("sz", "399001.SZ"), ("000300.SH", "000300.SH")):
+            with self.subTest(market=market):
+                self.assertEqual(["20260826"], provider.get_trading_dates(market, "20260801", "20260826", 3))
+                self.assertEqual((expected_stock, "20260801", "20260826", 3), context.calls[-1])
+
 
 if __name__ == "__main__":
     unittest.main()

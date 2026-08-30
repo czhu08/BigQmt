@@ -191,6 +191,102 @@ class PositionSnapshot:
         self.direction = direction
 
 
+class PositionStatisticsSnapshot:
+    """One position-statistics row, i.e. ``get_trade_detail_data(..., "POSITION_STATISTICS")``.
+
+    """
+
+    def __init__(
+        self,
+        account_id="",
+        exchange_id="",
+        exchange_name="",
+        product_id="",
+        instrument_id="",
+        instrument_name="",
+        stock_code="",
+        direction=0,
+        hedge_flag=0,
+        position=0,
+        yesterday_position=0,
+        today_position=0,
+        can_close_vol=0,
+        position_cost=None,
+        avg_price=None,
+        position_profit=None,
+        float_profit=None,
+        open_price=None,
+        used_margin=None,
+        used_commission=None,
+        frozen_margin=None,
+        frozen_commission=None,
+        instrument_value=None,
+        open_times=0,
+        open_volume=0,
+        cancel_times=0,
+        last_price=None,
+        rise_ratio=None,
+        product_name="",
+        royalty=None,
+        expire_date="",
+        assest_weight=None,
+        increase_by_settlement=None,
+        margin_ratio=None,
+        float_profit_divide_by_used_margin=None,
+        float_profit_divide_by_balance=None,
+        today_profit_loss=None,
+        yesterday_init_position=0,
+        frozen_royalty=None,
+        today_close_profit_loss=None,
+        close_profit=None,
+        ft_product_name="",
+        open_cost=None,
+    ):
+        self.account_id = account_id
+        self.exchange_id = exchange_id
+        self.exchange_name = exchange_name
+        self.product_id = product_id
+        self.instrument_id = instrument_id
+        self.instrument_name = instrument_name
+        self.stock_code = stock_code
+        self.direction = direction
+        self.hedge_flag = hedge_flag
+        self.position = position
+        self.yesterday_position = yesterday_position
+        self.today_position = today_position
+        self.can_close_vol = can_close_vol
+        self.position_cost = position_cost
+        self.avg_price = avg_price
+        self.position_profit = position_profit
+        self.float_profit = float_profit
+        self.open_price = open_price
+        self.used_margin = used_margin
+        self.used_commission = used_commission
+        self.frozen_margin = frozen_margin
+        self.frozen_commission = frozen_commission
+        self.instrument_value = instrument_value
+        self.open_times = open_times
+        self.open_volume = open_volume
+        self.cancel_times = cancel_times
+        self.last_price = last_price
+        self.rise_ratio = rise_ratio
+        self.product_name = product_name
+        self.royalty = royalty
+        self.expire_date = expire_date
+        self.assest_weight = assest_weight
+        self.increase_by_settlement = increase_by_settlement
+        self.margin_ratio = margin_ratio
+        self.float_profit_divide_by_used_margin = float_profit_divide_by_used_margin
+        self.float_profit_divide_by_balance = float_profit_divide_by_balance
+        self.today_profit_loss = today_profit_loss
+        self.yesterday_init_position = yesterday_init_position
+        self.frozen_royalty = frozen_royalty
+        self.today_close_profit_loss = today_close_profit_loss
+        self.close_profit = close_profit
+        self.ft_product_name = ft_product_name
+        self.open_cost = open_cost
+
+
 class AssetSnapshot:
     """Account funds, mirroring MiniQMT's ``XtAsset``.
 
@@ -233,7 +329,12 @@ class OrderRequest:
         price_type,
         strategy_name,
         remark="",
+        order_type=None,
     ):
+        # MiniQMT-style order_type (xtconstant). Only set for operations a
+        # BUY/SELL action cannot express -- credit financing, repayment and the
+        # special-margin family. None means an ordinary stock order.
+        self.order_type = order_type
         self.signal_id = signal_id
         self.account_id = account_id
         self.action = action
@@ -267,8 +368,9 @@ class OrderSnapshot:
         strategy_name="",
         remark="",
         order_time=0,
-        price_type=50,
-        status_msg=""
+        status_msg="",
+        traded_price=0.0,
+        price_type=None,
     ):
         self.order_sys_id = order_sys_id
         self.user_order_id = user_order_id
@@ -278,6 +380,7 @@ class OrderSnapshot:
         self.traded_volume = traded_volume
         self.status = status
         self.price = price
+        self.traded_price = traded_price
         self.strategy_name = strategy_name
         self.remark = remark
         # 报单时间, Unix 秒 -- MiniQMT XtOrder.order_time 的语义。0 = 未上报。
@@ -288,6 +391,8 @@ class OrderSnapshot:
         # 柜台的拒单理由只在这里, 例如
         # "[COUNTER] 资金可用余额不足，尚需[4789.630]" (issue #60)。
         self.status_msg = status_msg
+        # 完整 QMT 的不同版本可能不提供 price_type；追加在末尾保持旧位置参数兼容。
+        self.price_type = price_type
 
 
 class TradeSnapshot:

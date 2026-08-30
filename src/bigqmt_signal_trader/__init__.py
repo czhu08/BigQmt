@@ -1,6 +1,6 @@
 """可替换的大 QMT 信号下单包核心模块。"""
 
-__version__ = "0.2.0"
+from .version import __version__, deployment_report
 
 from .app import SignalTradingApp
 from .models import (

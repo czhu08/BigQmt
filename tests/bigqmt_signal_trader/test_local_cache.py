@@ -51,6 +51,16 @@ class LocalMarketCacheTest(unittest.TestCase):
         self.assertIsNone(c.read("MISSING", "1d"))
         self.assertEqual(c.covered("X", "1d"), ("20260101", "20260103", 3))
 
+    def test_daily_range_accepts_full_timestamp_bounds(self):
+        import pandas as pd
+
+        c = LocalMarketCache(self.dir)
+        c.write("X", "1d", pd.DataFrame({"stime": ["20260101", "20260102", "20260103"], "close": [1, 2, 3]}))
+
+        out = c.read("X", "1d", start_time="20260102000000", end_time="20260102235959")
+
+        self.assertEqual(list(out["stime"]), ["20260102"])
+
     def test_index_time_frames_slice_by_date_window(self):
         # issue #54 follow-up: MiniQMT-shaped frames carry time as the index
         # (the client normalizer moves stime to the index and drops the column).
@@ -267,6 +277,7 @@ class FakeClient:
         self.account_id = "acct"
         self.calls = []
         self.call_params = []
+        self.call_timeouts = []
         self.local_cache_config = {"enabled": True, "dir": cache_dir, "fallback_rpc": fallback_rpc}
 
     def _redis(self):
@@ -275,6 +286,7 @@ class FakeClient:
     def call(self, method, params=None, account_id=None, timeout_seconds=None):
         self.calls.append(method)
         self.call_params.append((method, params))
+        self.call_timeouts.append((method, timeout_seconds))
         if method == "get_market_data_ex":
             import pandas as pd
 
@@ -307,6 +319,7 @@ class LocalCacheClientTest(unittest.TestCase):
         self.assertEqual(len(progress), 2)
         self.assertEqual(progress[-1]["stockcode"], "000001.SZ")
         self.assertEqual(progress[-1]["finished"], 2)
+        self.assertEqual(next(timeout for method, timeout in xt.client.call_timeouts if method == "get_market_data_ex"), 60.0)
         calls_after_download = list(xt.client.calls)
 
         data = xt.get_local_data(stock_list=["600000.SH", "000001.SZ"], period="1d")
@@ -569,6 +582,7 @@ class _AllZeroThenRealClient(FakeClient):
     def call(self, method, params=None, account_id=None, timeout_seconds=None):
         self.calls.append(method)
         self.call_params.append((method, params))
+        self.call_timeouts.append((method, timeout_seconds))
         import pandas as pd
 
         if method == "download_history_data2":
@@ -602,7 +616,7 @@ class AdjustedReadSelfHealTest(unittest.TestCase):
         xt = self._xt()
         data = xt.get_market_data_ex(
             field_list=["close"], stock_list=["600000.SH"], period="1d",
-            dividend_type="front",
+            dividend_type="front", timeout_seconds=60.0,
         )
         # After self-heal the retry returns real (non-zero) bars.
         self.assertEqual(list(data["600000.SH"]["close"]), [8.76, 8.73])
@@ -611,6 +625,10 @@ class AdjustedReadSelfHealTest(unittest.TestCase):
         self.assertIn("download_history_data2", method_calls)
         # get_market_data_ex called twice: initial all-zero pull + retry.
         self.assertEqual(method_calls.count("get_market_data_ex"), 2)
+        self.assertEqual(
+            [timeout for method, timeout in xt.client.call_timeouts if method == "get_market_data_ex"],
+            [60.0, 60.0],
+        )
 
     def test_none_read_does_not_self_heal(self):
         xt = self._xt()

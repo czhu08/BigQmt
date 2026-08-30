@@ -497,11 +497,39 @@ class XtquantCompatTest(unittest.TestCase):
     def test_quote_subscribe_and_unsubscribe_write_redis_events(self):
         xtdata = self._xtdata()
 
+        # Tick subscriptions ride the whole-quote push session now (#95), so
+        # stand one in; the bookkeeping this test covers is unchanged.
+        class _Session(object):
+            def __init__(self):
+                self.active = set()
+                self.subscribed = []
+
+            def start(self):
+                pass
+
+            def subscribe_whole_quote(self, code_list, callback=None):
+                self.subscribed.append(list(code_list))
+                sub_id = 900 + len(self.subscribed)
+                self.active.add(sub_id)
+                return sub_id
+
+            def unsubscribe_quote(self, sub_id):
+                self.active.discard(sub_id)
+                return 0
+
+            def has_subscription(self, sub_id):
+                return sub_id in self.active
+
+        session = _Session()
+        xtdata._quote_session_factory = lambda: session
+
         seq = xtdata.subscribe_quote("600000.SH", period="tick")
         result = xtdata.unsubscribe_quote(seq)
 
         key = "bigqmt:quote_subscriptions:acct"
         self.assertEqual(result, 0)
+        self.assertEqual(session.subscribed, [["600000.SH"]])
+        self.assertNotIn(seq, session.active)
         self.assertNotIn(str(seq), xtdata.client.redis.hashes.get(key, {}))
         self.assertIn((key, str(seq)), xtdata.client.redis.deleted)
         self.assertEqual(xtdata.client.redis.events[0][0], "subscribe_quote")
@@ -776,6 +804,39 @@ class XtquantCompatTest(unittest.TestCase):
         self.assertEqual(transport.name, "zmq")
         self.assertEqual(transport.connect_address, "tcp://127.0.0.1:20146")
         self.assertIsNone(transport.discovery_redis_client)
+
+    def test_pure_zmq_quote_metadata_does_not_build_redis_client(self):
+        """纯 ZMQ 的兼容订阅元数据不能隐式连接 Redis。"""
+        client = BigQmtRpcClient(account_id="acct", redis_config={"transport": "zmq"})
+        client._redis = lambda: (_ for _ in ()).throw(AssertionError("Redis must not be used"))
+
+        event = client.publish_event("subscribe_quote", {"seq": 1})
+        client.save_quote_subscription(1, {"seq": 1}, active=True)
+
+        self.assertEqual(event["event_type"], "subscribe_quote")
+
+    def test_mysql_quote_metadata_keeps_existing_redis_path(self):
+        """非 ZMQ transport 继续使用既有 Redis 订阅元数据。"""
+        class RedisRecorder:
+            def __init__(self):
+                self.calls = []
+
+            def xadd(self, *args, **kwargs):
+                self.calls.append("xadd")
+
+            def publish(self, *args, **kwargs):
+                self.calls.append("publish")
+
+            def hset(self, *args, **kwargs):
+                self.calls.append("hset")
+
+        redis = RedisRecorder()
+        client = BigQmtRpcClient(account_id="acct", redis_client=redis, redis_config={"transport": "mysql"})
+
+        client.publish_event("subscribe_quote", {"seq": 1})
+        client.save_quote_subscription(1, {"seq": 1}, active=True)
+
+        self.assertEqual(redis.calls, ["xadd", "publish", "hset"])
 
 
 if __name__ == "__main__":
