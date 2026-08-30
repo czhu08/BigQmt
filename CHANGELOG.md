@@ -2,6 +2,18 @@
 
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/) 和 [语义化版本](https://semver.org/)。
 
+## [Unreleased]
+
+### 新增
+
+- **能力探测 RPC `probe_capabilities`**：只读探查当前部署暴露了哪些 QMT callable——运行时全局函数绑定（passorder/download/信用等 20 项）、ContextInfo 方法存在性、信用接口只读试调（行数/报错）。部署后跑一次即可确认这台券商 QMT 的能力边界。参考 cfquant 的 credit probe 思路。
+- **docs/DEPLOY_QUICKSTART.md**：单账号部署最短路径（5 步 + 部署期常见问题表），README 快速开始入口挂载。
+- **docs/LATENCY_REPORT.md**：延迟报告独立成文（传输层对比、FormulaServer 直连、下单链路各环节、方法论声明）。
+
+### 修复
+
+- **qmt_launcher 锁屏防护**：`restart_qmt` 在会话锁屏且需要自动登录时直接拒绝执行（否则关掉终端却登不回去，交易中断）；新增 `session_is_locked()` 检测。
+
 ## [0.3.1] - 2026-08-30
 
 ### 修复

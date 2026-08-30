@@ -159,6 +159,26 @@ def is_qmt_running(install_dir):
     return bool(find_qmt_processes(install_dir))
 
 
+def session_is_locked():
+    """True when the interactive session is at the Windows lock screen.
+
+    Login automation is impossible while locked (physical input lands on the
+    lock screen), so callers can check before closing a running terminal.
+    Heuristic: the foreground window is the lock screen's CoreWindow.
+    """
+    try:
+        import ctypes
+
+        import win32gui
+
+        hwnd = ctypes.windll.user32.GetForegroundWindow()
+        title = win32gui.GetWindowText(hwnd) or ""
+        cls = win32gui.GetClassName(hwnd)
+        return cls == "Windows.UI.Core.CoreWindow" and "锁屏" in title
+    except Exception:
+        return False
+
+
 # ------------------------------------------------------------------ readiness
 def port_is_listening(port=DEFAULT_READY_PORT, host="127.0.0.1", timeout=1.0):
     sock = socket.socket()
@@ -487,6 +507,13 @@ def restart_qmt(install_dir, settle_seconds=5.0, **open_kwargs):
     after the process dies, and the ZMQ transport binds its configured port
     exactly (no scanning), so restarting too eagerly fails the rebind.
     """
+    mode = str(open_kwargs.get("mode") or "auto")
+    if mode in ("login", "auto") and session_is_locked():
+        raise QmtLauncherError(
+            "interactive session is locked; the login dialog cannot be automated "
+            "now. Unlock the session first, or restart without closing "
+            "(the terminal would sit at the login dialog with trading down)."
+        )
     closed = close_qmt(install_dir)
     if closed:
         time.sleep(settle_seconds)

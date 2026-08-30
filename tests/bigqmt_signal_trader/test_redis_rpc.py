@@ -8,6 +8,7 @@ import unittest
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "src"))
 
+from bigqmt_signal_trader.adapters.market_bigqmt import BigQmtMarketDataProvider
 from bigqmt_signal_trader.adapters.order_dryrun import DryRunOrderGateway
 from bigqmt_signal_trader.models import AssetSnapshot, OrderSnapshot, PositionSnapshot, TradeSnapshot
 from bigqmt_signal_trader.redis_rpc import (
@@ -1216,6 +1217,51 @@ class DownloadHistoryDataTest(unittest.TestCase):
             ("000001.SZ", "1d", "20260815", "20260819"),
         ])
         self.assertTrue(result)
+
+
+class ProbeCapabilitiesTest(unittest.TestCase):
+    """probe_capabilities：部署后只读探测 QMT 暴露的 callable。"""
+
+    def _handlers(self):
+        calls = []
+
+        def fake_credit(account_id):
+            calls.append(account_id)
+            return [{"a": 1}, {"b": 2}]
+
+        class _Ctx:
+            def get_full_tick(self, codes):
+                return {}
+
+            # get_market_data_ex 故意不提供，验证 False 分支
+
+        return BigQmtRpcHandlers(
+            account_id="acct",
+            market_data=BigQmtMarketDataProvider(_Ctx()),
+            position_provider=FakePositionProvider(),
+            qmt_api={
+                "passorder": lambda *a: None,
+                "get_assure_contract": fake_credit,
+                "get_enable_short_contract": lambda a: (_ for _ in ()).throw(RuntimeError("no credit")),
+            },
+        )
+
+    def test_probe_reports_globals_context_and_credit(self):
+        info = self._handlers().handle("probe_capabilities", {})
+
+        self.assertTrue(info["qmt_globals"]["passorder"])
+        self.assertFalse(info["qmt_globals"]["cancel"])
+        self.assertTrue(info["contextinfo_methods"]["get_full_tick"])
+        self.assertFalse(info["contextinfo_methods"]["get_market_data_ex"])
+        # 信用探测：成功的带行数，报错的带原因，未绑定的标 unavailable
+        self.assertEqual(info["credit_probe"]["get_assure_contract"]["rows"], 2)
+        self.assertFalse(info["credit_probe"]["get_enable_short_contract"]["ok"])
+        self.assertIn("no credit", info["credit_probe"]["get_enable_short_contract"]["error"])
+        self.assertFalse(info["credit_probe"]["get_debt_contract"]["available"])
+
+    def test_probe_is_read_only_and_in_whitelist(self):
+        handlers = self._handlers()
+        self.assertIn("probe_capabilities", handlers.allowed_methods)
 
 
 if __name__ == "__main__":

@@ -32,6 +32,7 @@ RPC_REVISION = "20260715-execution-snapshot-v1"
 READ_METHODS = {
     "ping",
     "get_deployment_info",
+    "probe_capabilities",
     "get_ticks",
     "get_instrument",
     "get_instrument_type",
@@ -525,6 +526,67 @@ class BigQmtRpcHandlers:
                 info["strategy_dir"] = os.path.dirname(os.path.abspath(path))
         except Exception:
             pass
+        return info
+
+    # probe 时检查的关键 QMT 运行时全局函数（存在与否决定对应能力可用性）。
+    _PROBE_QMT_GLOBALS = (
+        "passorder", "cancel", "get_trade_detail_data",
+        "download_history_data", "download_history_data2", "down_history_data",
+        "get_history_trade_detail_data", "get_value_by_order_id", "get_last_order_id",
+        "get_ipo_data", "get_new_purchase_limit",
+        "get_assure_contract", "get_enable_short_contract",
+        "get_unclosed_compacts", "get_closed_compacts", "get_debt_contract",
+        "get_option_subject_position", "get_comb_option", "get_hkt_exchange_rate",
+    )
+
+    # probe 时抽查的 ContextInfo 方法。
+    _PROBE_CONTEXT_METHODS = (
+        "get_full_tick", "get_market_data_ex", "get_market_data", "get_local_data",
+        "subscribe_quote", "subscribe_whole_quote", "unsubscribe_quote",
+        "get_trading_dates", "get_financial_data", "get_stock_list_in_sector",
+        "do_back_test", "get_trade_detail_data",
+    )
+
+    def _handle_probe_capabilities(self, params):
+        """只读能力探测：当前部署暴露了哪些 QMT callable。
+
+        部署后跑一次就能回答「这台券商 QMT 缺什么」——只读调用，不触发任何
+        委托。返回三部分：运行时全局函数绑定情况、ContextInfo 方法存在性、
+        信用接口只读探测（调用一次看是否报错/返回行数）。
+        """
+        info = {
+            "account_id": self.account_id,
+            "allow_order_methods": self.allow_order_methods,
+            "settle_orders_inline": self.settle_orders_inline,
+            "order_settle_timeout_seconds": self.order_settle_timeout_seconds,
+            "qmt_globals": {},
+            "contextinfo_methods": {},
+            "credit_probe": {},
+            "server_time": _dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        for name in self._PROBE_QMT_GLOBALS:
+            info["qmt_globals"][name] = callable(self.qmt_api.get(name))
+        context_info = getattr(self.market_data, "context_info", None)
+        for name in self._PROBE_CONTEXT_METHODS:
+            info["contextinfo_methods"][name] = callable(getattr(context_info, name, None))
+        # 信用接口只读探测：不存在的全局直接标 unavailable；存在的真调一次，
+        # 记录是否报错和返回行数（担保品/融券标的可能很多行，只计数）。
+        for name in ("get_assure_contract", "get_enable_short_contract",
+                     "get_unclosed_compacts", "get_debt_contract"):
+            func = self.qmt_api.get(name)
+            if not callable(func):
+                info["credit_probe"][name] = {"available": False}
+                continue
+            try:
+                rows = func(self.account_id) or []
+                info["credit_probe"][name] = {
+                    "available": True, "ok": True, "rows": len(rows),
+                }
+            except Exception as exc:
+                info["credit_probe"][name] = {
+                    "available": True, "ok": False,
+                    "error": "%s: %s" % (exc.__class__.__name__, exc),
+                }
         return info
 
     # ------------------------------------------------------------------
