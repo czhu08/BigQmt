@@ -341,6 +341,29 @@ def to_jsonable(value):
             }
         except Exception:
             return str(value)
+    # pandas Panel (3-D). QMT ships pandas 0.22, where get_financial_data with
+    # several stocks AND several dates still returns one. A Panel has no
+    # .columns and no .index, so it falls past the DataFrame and Series
+    # branches all the way to the __dict__ fallback -- and vars(panel) is
+    # {'_data': ..., 'is_copy': None}, which the underscore filter reduces to
+    # {'is_copy': None}. That is exactly what callers got back (issue #115):
+    # not an error, just the one public attribute the object happened to have.
+    #
+    # pandas removed Panel in 1.0, so the client cannot rebuild one even if we
+    # sent the axes. Send a DataFrame per item instead; it arrives as a dict.
+    if (hasattr(value, "major_axis") and hasattr(value, "minor_axis")
+            and hasattr(value, "items") and not isinstance(value, dict)):
+        try:
+            labels = [str(item) for item in value.items]
+            return {
+                "__bigqmt_type__": "Panel",
+                "items": labels,
+                "major_axis": [str(item) for item in value.major_axis],
+                "minor_axis": [str(item) for item in value.minor_axis],
+                "data": {str(item): to_jsonable(value[item]) for item in value.items},
+            }
+        except Exception:
+            return str(value)
     if hasattr(value, "tolist") and not isinstance(value, (str, bytes, bytearray)):
         try:
             return to_jsonable(value.tolist())
@@ -1074,7 +1097,32 @@ class BigQmtRpcHandlers:
             raise ValueError(
                 "order_type %s has no implicit buy/sell side; pass action "
                 "explicitly" % raw)
-        raise ValueError("action or order_type is required")
+        if raw in (None, ""):
+            raise ValueError("action or order_type is required")
+        # An order_type WAS supplied and was not recognised. Saying "required"
+        # here sent a reporter looking at their own call for twenty minutes
+        # (issue #92): the real answer is almost always that the package
+        # deployed inside QMT predates the type they are using, and a
+        # client-side pip upgrade cannot fix that -- this code runs in QMT.
+        raise ValueError(
+            # ASCII only: this text is written to QMT's own log, which drops
+            # non-ASCII characters (a Chinese install path came back mangled).
+            "order_type %r is not recognised by the package deployed in QMT "
+            "(%s). Credit order types (27-32, and 40-45 special) need 0.3.1 "
+            "or newer HERE, in the QMT python directory -- upgrading the "
+            "client with pip does not change this file. Run "
+            "xt_trader.sync_deployment(), restart the strategy, then check "
+            "xtdata.get_deployment_info()." % (raw, self._deployed_version()))
+
+    @staticmethod
+    def _deployed_version():
+        """Never raises: this only ever runs while building an error message."""
+        try:
+            from bigqmt_signal_trader.version import __version__
+
+            return __version__
+        except Exception:
+            return "unknown version"
 
     def _credit_order_type_from_params(self, params):
         """The MiniQMT order_type to forward, when it is a credit operation."""

@@ -364,6 +364,13 @@ def _restore_jsonable(value):
                 return pd.DataFrame(value.get("records") or [], columns=value.get("columns") or None)
             except Exception:
                 return value.get("records") or []
+        if marker == "Panel":
+            # pandas dropped Panel in 1.0, so a 3-D object cannot be rebuilt on
+            # a modern client. It comes back as what a caller can actually use:
+            # {item: DataFrame} (issue #115). The axis labels ride along for
+            # anyone who needs to know how the cube was sliced.
+            return {key: _restore_jsonable(item)
+                    for key, item in (value.get("data") or {}).items()}
         if marker == "Series":
             try:
                 import pandas as pd
@@ -529,7 +536,7 @@ class BigQmtRpcClient:
             if timeout_seconds is not None
             else config_timeout
             if config_timeout is not None
-            else _env_float("BIGQMT_RPC_TIMEOUT_SECONDS", 6.0)
+            else _env_float("BIGQMT_RPC_TIMEOUT_SECONDS", DEFAULT_RPC_TIMEOUT_SECONDS)
         )
         config_download_wait = client_config.get("download_wait_seconds")
         self.download_wait_seconds = float(
@@ -878,6 +885,15 @@ def ipo_market_of(code):
 MARKET_TOKENS = frozenset({"SH", "SZ", "BJ", "HK"})
 # Above this many explicit codes, one RPC's single timeout starts to matter more
 # than the extra payload of reading the exchange and filtering (issue #104).
+# Measured against a live bridge: query_orders 1.5s, get_asset 1.4s,
+# get_financial_data 0.8s warm, a whole-market get_full_tick 7.7s. The old
+# 6s default sat under the cost of ordinary QMT data calls, and timing out
+# here is worse than waiting: the bridge keeps working on the abandoned
+# request, so the next call queues behind it and one timeout breeds more.
+# 30s is also what the whole-market snapshot path already used, so there is
+# one number rather than two.
+DEFAULT_RPC_TIMEOUT_SECONDS = 30.0
+
 LARGE_CODE_LIST = 1000
 # What the fallback reads first. Stocks are 8.7% of an exchange listing, so
 # starting narrow is 1.08s against 7.4s; it widens to "all" only if that misses.
@@ -1180,8 +1196,9 @@ class BigQmtXtData:
         Args:
             code_list: stock codes to query.
             timeout_seconds: per-request RPC timeout. None = auto (30s for whole-market
-                snapshots, else client default 120s). Callers can pass a larger value
-                when querying many codes (e.g. 1256 ETF options may need 150-180s).
+                snapshots, else the client default, DEFAULT_RPC_TIMEOUT_SECONDS).
+                Callers can pass a larger value when querying many codes (e.g. 1256
+                ETF options may need 150-180s).
         """
         codes = list(code_list or [])
         if not codes:

@@ -14,6 +14,148 @@
 
 - **qmt_launcher 锁屏防护**：`restart_qmt` 在会话锁屏且需要自动登录时直接拒绝执行（否则关掉终端却登不回去，交易中断）；新增 `session_is_locked()` 检测。
 
+## [0.3.4] - 2026-08-30
+
+### 修复
+
+- **回测：三个报告，两个原因**（Issue #109，@wolfeee）
+
+  **弃用提示和 `不支持'prev_close'数据字段` 是同一个 bug。** `ContextInfo.get_history_data` 只提供 `open` / `high` / `low` / `close` / `quoter` 五个字段（API 参考 5.2），且标着【不推荐】。而 bar 提取器把它想要的**每个**字段都拿去问它——`prev_close`、`preClose`、`lastClose`、`volume`、`amount`。这些问必然失败，而且**每问一次 QMT 就往自己的日志里写一行 ERROR**，每字段 × 每周期 × 每根 K 线。
+
+  更没道理的是：提取器本来就用上一根 K 线的收盘价填 `prev_close`，所以这些问从头到尾没有可能有收益。现在先用主推接口 `get_market_data_ex`，`get_history_data` 只问它真正有的字段。
+
+  **停止后重启 bind 失败是真的端口泄漏。** `stop()` 只告诉引擎回测结束，从没停过 ZMQ 服务——端口继续被一个已经不存在的策略占着（回测界面的停止按钮走的正是这条路径）。而且 `stop_server()` 只设标志就返回，服务线程最多 `poll_ms` 之后才关 socket，`init()` 紧接着就 bind 下一个。端点是固定端口，没有退到随机端口的余地，这个竞态的结果只能是 EADDRINUSE。
+
+  现在 `stop()` 会停服务，`stop_server()` 会等 socket 真的关闭。bind 失败也会保留原因——光一句 `failed to bind` 会让人往错方向查，带上 `Address in use` 才知道有一个跑着的回测要先停。
+
+- **客户端默认 RPC 超时从 6s 提到 30s**：验证 0.3.3 部署时发现 `get_financial_data` 对着一个健康的桥超时了。同一个桥上实测：`query_orders` 1.5s、`get_asset` 1.4s、`get_financial_data` 0.8s（热）、整市场 `get_full_tick` 7.7s。
+
+  **超时比等待更糟**：请求已经到桥那边，桥会继续做完，只是客户端不听了。下一个调用就排在一份没人要的工作后面——**一次超时繁殖出更多超时**（实测中三个调用连续各超过 45s，正是桥在消化上一轮被 6s 掐掉的请求）。不会串号：transport 按 `request_id` 匹配响应，迟到的被丢弃。
+
+  选 30s 是因为整市场快照那条路径本来就用 30s，现在是一个数而不是两个。`timeout_seconds=` 参数与 `BIGQMT_RPC_TIMEOUT_SECONDS` 环境变量照旧优先。
+
+  **两个配置模板也带着 `6.0`** —— example，以及 `bigqmt-init` 给每个新用户生成的那份。只改默认值的话，跑过 init 的人都拿不到这个修复。三处由测试一起钉住。
+
+  顺带更正 `get_full_tick` 文档字符串里「client default 120s」的错误说法。
+
+### 已实盘验证（0.3.3 部署，本次确认）
+
+- ✅ **多股多日期财务数据**（Issue #115）：双股 + 日期区间返回 `{'000017.SZ': DataFrame(159 行), '000001.SZ': DataFrame(159 行)}`，0.16s。修复前这里是 `{'is_copy': None}`。
+- ✅ **未知 order_type 的新报错**（Issue #92）：`9999` 得到指名版本的新消息；`27` **被接受**（卡在后面的 `stock_code is required`），证明信用类型在部署端已生效；无参数时保持原消息；`32` 报「无隐含买卖方向」。
+- ✅ **`types=` 收窄**（Issue #104）：`['stock']` 1.13s / 2315 只，`['all']` 7.74s / 26744 只，默认 0.85s / 2315 只。
+
+### 已知限制
+
+- **回测修复未实盘验证**：跑在 QMT 回测进程里，需要走一遍「启动 → 停止 → 再启动」。
+- **信用委托 27 / 28 / 40 到达券商的品种未验证**：RPC 层已确认接受，但是否真的作为融资买入送达券商仍需信用账户实单。
+- **撤单返回值未实盘验证**：需要一笔真实可撤委托。
+- **订单号形态未在实盘记录上验证**：验证当日账户无委托无成交。
+- **期货行情**：本机无期货权限。
+
+---
+
+## [0.3.3] - 2026-08-30
+
+### 修复
+
+- **未知 `order_type` 的报错误导性极强**（Issue #92）：传 `order_type=27` 得到的回应是 `action or order_type is required`——可调用方明明传了。报告人因此两次回来贴同一份 traceback，间隔半小时，一字不差；两次都在检查自己的调用。
+
+  真正的原因报错里一个字都没提：**QMT 目录里部署的那份包早于信用委托类型**。这段代码跑在 QMT 里，客户端 `pip install --upgrade` 碰不到它。
+
+  根因是那个检查**没有区分**「没传 order_type」和「传了但不认识」，两种情况共用同一条消息。现在分开：
+
+  - 没传 → 保持原消息 `action or order_type is required`
+  - 传了但不认识 → 说清楚是**哪个值**、**哪个版本**拒绝的、以及**升级客户端没用**
+
+  ```
+  order_type 9999 is not recognised by the package deployed in QMT (0.3.3).
+  Credit order types (27-32, and 40-45 special) need 0.3.1 or newer HERE, in
+  the QMT python directory -- upgrading the client with pip does not change
+  this file. Run xt_trader.sync_deployment(), restart the strategy, then check
+  xtdata.get_deployment_info().
+  ```
+
+  消息是**纯 ASCII** 的：QMT 的日志写入会丢非 ASCII 字符（本项目遇到过中文安装路径被吞成乱码），一条乱码的报错帮不上任何人。这一点由测试钉住。
+
+### 已知限制
+
+- 同 0.3.2。**信用委托类型（27/28/40）仍未实盘验证**——@fengzhizialex 已确认信用账户的资产与持仓正常（Issue #92），下单类型待其完成部署后验证。
+
+---
+
+## [0.3.2] - 2026-08-30
+
+### ⚠️ 破坏性变更：`cancel_order_stock` 的返回值
+
+**撤单以前返回 `True` / `False`，现在返回 `0`（成功）/ `-1`（失败），与 MiniQMT 一致。**
+
+```python
+# 需要改
+if xt_trader.cancel_order_stock(acc, order_id):      # ✗
+# 改成
+if xt_trader.cancel_order_stock(acc, order_id) == 0: # ✓
+```
+
+这是有意向 MiniQMT 契约靠拢。原来的 bool **把判断反过来了**：MiniQMT 的写法是 `== 0`，而 Python 里 `False == 0` 为 True，所以撤单**失败**被读成成功，**成功**被读成失败。而我们自己的异步回调早就在用 `cancel_result=0` 表示成功，同一套 API 的两半互相矛盾。
+
+### 修复
+
+- **返回类型与 MiniQMT 不符**（Issue #113，@tokens-lin）：报的是 `order_stock` 返回字符串而不是数字。顺着查了整个接口面，同类问题三处：
+
+  | 接口 | MiniQMT | 修复前 |
+  |---|---|---|
+  | `order_stock()` | `int`（失败 -1） | `str` 合同编号 |
+  | `cancel_order_stock()` | `int`（0 成功） | `bool` |
+  | `XtOrder.order_id` / `XtTrade.order_id` | `int` | `str` |
+
+  另有一个边角：委托被拒时服务端返回的是**字符串** `"-1"`，它 truthy 且永不等于 `-1`，所以废单也被读成成功。
+
+  大 QMT 没有 int 委托编号可给——`get_trade_detail_data` 只有 `m_strOrderSysID` 字符串。所以订单号做成 int 子类，两种形态同时成立：
+
+  ```python
+  order_id = xt_trader.order_stock(acc, "600000.SH", 23, 100, 11, 10.0, "s", "")
+
+  isinstance(order_id, int)   # True，MiniQMT 写法照常
+  order_id > 0                # True
+  str(order_id)               # '合同编号'，券商原始串
+  xt_trader.cancel_order_stock(acc, order_id)   # 撤单送回原始串
+  ```
+
+  纯数字编号（多数券商）int 值就是那个数字；非数字的给一个稳定正数替身，撤单仍用真实串。存进数据库变成普通 int 也能撤单——客户端记最近 4096 个映射。想要字符串用 `.order_sysid`，它一直是 str。
+
+  同样规则用于回调对象 `XtOrderError` / `XtCancelError` / `XtOrderResponse` 的 `order_id`。
+
+  原有 4 个测试文件里 **9 处断言把旧的字符串/布尔契约写死了**，测试与代码基于同一个错误前提，所以一直全绿。这些断言已改正。
+
+- **多股多日期财务数据只返回 `{'is_copy': None}`**（Issue #115，@jerry87n 精确定位）：QMT 的 pandas 0.22 下，`get_financial_data` 多股 **且** 多日期时返回的是 Panel。Panel 既没有 `.columns` 也没有 `.index`，一路穿过序列化层的 DataFrame 分支和 Series 分支，落到 `__dict__` 兜底——而 `vars(panel)` 是 `{'_data': ..., 'is_copy': None}`，下划线过滤后正好剩那一个。
+
+  不报错，没数据。单股或单日期返回 DataFrame，走得通，所以藏得久。
+
+  pandas 1.0 已删除 Panel，客户端重建不出来，因此现在返回客户端能用的形态：`{股票代码: DataFrame}`，轴标签一并带回。
+
+### 文档
+
+- **README 新增「与 MiniQMT 的兼容性对照」**（Issue #113 的原始诉求）：返回值对照表、int/str 双形态订单号、以及会咬人的行为差异（`types=` 默认值、`account_type` 不会从客户端传到服务端、xtconstant 与 passorder 两套编号）。
+
+- **更正 `qmt_launcher` 一段错误描述**：README 原先称 `login` 模式用 `win32api.SendMessage`、锁屏下也能工作。代码从 #45 起就相反——用 `keybd_event` 物理输入，要求对话框在前台，`session_is_locked()` 为真时直接抛异常拒绝。要**无人值守定时重启**请用 `linkmini` / `bat` / `exe`，只有 `login` 受此限制（Issue #116）。
+
+### 已知限制
+
+- **撤单返回值未实盘验证**：需要一笔真实可撤委托，本机没有。类型层面单测覆盖完整。
+- **Panel 修复未实盘验证**：改动跑在 QMT 内，需部署 + 重启策略后用一次多股多日期真实调用确认。
+- **信用委托仍未实盘验证**（0.3.1 起）：@fengzhizialex 已确认信用账户的**资产与持仓**正常（Issue #92），但 `order_type=27/28/40` 到达券商时是否为对应品种仍待验证。
+- 其余同 0.3.1。
+
+### 部署提醒
+
+Panel 修复在**服务端**（`redis_rpc.py` 跑在 QMT 里），只 `pip install --upgrade` 不生效——要把包拷进 QMT 的 python 目录并**重启策略**：
+
+```python
+xt_trader.sync_deployment()   # 自动拷，不碰 config 文件
+```
+
+---
+
 ## [0.3.1] - 2026-08-30
 
 ### 修复
