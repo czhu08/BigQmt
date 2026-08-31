@@ -936,8 +936,9 @@ def _notice_field_list_cost(field_list):
     """Say once that naming fields is what enables the fast path.
 
     Not a warning about a mistake: an empty field_list correctly returns all 11
-    columns and only RPC can do that. But the 30x is invisible unless someone
-    tells you it exists (issue #104)."""
+    columns and only RPC can do that. But the speedup is invisible unless
+    someone tells you it exists (issue #104). Asking for a field the direct
+    path lacks is safe -- it falls back to RPC rather than returning NaN."""
     if field_list or _FIELD_LIST_NOTICE["shown"]:
         return
     _FIELD_LIST_NOTICE["shown"] = True
@@ -945,8 +946,10 @@ def _notice_field_list_cost(field_list):
         log.info(
             "get_market_data_ex with an empty field_list returns all 11 columns "
             "and must go over RPC. If the six OHLCV columns %s are enough, pass "
-            "them as field_list -- that path is served by FormulaServer, ~30x "
-            "faster (0.03s vs 0.97s measured).", ", ".join(DIRECT_PATH_FIELDS))
+            "them as field_list -- that path is served by FormulaServer, 0.015s "
+            "against 5.8s measured. Naming preClose / suspendFlag / "
+            "settelementPrice / openInterest falls back to RPC, so a wider "
+            "field_list is safe, just not faster.", ", ".join(DIRECT_PATH_FIELDS))
     except Exception:
         pass
 
@@ -1238,20 +1241,42 @@ class BigQmtXtData:
             rpc_timeout = timeout_seconds
         else:
             rpc_timeout = 30 if upper_codes & {"SH", "SZ", "BJ", "HK"} else None
+        failure = None
         try:
             data = self.client.call(
                 "get_full_tick", _full_tick_params(codes, types),
                 timeout_seconds=rpc_timeout) or {}
-        except Exception:
+        except Exception as exc:
             data = None
+            failure = exc
             if not self._can_fall_back_to_markets(codes, upper_codes):
                 raise
         if self._should_fall_back(codes, upper_codes, data):
-            recovered = self._full_tick_via_markets(codes, rpc_timeout, types)
+            fallback_errors = []
+            recovered = self._full_tick_via_markets(
+                codes, rpc_timeout, types, errors=fallback_errors)
             if recovered is not None:
                 return recovered
-            if data is None:
-                raise
+            if failure is not None:
+                # A bare `raise` here has no active exception -- the except
+                # block above has already exited -- so it produced
+                # "RuntimeError: No active exception to reraise" and buried
+                # the real timeout (reported on issue #104). Re-raise the
+                # actual failure, and say why the recovery did not help.
+                if fallback_errors:
+                    log.warning(
+                        "get_full_tick: %d codes failed directly (%s) and the "
+                        "market re-read failed too (%s: %s); raising the "
+                        "original failure.",
+                        len(codes), failure,
+                        fallback_errors[-1].__class__.__name__,
+                        fallback_errors[-1])
+                else:
+                    log.warning(
+                        "get_full_tick: %d codes failed directly (%s) and "
+                        "could not be recovered from a market read.",
+                        len(codes), failure)
+                raise failure
         return data or {}
 
     def _can_fall_back_to_markets(self, codes, upper_codes):
@@ -1272,7 +1297,7 @@ class BigQmtXtData:
         # than was asked for (issue #104).
         return len(data) < len(set(str(c) for c in codes))
 
-    def _full_tick_via_markets(self, codes, rpc_timeout, types=None):
+    def _full_tick_via_markets(self, codes, rpc_timeout, types=None, errors=None):
         """Read the exchange(s) these codes live on, then filter to them.
 
         A long explicit list is one RPC carrying one timeout, so it either fits
@@ -1304,7 +1329,11 @@ class BigQmtXtData:
                     for key, value in snapshot.items():
                         if str(key) in wanted:
                             merged[key] = value
-            except Exception:
+            except Exception as exc:
+                # Swallowing the reason here left the caller with nothing to
+                # report; hand it back so the raise can name it (issue #104).
+                if errors is not None:
+                    errors.append(exc)
                 return None
             if len(merged) >= len(wanted):
                 break          # everything asked for; no need to widen
@@ -1412,11 +1441,15 @@ class BigQmtXtData:
         ``chunk_size=0`` restores the old single-request behaviour.
 
         An empty ``field_list`` means "every field", which only the RPC path can
-        answer -- FormulaServer serves the six OHLCV columns and returns NaN for
-        settelementPrice / openInterest / preClose / suspendFlag, where RPC has
-        real values (preClose 9.07 against nan, measured). So the default stays
-        on RPC rather than quietly handing back NaN; naming the six fields you
-        actually want is what unlocks the ~30x direct path (issue #104).
+        answer: FormulaServer has the six bar columns plus time, and not the
+        four daily ones (settelementPrice, openInterest, preClose,
+        suspendFlag). Naming the fields you actually want is what unlocks the
+        direct path -- 0.015s against 5.8s, measured (issue #104).
+
+        Asking it for a field it lacks is now refused at the router and served
+        by RPC instead. It used to answer with a column of NaN, so naming all
+        eleven columns looked like a free speedup and quietly cost four of them
+        (see formula_server.SERVED_FIELDS).
         """
         _notice_field_list_cost(field_list)
         codes = list(stock_list or [])

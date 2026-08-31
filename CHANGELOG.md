@@ -14,6 +14,93 @@
 
 - **qmt_launcher 锁屏防护**：`restart_qmt` 在会话锁屏且需要自动登录时直接拒绝执行（否则关掉终端却登不回去，交易中断）；新增 `session_is_locked()` 检测。
 
+## [0.3.6] - 2026-08-31
+
+### 修复
+
+- **可转债的最小申报量、市场推断与报价精度**（PR #121）：三处同一个原因——代码里没有「债券」这个概念，一律按股票处理。
+
+  | 位置 | 修复前 | 后果 |
+  |---|---|---|
+  | `code_utils.min_lot()` | 可转债返回 100 | `round_buy_volume` 把一手转债算成 `(10 // 100) * 100 == 0`，**单子直接废掉** |
+  | `code_utils.normalize_stock_code()` | 裸 6 位码按「5/6 开头 = 沪市」 | 沪市转债 110/111/113/118/132 都是 `1` 开头，**被判到深市**，拿去下单是另一只票 |
+  | `price_engine._price_precision()` | 只把 15/16/51/52 当 3 位小数 | 转债报价精度同样是 0.001，按 2 位取整会被交易所拒单 |
+
+  是在给 [bigqmt-dashboard](https://github.com/litaolemo/bigqmt_dashboard) 接可转债交易时踩出来的。
+
+- **直连路径对四个字段静默返回 NaN**（Issue #104）：FormulaServer 直连**接受任何字段名**，对它没有的四个字段不报错，而是返回一整列 `NaN`。实盘量的：
+
+  ```
+  field_list=[...11 个字段名...]   0.015s   preClose=nan   suspendFlag=nan
+  field_list=[]                    (RPC)    preClose=9.0   suspendFlag=0
+  ```
+
+  同样的列、同样的形状、快 12 倍、数据静默错了。而这正是有人在被告知「写明字段名能走快路径」之后会做的事——客户端自己还打印了这条提示。
+
+  `settelementPrice` / `openInterest` / `preClose` / `suspendFlag` 是**日频元数据**，不是 K 线数据，所以直连缺的正好是这四个。
+
+  现在沿用 `dividend_type` 与 `period=tick` 已有的规矩：**这条路径答不诚实的请求，交给 RPC**。用白名单（`open/high/low/close/volume/amount/time/stime`）而不是黑名单——不认识的字段名走 RPC 只是慢，猜它「大概能供」则可能静默出错，而这个 bug 正是这么来的。
+
+- **文件损坏时抛裸 `NameError`**（Issue #102，@huliangyu）：他的策略文件第一行是一串 200 字符的 token，不是代码。Python 把它当变量名求值，报出：
+
+  ```
+  File "...\bigqmt_signal_trader_strategy.py", line 1, in <module>
+      MiFBOecYoHXT4UUBBOIr3m5aTVbA5Rbt6OnG52cfBT5EAtPG9kA7kQnEsKu...
+  NameError: name 'MiFBOecYoHXT4UUB...' is not defined
+  ```
+
+  这条报错**看不出文件坏了**，所以第一反应的答复是「可能是版本问题，重新部署」——而那对这个文件无效，**换任何版本都一样报错**。
+
+  加载器现在在 exec 失败时看一眼第一行像不像 Python，像 token 就直说，并明确指出「换版本没用」。判定**故意做窄**：40 字符以上、无空白、字符全在 base64 字母表内——满足这三条的 Python 行只可能是裸标识符，本来就是坏代码。
+
+  两个入口脚本（`BIGQMT_REDIS_DRYRUN.py` / `BIGQMT_ZMQ_BACKTEST.py`）各内联一份；它们是引导包的入口，不能反过来 import 包里的工具。
+
+### 已实盘验证（本版全部改动）
+
+- ✅ **字段守卫**：六列快路径 0.016s 不变；六列 + `preClose` 回落 RPC 返回**真值 9.0**（原为 `nan`）；显式写全 11 列返回四列真值（`preClose=9.0` / `suspendFlag=0` / `openInterest=13`），与 `field_list=[]` 对照一致。1m / 5m / 1d 三周期行为一致，陌生字段名（`turnoverRate` 等）实盘确认回落 RPC。
+- ✅ **损坏文件报错**：端到端跑真实加载器——正常模块照常加载，`undefined_name_here` 仍抛它自己的 `NameError`（守卫够窄），token 文件给出新消息。**并在部署到 QMT 目录后，用 QMT 里那份实际执行的入口脚本复验通过。**
+
+### 说明
+
+- **如果你把入口脚本改过名**（例如 `BIGQMT_REDIS_DRYRUN.py` → `BIGQMT_REDIS.py`），`sync_deployment()` **不会更新它**——它只刷新部署目录里已存在的同名文件。改过名的入口需要手动重新拷一份。
+
+### 已知限制
+
+同 0.3.5：回测「启动 → 停止 → 再启动」、信用委托 27/28/40 到达券商的品种、撤单返回值、订单号双形态、长列表恢复的失败路径、期货行情，均待实盘验证。
+
+---
+
+## [0.3.5] - 2026-08-31
+
+### 修复
+
+- **长代码列表恢复失败时抛出无意义的错误**（Issue #104，@frank0532 在 0.3.4 上报告）：
+
+  ```
+  File ".../xtquant_compat.py", line 1163, in get_full_tick
+      raise
+  RuntimeError: No active exception to reraise
+  ```
+
+  这是 0.3.1 引入恢复逻辑时留下的 bug。那个 `raise` 在 `except` 块**外面**——except 已经退出，没有活跃异常可重新抛出，于是**真正发生的超时被换成了一条毫无意义的错误**。
+
+  而且重读那边把自己的失败原因也吞了（`except Exception: return None`），所以即便修好 `raise`，仍然没有任何地方知道恢复为什么没成功。
+
+  现在：原始异常按**原类型**重新抛出（写 `except TimeoutError` 的调用方照旧接得住），重读失败的原因写进 warning 日志。
+
+  > 这让报错变得有用，**并不保证超长列表一定能成功**。要全量数据，市场令牌始终更快：`get_full_tick(["SH"], types=["all"])`，7.7s 一次请求。
+
+### 已实盘验证（本次新增）
+
+- ✅ **`subscribe_quote` 的分周期 K 线订阅**（@frank0532 在 #104 问及）：盘中实测 `period="1m"`，210 秒内 4 次回调，bar 时间戳精确间隔 60 秒；`1m` / `5m` / `1d` 均返回 `{code: DataFrame}`，列为 `time/open/high/low/close/volume/amount`。该能力自 0.3.0 起即已具备，此前从未实盘确认过。
+
+### 已知限制
+
+- **`passorder` 被调用但委托不出现**：若桥的策略运行在 QMT 的**编辑器**界面，`passorder` 会静默什么都不做（QMT 文档 1.2：「编辑器里执行的下单函数不会产生实际委托」；回测/模拟信号模式同理）。这不是桥的缺陷，但表现为 `passorder submitted but order not found in system`。请确认策略在**模型交易**界面运行。
+- 其余同 0.3.4：回测「启动 → 停止 → 再启动」、信用委托 27/28/40 到达券商的品种、撤单返回值、订单号双形态、期货行情，均待实盘验证。
+
+---
+
 ## [0.3.4] - 2026-08-30
 
 ### 修复
