@@ -149,6 +149,11 @@ def _load_local_module(name):
     return module
 
 
+# Names proven not to be modules. A miss costs a full sys.path
+# walk, so it is worth remembering; a hit never changes back.
+_MISSING_LOCAL_MODULES = set()
+
+
 def _local_import(name, module_globals=None, module_locals=None, fromlist=(), level=0):
     absolute_name = _resolve_name(name, module_globals, level)
     if not _is_local(absolute_name):
@@ -156,10 +161,21 @@ def _local_import(name, module_globals=None, module_locals=None, fromlist=(), le
     module = _load_local_module(absolute_name)
     for child in fromlist or ():
         if child != "*":
+            child_name = absolute_name + "." + child
+            # A fromlist entry is usually an attribute, not a submodule.
+            # Looking one up walks _SOURCE_ROOT plus every sys.path entry
+            # doing os.path.isfile, then raises -- and nothing remembered the
+            # answer, so it ran again on EVERY `from X import Y` in the
+            # sandbox. Measured in the live terminal: a ping whose handler is
+            # one such import took 1493ms in handle(); with the miss
+            # remembered it takes 0ms, and the round trip went from ~1800ms to
+            # ~95-200ms.
+            if child_name in _MISSING_LOCAL_MODULES:
+                continue
             try:
-                _load_local_module(absolute_name + "." + child)
+                _load_local_module(child_name)
             except ModuleNotFoundError:
-                pass
+                _MISSING_LOCAL_MODULES.add(child_name)
     if fromlist:
         return module
     return _load_local_module(absolute_name.split(".", 1)[0])

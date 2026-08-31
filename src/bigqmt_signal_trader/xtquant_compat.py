@@ -30,7 +30,7 @@ from xtquant.xttype import StockAccount
 from .full_tick_cache import request_full_tick_cache, wait_full_tick_cache
 from .local_cache import LocalMarketCache
 from .order_id import OrderId, order_sys_id_of
-from .redis_rpc import call_redis_rpc
+from .redis_rpc import TYPED_PAYLOAD_FLAG, call_redis_rpc
 from .logging_setup import get_logger
 
 log = get_logger("xtquant_compat")
@@ -403,6 +403,75 @@ def _parse_qmt_stime(value):
     return None
 
 
+# FormulaServer 快照滞后检测：实测它会把 1m 数据冻结数小时（11:30 后不再
+# 更新，收盘后还在发午间数据）。对直连回答的 intraday 数据做时间差检测：
+# 滞后即告警 + 本次自动回落 RPC 桥拿实时数据，并在冷却期内跳过直连
+# （冷却到期自动重新探测，自愈）。
+_FORMULA_STALE_INTRADAY_PERIODS = ("tick", "1m", "3m", "5m", "15m", "30m", "1h")
+_FORMULA_STALE_WARN_LAG_SECONDS = 30 * 60
+_FORMULA_STALE_COOLDOWN_SECONDS = 120.0
+_formula_stale_warned = {}
+_formula_stale_until = {"ts": 0.0}
+
+
+def _formula_bars_stale(data, params):
+    """返回 (code, newest_dt, lag_seconds) 或 None。只检测，不告警。"""
+    try:
+        period = str((params or {}).get("period") or "").lower()
+        if period not in _FORMULA_STALE_INTRADAY_PERIODS:
+            return None
+        now = _dt.datetime.now()
+        today = now.date()
+        for code, df in (data or {}).items():
+            # 公式直连返回的帧时间轴在 stime 列（RangeIndex），
+            # 兼容层归一化后的帧在索引上——两种形态都认。
+            newest_value = None
+            for col in ("stime", "time"):
+                if col in list(getattr(df, "columns", [])):
+                    newest_value = df[col].iloc[-1]
+                    break
+            if newest_value is None:
+                index = getattr(df, "index", None)
+                if index is not None and len(index):
+                    newest_value = index[-1]
+            newest = _parse_qmt_stime(newest_value)
+            if newest is None:
+                continue
+            lag = (now - newest).total_seconds()
+            if (newest.date() < today) or (lag > _FORMULA_STALE_WARN_LAG_SECONDS):
+                return (str(code), newest, lag)
+    except Exception:
+        pass
+    return None
+
+
+def _warn_stale_formula_bars(data, params, hit=None):
+    try:
+        period = str((params or {}).get("period") or "").lower()
+        today = _dt.datetime.now().date()
+        if hit is None:
+            hit = _formula_bars_stale(data, params)
+        if hit is None:
+            return
+        code, newest, lag = hit
+        key = (code, period, str(today))
+        if _formula_stale_warned.get(key):
+            return
+        _formula_stale_warned[key] = True
+        log.warning(
+            "FormulaServer data looks stale for %s %s: newest bar %s lags now by %.0fs. "
+            "Falling back to the RPC bridge for live reads (cooldown %.0fs).",
+            code, period, newest, lag, _FORMULA_STALE_COOLDOWN_SECONDS,
+        )
+    except Exception:
+        pass
+
+
+def _formula_stale_active():
+    """冷却期内跳过公式直连（检测到滞后之后的一段时间）。"""
+    return time.time() < _formula_stale_until.get("ts", 0.0)
+
+
 def _qmt_stime_index(value):
     digits = _digits_only(value)
     if len(digits) >= 14:
@@ -696,7 +765,7 @@ class BigQmtRpcClient:
                 self._formula_router_instance = _Disabled()
         return self._formula_router_instance
 
-    def call(self, method, params=None, account_id=None, timeout_seconds=None):
+    def call(self, method, params=None, account_id=None, timeout_seconds=None, use_formula=True):
         target_account = str(account_id or self.account_id or "")
         if not target_account:
             raise ValueError(_missing_account_id_message())
@@ -705,12 +774,33 @@ class BigQmtRpcClient:
         # FormulaServer, bypassing the strategy process and its GIL. Anything it
         # declines (unmapped method, untranslatable params, server down) raises
         # Unroutable and drops through to the RPC bridge below.
-        router = self._formula_router()
-        if router.supports(method):
+        # use_formula=False 用于必须拿到最新数据的调用（如 subscribe_quote 的
+        # 盘中形成 bar 轮询）——FormulaServer 的快照可能滞后数小时（实测盘中
+        # 11:30 后冻结），形成 bar 只能走 RPC 桥读 QMT 实时数据。
+        router = self._formula_router() if use_formula else None
+        # 冷却期（公式数据刚被检出滞后）只对 get_market_data_ex 跳过直连——
+        # 其他方法是静态参考数据，不受时间序列滞后影响，照常走快速路径。
+        skip_formula = (
+            router is not None
+            and method == "get_market_data_ex"
+            and _formula_stale_active()
+        )
+        if router is not None and router.supports(method) and not skip_formula:
             from .formula_server import Unroutable
 
             try:
-                return _restore_jsonable(router.call(method, params or {}))
+                result = _restore_jsonable(router.call(method, params or {}))
+                if method == "get_market_data_ex":
+                    # 直连快照可能滞后（实测冻结数小时）——滞后即告警、
+                    # 本次调用自动回落 RPC 桥拿实时数据，并进入冷却期
+                    # 让后续调用直接跳过直连（到期重新探测，自愈）。
+                    hit = _formula_bars_stale(result, params or {})
+                    if hit is not None:
+                        _warn_stale_formula_bars(result, params or {}, hit=hit)
+                        _formula_stale_until["ts"] = time.time() + _FORMULA_STALE_COOLDOWN_SECONDS
+                        return self.call(method, params, account_id=account_id,
+                                         timeout_seconds=timeout_seconds, use_formula=False)
+                return result
             except Unroutable:
                 pass
         transport = self._transport()
@@ -742,6 +832,12 @@ class BigQmtRpcClient:
         server_error = str(response.get("server_error") or "")
         if server_error:
             raise RuntimeError("Big QMT %s server_error: %s" % (method, server_error))
+        # The transport already scanned the raw text for a typed envelope; when
+        # it found none there is provably nothing to rebuild, and skipping the
+        # walk turns 345.9ms into 3.7ms on a 51285-instrument snapshot. A None
+        # flag means the text was never seen (in-process routing), so walk.
+        if response.pop(TYPED_PAYLOAD_FLAG, None) is False:
+            return response.get("data")
         return _restore_jsonable(response.get("data"))
 
     # ------------------------------------------------------------------
@@ -1403,9 +1499,14 @@ class BigQmtXtData:
         # Self-heal adjusted reads (all-zero bars -> server raw download + retry).
         return self._heal_adjusted("get_market_data", params, data)
 
-    def _get_market_data_ex_batch(self, params, timeout_seconds=None):
+    def _get_market_data_ex_batch(self, params, timeout_seconds=None, use_formula=True):
         """One RPC's worth of bars, healed and normalized. No caching."""
-        data = self.client.call("get_market_data_ex", params, timeout_seconds=timeout_seconds)
+        if use_formula:
+            data = self.client.call("get_market_data_ex", params, timeout_seconds=timeout_seconds)
+        else:
+            # 只在绕路时显式传参——保持既有调用方/桩签名不变。
+            data = self.client.call("get_market_data_ex", params, timeout_seconds=timeout_seconds,
+                                    use_formula=False)
         # Self-heal adjusted reads (all-zero bars -> server raw download + retry).
         data = self._heal_adjusted("get_market_data_ex", params, data, timeout_seconds=timeout_seconds)
         # Normalize Big QMT's stime-indexed frame to MiniQMT shape (time-indexed).
@@ -1425,6 +1526,7 @@ class BigQmtXtData:
         fill_data=True,
         chunk_size=None,
         timeout_seconds=None,
+        use_formula=True,
     ):
         """Pull bars over RPC, in batches of ``chunk_size`` codes.
 
@@ -1466,7 +1568,8 @@ class BigQmtXtData:
 
         if step <= 0 or len(codes) <= step:
             data = self._get_market_data_ex_batch(
-                dict(base, stock_list=codes), timeout_seconds=timeout_seconds
+                dict(base, stock_list=codes), timeout_seconds=timeout_seconds,
+                use_formula=use_formula,
             )
         else:
             data = {}
@@ -1475,7 +1578,8 @@ class BigQmtXtData:
                 batch = codes[index:index + step]
                 try:
                     part = self._get_market_data_ex_batch(
-                        dict(base, stock_list=batch), timeout_seconds=timeout_seconds
+                        dict(base, stock_list=batch), timeout_seconds=timeout_seconds,
+                        use_formula=use_formula,
                     )
                 except Exception as exc:
                     # Losing one batch must not lose the others: a partial
@@ -1693,9 +1797,13 @@ class BigQmtXtData:
         seq = self._next_seq()
 
         def fetch():
+            # 盘中形成 bar 必须读 QMT 实时数据——FormulaServer 快照可能滞后数
+            # 小时（实测 11:30 后冻结，收盘后还停在午间数据），订阅推送如果走
+            # 直连会把"刚完成的 bar"发成数小时前的旧快照（issue #104 实测）。
             return self.get_market_data_ex(
                 stock_list=[stock_code], period=period,
-                start_time=start_time, end_time=end_time, count=count or 1)
+                start_time=start_time, end_time=end_time, count=count or 1,
+                use_formula=False)
 
         poller = _BarPoller(
             fetch, callback, self._bar_poll_interval_seconds(),

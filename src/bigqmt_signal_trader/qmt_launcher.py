@@ -4,10 +4,12 @@
 Big QMT has to be restarted most mornings, and the login dialog is the reason
 it cannot simply be dropped into a scheduler. Two ways past it:
 
-* **Passwordless (preferred)** -- ``XtMiniQmt.exe linkMini`` starts MiniQMT
-  against an existing session with no dialog at all. This is what
+* **Passwordless (mini terminal only)** -- ``XtMiniQmt.exe linkMini`` starts
+  MiniQMT against an existing session with no dialog at all. This is what
   ``免密登录qmt.bat`` does. No UI automation, so nothing here depends on a
-  desktop being visible.
+  desktop being visible. NOTE: the mini terminal has no strategy editor and no
+  ContextInfo runtime, so it cannot host the bridge strategy — use it only
+  when a MiniQMT data/trade server is needed alongside, not to run the bridge.
 * **Credential entry** -- for the full terminal (``XtItClient.exe``) the dialog
   is unavoidable. We drive it with PHYSICAL input (``keybd_event`` /
   ``mouse_event`` over ctypes), not ``SendMessage``: message-based typing never
@@ -398,8 +400,9 @@ def _login_via_window(credentials, window_title_prefix=None, appear_timeout_seco
             return
         title = win32gui.GetWindowText(hwnd) or ""
         cls = win32gui.GetClassName(hwnd)
-        # Qt5QWindowIcon 限定：避免把标题前缀相近的资源管理器等窗口当成登录框。
-        if cls == "Qt5QWindowIcon" and title.strip().startswith(prefix):
+        # Qt5QWindowIcon 限定 + 标题包含前缀（不是 startswith——模拟端标题是
+        # 「国金QMT交易端模拟 2.1.19.200」，前缀 "QMT" 在中间；issue #128）。
+        if cls == "Qt5QWindowIcon" and prefix in title:
             acc.append(hwnd)
 
     def _find():
@@ -426,7 +429,9 @@ def _login_via_window(credentials, window_title_prefix=None, appear_timeout_seco
             % (prefix, appear_timeout_seconds)
         )
 
-    # 解锁前台保护并置顶：不验证可见性就打字，密码会落进遮挡窗口（实盘踩过坑）。
+    # 解锁前台保护并置顶：物理输入以「点击聚焦 + 逐段截图验证」为安全网，
+    # GetForegroundWindow 只是辅助——它失败不等于不能输入（置顶 + 点击一样能聚焦），
+    # 真正防误输的是后面的字段级像素验证。
     user32.keybd_event(0x12, 0, 0, 0)   # Alt down — unlocks SetForegroundWindow
     user32.keybd_event(0x12, 0, 2, 0)   # Alt up
     time.sleep(0.2)
@@ -436,10 +441,9 @@ def _login_via_window(credentials, window_title_prefix=None, appear_timeout_seco
     user32.SetForegroundWindow(handle)
     time.sleep(0.8)
     if user32.GetForegroundWindow() != handle:
-        raise QmtLauncherError(
-            "could not foreground the login dialog; another window would receive "
-            "the password. Close covering windows and retry."
-        )
+        log.warning(
+            "could not foreground the login dialog (another window may hold focus); "
+            "proceeding with topmost + verified clicks anyway")
 
     def _looks_like_login_dialog():
         # 登录框是小窗（国金 2.1.19 为 ~624x443）；主界面是大窗/最大化。
@@ -452,13 +456,26 @@ def _login_via_window(credentials, window_title_prefix=None, appear_timeout_seco
         return
 
     # 国金 2.1.19 登录框（624x443）控件的相对位置，按比例适配尺寸变化。
+    # 账号框 x 必须避开右侧下拉按钮（~0.66w，点它会展开账号列表——实盘事故），
+    # 密码框 x 避开右侧虚拟键盘图标。
     rect = win32gui.GetWindowRect(handle)
     wx, wy = rect[0], rect[1]
     w = max(rect[2] - rect[0], 1)
     h = max(rect[3] - rect[1], 1)
-    account_xy = (0.68 * w, 0.57 * h)
-    password_xy = (0.48 * w, 0.63 * h)  # 避开右侧虚拟键盘图标
+    account_xy = (0.47 * w, 0.57 * h)
+    password_xy = (0.47 * w, 0.66 * h)
     login_xy = (0.40 * w, 0.79 * h)
+    account_region = (wx + int(0.10 * w), wy + int(0.50 * h), int(0.55 * w), int(0.10 * h))
+    password_region = (wx + int(0.10 * w), wy + int(0.60 * h), int(0.55 * w), int(0.10 * h))
+
+    try:
+        import pyautogui
+    except ImportError:
+        raise QmtLauncherError(
+            "mode='login' needs pyautogui (pip install pyautogui) for field-focus "
+            "verification; without it a missed click can type the password into the "
+            "account field (observed live)."
+        )
 
     def _click(fx, fy):
         user32.SetCursorPos(wx + int(fx), wy + int(fy))
@@ -486,18 +503,71 @@ def _login_via_window(credentials, window_title_prefix=None, appear_timeout_seco
         user32.keybd_event(win32con.VK_CONTROL, 0, 2, 0)
         time.sleep(0.2)
 
+    def _region_pixels(region):
+        img = pyautogui.screenshot(region=region).convert("L")
+        return list(img.getdata())
+
+    def _region_changed(before, after, min_ratio=0.01):
+        if not before or not after or len(before) != len(after):
+            return True
+        diff = sum(1 for a, b in zip(before, after) if abs(a - b) > 24)
+        return diff / float(len(before)) >= min_ratio
+
+    def _cleanup_leak():
+        # 打字落到错误字段时立即清空，绝不让密码以明文留在账号框（实盘事故）。
+        for xy in (account_xy, password_xy):
+            _click(*xy)
+            _select_all()
+            _key(win32con.VK_DELETE)
+
     # Never log the values themselves.
     log.info("entering credentials into window %r (physical input)", prefix)
+
+    # 1) 账号：点击 → 全选 → 输入 → 验证账号区变了、密码区没跟着变
+    acc_before = _region_pixels(account_region)
     _click(*account_xy)
     _select_all()
     _type(user)
-    _click(*password_xy)
-    _type(password)
+    time.sleep(0.3)
+    if not _region_changed(acc_before, _region_pixels(account_region)):
+        raise QmtLauncherError(
+            "account entry did not land in the account field; aborting before "
+            "typing the password anywhere unsafe."
+        )
+    acc_after_entry = _region_pixels(account_region)
+
+    # 2) 密码：TAB 从账号框过去——布局无关，模拟端（499x354，多三个页签）和
+    #    实盘端（624x443）尺寸不同也通用（issue #128）。先打 1 个字符验证落在
+    #    密码框，再打其余——密码绝不许进账号框。
+    pwd_before = _region_pixels(password_region)
+    _key(win32con.VK_TAB)
+    time.sleep(0.2)
+    _select_all()
+    _type(password[0])
+    time.sleep(0.3)
+    if not _region_changed(pwd_before, _region_pixels(password_region)):
+        # 焦点没在密码框：清空可能落错位置的内容后立即中止。
+        _cleanup_leak()
+        raise QmtLauncherError(
+            "password focus check failed (first char did not land in the password "
+            "field); cleared any leaked input and aborted without submitting."
+        )
+    _type(password[1:])
+    time.sleep(0.3)
+    # 再验证一次：账号区在打完密码后不应有变化（防止密码追加到账号后面）。
+    if _region_changed(acc_after_entry, _region_pixels(account_region), min_ratio=0.20):
+        _cleanup_leak()
+        raise QmtLauncherError(
+            "password appears to have landed in the account field; cleared it and "
+            "aborted without submitting."
+        )
+
     if not _looks_like_login_dialog():
         # 自动登录在打字过程中已完成——对话框已关闭，别再点"登录"坐标。
         log.info("login dialog gone mid-entry (auto-login completed); skipping submit click")
         return
-    _click(*login_xy)
+    # 用 Enter 提交而不是点坐标——布局无关（issue #128）。
+    _key(win32con.VK_RETURN)
 
 
 def restart_qmt(install_dir, settle_seconds=5.0, **open_kwargs):

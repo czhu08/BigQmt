@@ -4,6 +4,22 @@
 
 ## [Unreleased]
 
+### 修复
+
+- **qmt_launcher login 误输防护**（实盘事故修复）：账号框坐标原本打在右侧下拉箭头上（点它会展开账号列表），导致密码被追加进账号框；坐标改到输入框正中，且每步打完字都做字段级像素验证（账号必须进账号区、密码首字符必须进密码区、打密码期间账号区不许变），失败立即清空泄露并中止，绝不提交错误表单。
+- **zmq 出站堆积硬阻塞**：大 payload（全市场快照几 MB）与冷请求共享管道时，peer 水位满会让 send_multipart 阻塞 ~200ms、拖死 router 线程。内联发送改 DONTWAIT，堵了让位进有界队列逐拍重试（超 2000 丢最旧+记日志）。
+- **linkmini 模式误导**：它起的是迷你终端（无策略编辑器/ContextInfo），对本项目的桥不可用——README 与 docstring 已明确。
+
+## [Unreleased]
+
+### 修复
+
+- **subscribe_quote 盘中推送旧快照**（Issue #104）：订阅轮询默认走 FormulaServer 直连，其快照可能滞后数小时（实盘实测 11:30 后冻结、收盘后仍停在午间数据），导致"刚完成的 bar"被推成数小时前的旧值。订阅轮询改走 RPC 桥读 QMT 实时数据（`use_formula=False`，client.call / get_market_data_ex 新增该开关，默认行为不变）。实盘验证：最新 bar 为 15:00 收盘 bar 而非 11:30 旧快照。
+- **FormulaServer 快照滞后检测 + 自动回落**：intraday（tick/1m/5m/15m/30m/1h）直连回答的最新 bar 滞后超过 30 分钟（或跨日）时，本次调用**自动回落 RPC 桥拿实时数据**（不是只告警），并进入 120s 冷却期——冷却内 get_market_data_ex 直接跳过直连（不付双倍成本），到期自动重新探测（自愈）。告警同 code+period 每日一次。实盘验证：滞后检出 → 回落拿到 15:00 收盘 bar；冷却期跳过；到期恢复直连。
+- **probe_capabilities RPC**（此前已提交）：能力探测接口 + 部署快速开始文档 + 延迟报告 + launcher 锁屏防护。
+
+## [Unreleased]
+
 ### 新增
 
 - **能力探测 RPC `probe_capabilities`**：只读探查当前部署暴露了哪些 QMT callable——运行时全局函数绑定（passorder/download/信用等 20 项）、ContextInfo 方法存在性、信用接口只读试调（行数/报错）。部署后跑一次即可确认这台券商 QMT 的能力边界。参考 cfquant 的 credit probe 思路。
@@ -13,6 +29,51 @@
 ### 修复
 
 - **qmt_launcher 锁屏防护**：`restart_qmt` 在会话锁屏且需要自动登录时直接拒绝执行（否则关掉终端却登不回去，交易中断）；新增 `session_is_locked()` 检测。
+
+## [0.3.7] - 2026-08-31
+
+### 新增
+
+- **卡顿监控：区分「桥卡住」和「桥死了」**：`zmq slow handler` 是在 handler **返回之后**计时的，所以一个阻塞住的调用在结束之前什么都不打印。实测遇到过一次 346 秒的阻塞，那期间日志只有 adjust 心跳、每 10 秒 100 拍，**看上去一切健康**——而从客户端看，卡住和死掉是同一件事：超时。
+
+  现在有 watchdog 线程在 handler **还在跑的时候**就报：
+
+  ```
+  [bigqmt_rpc] zmq handler STILL RUNNING method=get_full_tick 6s
+  thread=bigqmt-zmq-rpc queued=0 -- the bridge is blocked, not dead
+  ```
+
+  默认 20 秒触发——比实测最慢的健康调用（整市场快照 7.7s）长得多，又短于客户端 30 秒的默认超时，**所以日志会在调用方放弃之前就点名**。指数退避，一次长阻塞不会把它自己要解释的日志淹掉。`BIGQMT_REDIS_CONFIG["zmq"]["stall_warn_seconds"] = 0` 关闭。
+
+- **启动预热**：重启后第一次 `get_financial_data` 可能要几分钟（实测 346 秒）。启动后会在**后台守护线程**上先跑一次，把这份等待提前付掉，并留下日志。
+
+  **特意不放主线程**：启动诊断跑在 `init()` 里，把一个可能几百秒的调用加进去，会在 adjust 定时器都还没排上的时候冻住启动——比原问题更糟。`BIGQMT_REDIS_CONFIG["warm_context_data"] = False` 关闭。
+
+  预热**会自检取到多少行**，取不到直说：
+
+  ```
+  [bigqmt_warmup] get_financial_data warm in 0.41s (159 rows)
+  [bigqmt_warmup] get_financial_data returned NOTHING in 0.02s -- the probe
+  did not exercise the path it is meant to warm
+  ```
+
+  这个自检是实盘验证时挣来的：第一版预热用了**空的日期区间**，被 QMT 接受、瞬间返回 `None`，日志却报 `warm in 0.00s` 的成功。一个静默空转的预热比不做更糟。
+
+### 实盘验证
+
+四次策略重启，逐项验证：
+
+- ✅ **watchdog**：临时把阈值调到 5 秒，跑一个 15.94 秒的请求，日志在 6s 和 11s 各报一次（退避生效），方法名/线程/队列深度均正确，**报的时候调用还在跑**。
+- ✅ **预热**：`warm in 0.00s (242 rows)`，确认真取到数。
+- ❌ **预热能否挡住那 346 秒：未证明**。见下。
+
+### 已知限制
+
+- **预热对 346 秒的实际效果尚未证明。** 当天策略重启四次，346 秒只在第一次出现；预热现在报 0.00s，说明该调用本来就是热的——**它预热的是一个已经热的东西**。那份代价更可能在 QMT **终端**进程里，而终端当天没有重启。要验证只能等终端重启后的第一次。机制可用、自检可靠，效果待实证。
+- **346 秒的根因仍未查清**：为什么一个 `ContextInfo` 调用会在后台 listener 线程上阻塞数百秒，而 QMT 自身健康、主策略线程空闲。已排除：按代码的冷缓存、按表的冷缓存、我们自己的字段翻译、以及「QMT 行情订阅重建慢」（曾据此解释，后被推翻——所依据的日志空档当天还有多处，完全正常）。watchdog 是下次复现时的眼睛。
+- 其余同 0.3.6。
+
+---
 
 ## [0.3.6] - 2026-08-31
 

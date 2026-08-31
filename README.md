@@ -297,6 +297,68 @@ field_list=[open,high,low,close,volume,amount]
 
 **只要 OHLCV 就显式写出来**，那 30 倍就到手了。首次不传 `field_list` 时会在 `bigqmt.log` 记一条说明。
 
+### 启动预热与卡顿监控
+
+**重启策略后，第一次调用 `get_financial_data` 可能要几分钟。** 实测过一次 **346 秒**——当时 QMT 自身完全健康（全推行情每几秒一批、线程池正常），主策略线程也空闲（adjust 每 10 秒 100 拍，每拍 < 2ms）。当天之后的所有调用都在 1 秒内，**包括从没查过的票和没查过的表**，所以这是一次性代价，不是按代码的缓存未命中。
+
+问题在于它的传染性：**RPC 处理是串行的**，一个调用卡住，后面排队的全部超时。客户端看到的是一片超时，和「桥死了」完全一样。
+
+#### 启动时自动预热（默认开启）
+
+启动后会在**后台线程**上先跑一次这个调用，把这份等待提前付掉：
+
+```
+[bigqmt_warmup] get_financial_data: first call after a restart can take
+minutes; running it now so a caller does not have to wait
+[bigqmt_warmup] get_financial_data warm after 346.0s -- that wait is now paid
+```
+
+热了之后就是这样：
+
+```
+[bigqmt_warmup] get_financial_data warm in 0.31s
+```
+
+**预热不会让这个代价变便宜**，它只是把代价挪到一个确定的时刻、一个没人等待的线程上，并且留下一行说明——而不是让它以「第一个调用方莫名卡死」的形式出现。
+
+> **为什么不放在 init 里？** 启动诊断（`_diag_startup`）跑在主线程的 `init()` 中。把一个可能 346 秒的调用加进去，会在 adjust 定时器都还没排上的时候冻住整个启动——比原问题更糟。所以预热走独立守护线程，`init()` 立即返回。
+
+关掉它（服务端 local config）：
+
+```python
+BIGQMT_REDIS_CONFIG = {
+    # ...
+    "warm_context_data": False,
+}
+```
+
+#### 卡顿监控：区分「桥卡住」和「桥死了」
+
+handler 还在跑的时候就会报，不用等它结束：
+
+```
+[bigqmt_rpc] zmq handler STILL RUNNING method=get_financial_data 40s
+thread=bigqmt-zmq-rpc queued=3 -- the bridge is blocked, not dead
+```
+
+- 默认 **20 秒**触发。比实测最慢的健康调用（整市场快照 7.7s）长得多，又短于客户端 30 秒的默认超时，**所以日志会在调用方放弃之前就点名**
+- 指数退避，一次长阻塞不会把它自己要解释的日志淹掉
+- 调整或关闭（注意它在 **`zmq` 子块**里，不是顶层）：
+
+```python
+BIGQMT_REDIS_CONFIG = {
+    # ...
+    "zmq": {
+        "stall_warn_seconds": 45,   # 0 = 关闭
+    },
+}
+```
+
+**看到成片超时时，先在服务端日志里搜 `STILL RUNNING` 或 `slow handler`。** 有这两行之一，就说明桥没死，只是被一个慢调用堵住了——等它跑完，或者查那个方法。
+
+> 注意 `slow handler` 是**事后**打的（handler 返回才计时），`STILL RUNNING` 才是进行中的。
+
+
 ### 版本检测与部署同步
 
 部署到 QMT 是**文件拷贝**，而 QMT 跨策略重跑保留 `sys.modules`。所以「忘了拷」和「拷了但没被加载」从外部看**一模一样**——这是本项目最容易浪费时间的一类问题：本地修好了，实盘却像没修。
@@ -416,6 +478,10 @@ pymongo 的 `bson`，两者输出实测逐字节一致），客户端不需要�
 
 大 QMT 基本每天早上要重启一次，卡点在登录框。两条路绕过它：
 
+> **依赖**：进程枚举优先用 `psutil`；Win11 起系统不再带 `wmic`，没有 psutil 时
+> `close_qmt`/`status` 会直接报 `cannot enumerate processes`（issue #128）。
+> 装上即可：`pip install psutil`。
+
 ```bash
 python -m bigqmt_signal_trader.qmt_launcher status  --dir "D:\国金证券QMT交易端_lemo"
 python -m bigqmt_signal_trader.qmt_launcher restart --dir "D:\国金证券QMT交易端_lemo"
@@ -423,21 +489,64 @@ python -m bigqmt_signal_trader.qmt_launcher restart --dir "D:\国金证券QMT交
 
 | mode | 做什么 | 需要登录框交互 |
 |------|--------|---------------|
-| `linkmini`（默认优先）| `XtMiniQmt.exe linkMini`，MiniQMT 免密启动 | 否 |
+| `linkmini` | `XtMiniQmt.exe linkMini`，MiniQMT 免密启动 | 否 |
 | `bat` | 跑指定批处理（如 `免密登录qmt.bat`）| 否 |
 | `exe` | 直接起 `XtItClient.exe`，靠终端自身恢复会话 | 否 |
-| `login` | 起 exe 后向登录框输入账号密码 | 是，需 pywin32 |
+| `login` | 起 exe 后向登录框输入账号密码 | 是，需 pywin32 + pyautogui |
+
+> ⚠️ **`linkmini` 对本项目不可用**：它起的是迷你终端（MiniQMT），没有策略编辑器和
+> ContextInfo 运行时，桥作为大 QMT 策略跑不进去。本项目的桥必须用 `exe` / `bat` /
+> `login` 三种模式（都起大终端）。`linkmini` 只在你**同时需要迷你终端**（给外部
+> xtquant SDK 提供行情/交易服务）时才有意义——那是另一个进程，与桥互不影响。
 
 **`login` 模式需要未锁屏的交互式桌面。** 它用的是 `keybd_event` / `mouse_event`
 物理输入（经 ctypes），不是 `SendMessage`——消息式输入投不到 Qt 对话框的焦点控件上，
 当别的窗口在前台时会静默失败，什么也不输入。物理输入要求对话框在最前，所以启动前会
 先把它置顶并核验；锁屏或 RDP 注销的会话直接抛 `QmtLauncherError` 而不是打一半密码。
 
-> 需要**无人值守定时重启**的话，用 `linkmini` / `bat` / `exe` 三种模式，它们不碰登录框，
-> 锁屏也能跑。只有 `login` 受这条限制。
+> 需要**无人值守定时重启**（重启的是**大终端**+桥策略）的话，用 `bat` / `exe` / `login`
+> 三种模式。`bat`/`exe` 不碰登录框、锁屏也能跑，但要求终端自身能恢复会话（设了自动登录）；
+> `login` 会替你输密码，但受锁屏限制。
 
 密码从环境变量 `BIGQMT_LOGIN_USER` / `BIGQMT_LOGIN_PASSWORD` 读，不走命令行参数——argv
 对同机任何进程可见。
+
+#### Python API
+
+除了命令行，也可以在代码/计划任务脚本里直接调函数（语义与 CLI 一致）：
+
+```python
+from bigqmt_signal_trader.qmt_launcher import (
+    close_qmt, open_qmt, restart_qmt,
+    is_qmt_running, find_qmt_processes, wait_until_ready, session_is_locked,
+)
+
+# 关：先礼貌 terminate（QMT 会冲刷本地数据），force_after_seconds 后才强杀。
+# 只终结该安装目录 bin.x64 下的进程；拿不到 exe 路径的进程直接跳过而不是误杀。
+close_qmt(r"D:\国金证券QMT交易端_lemo", force_after_seconds=20)
+
+# 开：mode 见上表（exe/bat/login；linkmini 对本项目不可用）。
+# login 模式自动填账号密码：Alt 解锁前台 + 置顶 + 字段级像素验证打字，
+# 打完逐段验证（账号必须进账号区、密码必须进密码区），错了清空中止，不提交错表单。
+open_qmt(
+    r"D:\国金证券QMT交易端_lemo",
+    mode="login",
+    credentials={"user": "你的账号", "password": "你的密码"},
+    window_title_prefix="QMT",          # 登录框标题包含串（模拟端 "国金QMT交易端模拟" 也能匹配）
+    ready_timeout_seconds=180,          # 等 FormulaServer(58600) 就绪的超时
+)
+
+# 一把重启：close_qmt → 等端口释放 → open_qmt。会话锁屏且需要 login 时直接抛错
+# （而不是关掉终端却登不回去）。
+restart_qmt(r"D:\国金证券QMT交易端_lemo", mode="login",
+            credentials={"user": "...", "password": "..."})
+
+# 状态查询
+is_qmt_running(r"D:\国金证券QMT交易端_lemo")      # 进程在不在
+find_qmt_processes(r"D:\国金证券QMT交易端_lemo")  # [(pid, 进程名, exe 路径)]
+wait_until_ready(port=58600)                       # 阻塞到 FormulaServer 可连接
+session_is_locked()                                # 交互式会话是否锁屏
+```
 
 两个设计要点：
 

@@ -27,6 +27,7 @@ import uuid
 
 from ..adapters.redis_common import decode_text
 from ..redis_rpc import (
+    TYPED_PAYLOAD_FLAG, TYPED_PAYLOAD_MARKER,
     decode_rpc_request_payload,
     encode_rpc_request_payload,
 )
@@ -60,10 +61,15 @@ def _default_zmq_address(account_id, host=None):
 
 def _loads(raw):
     if isinstance(raw, dict):
+        # Already an object (in-process routing): no text to scan, so the
+        # client walks it as before rather than assuming there is nothing.
         return dict(raw)
     text = decode_text(raw)
     text = decode_rpc_request_payload(text)
-    return json.loads(text)
+    response = json.loads(text)
+    if isinstance(response, dict):
+        response[TYPED_PAYLOAD_FLAG] = TYPED_PAYLOAD_MARKER in text
+    return response
 
 
 class ZmqTransport(RpcTransport):
@@ -94,6 +100,8 @@ class ZmqTransport(RpcTransport):
         discovery_key_template="bigqmt:zmq:addr:{account_id}",
         discovery_ttl_seconds=300,
         port_scan_range=50,
+        stall_warn_seconds=20.0,
+        stall_check_seconds=5.0,
     ):
         super(ZmqTransport, self).__init__(account_id=account_id, print_prefix=print_prefix)
         # Address resolution order: explicit bind_address/connect_address win;
@@ -109,6 +117,13 @@ class ZmqTransport(RpcTransport):
         self.connect_address = connect_address
         self.bind_host = resolved_host
         self.base_port = resolved_port
+        # Handlers run one at a time, so anything past a few seconds is
+        # holding up every queued request. 20s is comfortably longer than the
+        # slowest healthy call measured here (a whole-market snapshot, 7.7s)
+        # and far short of a client's default 30s timeout, so the log names
+        # the culprit before the caller gives up. 0 disables the watchdog.
+        self.stall_warn_seconds = float(stall_warn_seconds)
+        self.stall_check_seconds = max(float(stall_check_seconds), 0.5)
         self.io_threads = int(io_threads)
         self.recv_timeout_seconds = float(recv_timeout_seconds)
         self.server_hwm = int(server_hwm)
@@ -132,6 +147,13 @@ class ZmqTransport(RpcTransport):
         self._response_queue = queue.Queue()
         self._queued_response_count = 0
         self._sent_response_count = 0
+        self._dropped_response_count = 0
+        # 出站堆积让位队列的上限（满时丢最旧，防止背压变成内存膨胀）。
+        self._max_queued_responses = 2000
+        # (method, started_at, thread_name) while a handler is running.
+        # Reported by the stall watchdog below; None when idle.
+        self._in_flight = None
+        self._stall_thread = None
         # client state
         self._dealer = None
         self._client_lock = threading.Lock()
@@ -157,6 +179,8 @@ class ZmqTransport(RpcTransport):
             ),
             discovery_ttl_seconds=int(config.get("discovery_ttl_seconds", 300)),
             port_scan_range=int(config.get("port_scan_range", 50)),
+            stall_warn_seconds=float(config.get("stall_warn_seconds", 20.0)),
+            stall_check_seconds=float(config.get("stall_check_seconds", 5.0)),
         )
 
     # -- shared zmq context -----------------------------------------------
@@ -250,6 +274,11 @@ class ZmqTransport(RpcTransport):
             target=self._router_loop, name="bigqmt-zmq-rpc", daemon=True
         )
         self._router_thread.start()
+        if self.stall_warn_seconds > 0:
+            self._stall_thread = threading.Thread(
+                target=self._stall_watchdog_loop, name="bigqmt-zmq-stall",
+                daemon=True)
+            self._stall_thread.start()
         print(
             "%s zmq started bound=%s" % (self.print_prefix, self.bind_address)
         )
@@ -298,14 +327,55 @@ class ZmqTransport(RpcTransport):
 
     def _deliver_request(self, request):
         started = time.perf_counter()
+        method = request.get("method")
+        # Published for the watchdog. Handlers run one at a time on this
+        # thread, so a single slot is enough.
+        self._in_flight = (method, started, threading.current_thread().name)
         try:
             self.deliver(request)
         except Exception as exc:
             print("%s zmq deliver failed: %s" % (self.print_prefix, exc))
+        finally:
+            self._in_flight = None
         elapsed_ms = (time.perf_counter() - started) * 1000.0
         if elapsed_ms > 50.0:
             print("%s zmq slow handler method=%s %.0fms"
-                  % (self.print_prefix, request.get("method"), elapsed_ms))
+                  % (self.print_prefix, method, elapsed_ms))
+
+    def _stall_watchdog_loop(self):
+        """Report a handler that is STILL running, while it still is.
+
+        The slow-handler line above is measured after deliver() returns, so a
+        handler that blocks says nothing until it finishes. One did, for 346
+        seconds: get_financial_data on the first call after a restart, while
+        QMT itself was healthy and the main strategy thread idle. Every
+        request queued behind it timed out, and the only clue in the log
+        arrived once it was already over.
+
+        A stalled bridge and a dead one look identical from the client. This
+        is what tells them apart, at the time it matters.
+        """
+        reported_at = 0.0
+        while self._running:
+            time.sleep(self.stall_check_seconds)
+            snapshot = self._in_flight
+            if snapshot is None:
+                reported_at = 0.0
+                continue
+            method, started, thread_name = snapshot
+            elapsed = time.perf_counter() - started
+            if elapsed < self.stall_warn_seconds:
+                continue
+            # Back off: every interval at first, then less often, so a very
+            # long stall does not bury the log it is meant to explain.
+            interval = self.stall_warn_seconds * (2 ** min(reported_at, 6))
+            if reported_at and elapsed < interval:
+                continue
+            reported_at += 1
+            print("%s zmq handler STILL RUNNING method=%s %.0fs thread=%s "
+                  "queued=%d -- the bridge is blocked, not dead"
+                  % (self.print_prefix, method, elapsed, thread_name,
+                     self._response_queue.qsize()))
 
     def _drain_response_queue(self):
         while True:
@@ -321,6 +391,21 @@ class ZmqTransport(RpcTransport):
             except Exception as exc:
                 print("%s zmq send failed: %s" % (self.print_prefix, exc))
 
+    def _queue_response(self, identity, payload, reason=""):
+        # 出站堆积时让位排队而不是阻塞 router 线程：队列有上限，满时丢最旧
+        # 并记日志（读类请求超时可重试，比全管道停摆好）。
+        self._queued_response_count += 1
+        self._response_queue.put((identity, payload))
+        if self._response_queue.qsize() > self._max_queued_responses:
+            try:
+                self._response_queue.get_nowait()
+                self._dropped_response_count += 1
+                if self._dropped_response_count <= 5 or self._dropped_response_count % 100 == 0:
+                    print("%s zmq response queue full (%d), dropped oldest (%s)"
+                          % (self.print_prefix, self._max_queued_responses, reason))
+            except queue.Empty:
+                pass
+
     def send_response(self, request, response):
         if self._router is None:
             raise TransportError("zmq server socket is not bound")
@@ -334,13 +419,14 @@ class ZmqTransport(RpcTransport):
             return
         payload = encode_rpc_request_payload(response).encode("utf-8")
         if self._router_thread is not None and threading.current_thread() is not self._router_thread:
-            self._queued_response_count += 1
-            if self._queued_response_count <= 5:
-                print("%s zmq response queued for router thread" % self.print_prefix)
-            self._response_queue.put((identity, payload))
+            self._queue_response(identity, payload, reason="off-thread")
             return
         try:
-            self._router.send_multipart([identity, payload])
+            # 硬阻塞改非阻塞：peer 水位满（出站堆积）时不让位整个 router 线程
+            # ~200ms——改道进队列由 drain 循环重试，线程永不停摆。
+            self._router.send_multipart([identity, payload], self._zmq.DONTWAIT)
+        except self._zmq.Again:
+            self._queue_response(identity, payload, reason="peer-muted")
         except Exception as exc:
             print("%s zmq send failed: %s" % (self.print_prefix, exc))
 
