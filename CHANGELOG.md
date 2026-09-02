@@ -5,6 +5,24 @@
 
 ## [未发布]
 
+### 新增
+
+- **`rpc_default_strategy_name`：委托的「报单来源」由你决定**（issue #154，@kingtsi）：QMT 把委托的 投资备注 显示在 委托 列表的**报单来源**列里，所以那不是内部字段 —— 之前每一笔没指定策略名的委托都在那个界面上写着 `bigqmt_rpc`。
+
+  单次调用传 `strategy_name=` 一直是生效的，缺的是**默认值** —— `bigqmt_rpc` 硬编码在三处。现在可以在配置里设一次：
+
+  ```python
+  "rpc_default_strategy_name": "",     # 留空，和手动下单一样
+  ```
+
+  空字符串在整条链路上都当作**有效答案**（`.get(key)` 而不是 `.get(key, default)`），否则它会被默认值吞回去。默认不变，现有部署不受影响。**改配置需要重启策略** —— `bigqmt_signal_trader_strategy.py` 是顶层文件，`reload_deployment()` 刷不了。
+
+- **`describe_trade_detail_fields` 新增 `shape_fields`**：报告字段的**形状**而不是值 —— 长度、`|` 分段、以及字符类掩码（数字变 `#`、字母变 `a`、分隔符保留）。回答「这个字段里到底是什么东西」而不用把值送出 QMT。掩码是有损的，这正是重点：它带不回一个标识符。
+
+  #154 就是这么定的案：`m_strSource` 在本终端上是 `aaaaaa_aaaaa_aaaaaa` —— **只有字母和下划线，没有数字、没有 `-`、没有 `|`、没有 `{}`**，也就是策略名，不是 MAC 或设备 GUID。
+
+
+
 ### 修复
 
 - **zmq 传输 + redis 可达的部署里，委托/成交回调永远收不到**（issue #144，@sumo225270）：服务端发布执行事件是「**redis 优先**」——只要能建出 redis 客户端就发 redis 通道（流带短回放），连挂多次才降级到 zmq 推送通道（#145）。而客户端 `_event_loop` 是**按 transport 选的**——zmq 传输只听 zmq 推送通道。于是这类部署里每个事件都发在 redis 上，客户端却在另一个通道上听：`on_stock_order` / `on_stock_trade` 静默全丢。

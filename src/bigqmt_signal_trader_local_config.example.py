@@ -43,6 +43,11 @@ BIGQMT_REDIS_CONFIG = {
     # },
     # Keep order RPC disabled unless you explicitly want remote order/cancel.
     "rpc_allow_order_methods": True,
+    # 未指定 strategy_name 的委托带的 投资备注，默认 "bigqmt_rpc"。
+    # 注意这不是内部字段：QMT 把它显示在 委托 列表的「报单来源」列里
+    # （issue #154），任何看那个界面的人都能看到。设成自己的名字，或者设成
+    # "" 让该列留空 —— 和手动下单一样。单次调用传 strategy_name= 始终优先。
+    "rpc_default_strategy_name": "",
     # Redis and ZMQ can both drain requests through QMT's official
     # run_time("adjust", ...) callback. This avoids GIL stalls in QMT's process.
     "rpc_process_in_listener": True,

@@ -188,6 +188,13 @@ BUY_ORDER_TYPES = {"23", "STOCK_BUY", "BUY", "B"}
 SELL_ORDER_TYPES = {"24", "STOCK_SELL", "SELL", "S"}
 CANCELABLE_ORDER_STATUSES = {"50", "55"}
 CANCELED_ORDER_STATUSES = {"53", "54"}
+
+# Default 投资备注 / strategy name on an order the caller did not name.
+# QMT shows it in the 委托 list's 报单来源 column (issue #154), so it is
+# visible to anyone reading that screen. Override per call with
+# strategy_name=, or once with rpc_default_strategy_name in the config;
+# "" leaves the column blank the way a hand-placed order does.
+DEFAULT_ORDER_STRATEGY_NAME = "bigqmt_rpc"
 TERMINAL_NON_CANCEL_ORDER_STATUSES = {"56", "57"}
 # 51 已报待撤 / 52 部成待撤: the exchange has ACCEPTED the cancel and it is
 # on its way. Neither cancelled nor failed -- keep waiting, and at the
@@ -490,7 +497,18 @@ class BigQmtRpcHandlers:
         settle_orders_inline=False,
         order_settle_timeout_seconds=3.0,
         quote_subscription_manager=None,
+        default_strategy_name=None,
     ):
+        # What an order carries when the caller names no strategy. It is not
+        # internal: QMT puts it in the 委托 list's 报单来源 column, so every
+        # order announces "bigqmt_rpc" to anyone reading that screen, and a
+        # reporter asked to be rid of it (issue #154). Per-call
+        # strategy_name= always won; there was just no way to set the default
+        # once. Empty string is a real answer here -- it leaves the column
+        # blank, the way a hand-placed order does.
+        self.default_strategy_name = (
+            DEFAULT_ORDER_STRATEGY_NAME if default_strategy_name is None
+            else str(default_strategy_name))
         self.account_id = str(account_id or "")
         self.market_data = market_data
         self.position_provider = position_provider
@@ -1064,6 +1082,12 @@ class BigQmtRpcHandlers:
         detail_types = params.get("detail_types") or params.get("detail_type")
         if isinstance(detail_types, str):
             detail_types = [detail_types]
+        shape_fields = params.get("shape_fields") or params.get("shape_field")
+        if isinstance(shape_fields, str):
+            shape_fields = [shape_fields]
+        if shape_fields:
+            return describe(self._request_account_id(params), detail_types,
+                            shape_fields=shape_fields)
         return describe(self._request_account_id(params), detail_types)
 
     def _handle_reload_deployment(self, params):
@@ -1097,7 +1121,7 @@ class BigQmtRpcHandlers:
         account_id = self._request_account_id(params)
         order_name = params.get("order_strategy_name")
         if order_name is None:
-            order_name = params.get("strategy_name", "bigqmt_signal_trader")
+            order_name = params.get("strategy_name", self.default_strategy_name)
         trade_name = params.get("trade_strategy_name")
         if trade_name is None:
             trade_name = ""
@@ -1470,7 +1494,8 @@ class BigQmtRpcHandlers:
             volume=int(params.get("volume") or params.get("order_volume") or 0),
             price=float(price if price not in (None, "") else 0),
             price_type=params.get("price_type") or "LIMIT",
-            strategy_name=str(params.get("strategy_name") or "bigqmt_rpc"),
+            strategy_name=str(params.get("strategy_name")
+                              or self.default_strategy_name),
             remark=order_tag,
             order_type=self._forwarded_order_type(params),
         )
@@ -1632,7 +1657,7 @@ class BigQmtRpcHandlers:
         strategy_name = str(
             params.get("strategy_name")
             or (orders[0] or {}).get("strategy_name")
-            or "bigqmt_rpc"
+            or self.default_strategy_name
         )
         existing_by_tag = {}
         lookup_ok = True

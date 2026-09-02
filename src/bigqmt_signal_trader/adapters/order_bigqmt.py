@@ -13,6 +13,12 @@ from ..models import CancelResult, OrderSnapshot, OrderSubmitResult, SignalActio
 from .position_bigqmt import _attr, _full_code, skip_unparsable_row
 
 
+# Cap on the masked shape reported by describe_detail_fields (issue #154):
+# long enough to show the segment layout, short enough that nothing large
+# rides back on a diagnostic call.
+_SHAPE_MASK_MAX = 200
+
+
 PRICE_TYPE_ALIASES = {
     "LIMIT": 11,
     "FIX_PRICE": 11,
@@ -629,7 +635,41 @@ class BigQmtOrderGateway:
             )
         return result
 
-    def describe_detail_fields(self, account_id, detail_types=None):
+    @staticmethod
+    def _field_shape(value):
+        """A field's shape with its identity removed.
+
+        Issue #154 asked what 报单来源 (m_strSource) actually holds -- the
+        reporter's screenshot showed something that looks like a MAC address
+        and a device GUID, and they wanted it gone. Answering "is any of that
+        ours?" needs the value, and the value is exactly the thing nobody
+        should put on a wire.
+
+        So report the shape instead: length, the size of each ``|`` segment,
+        and a character-class mask (digits to #, letters to a, separators
+        kept). The mask is lossy by construction, which is the point -- it
+        cannot carry an identifier back, and it is still enough to tell
+        ``a#-#a-##-...`` apart from ``aaaaaa_aaa``, which is the whole
+        question.
+        """
+        text = "" if value is None else str(value)
+        masked = []
+        for ch in text[:_SHAPE_MASK_MAX]:
+            if ch.isdigit():
+                masked.append("#")
+            elif ch.isalpha():
+                masked.append("a")
+            else:
+                masked.append(ch)          # separators carry the structure
+        return {
+            "length": len(text),
+            "empty": not text,
+            "segments": [len(part) for part in text.split("|")] if text else [],
+            "mask": "".join(masked),
+        }
+
+    def describe_detail_fields(self, account_id, detail_types=None,
+                               shape_fields=None):
         """Which attributes QMT's own ORDER / DEAL rows actually carry.
 
         Names only, never values. Three issues so far (#113, #130, #133) have
@@ -638,8 +678,14 @@ class BigQmtOrderGateway:
         get_trade_detail_data hands back. A row carries prices, volumes and
         counter ids, and this travels the same channel as any other RPC, so
         the values stay here.
+
+        ``shape_fields`` names attributes to report the *shape* of as well --
+        see _field_shape. Still not values: a mask cannot be read back into an
+        identifier, so this keeps the promise above while answering "what kind
+        of thing is in this field" (issue #154).
         """
         query = self._require_query_func()
+        wanted_shapes = [str(name) for name in (shape_fields or []) if str(name or "").strip()]
         described = {}
         for detail_type in (detail_types or ("ORDER", "DEAL")):
             entry = {"rows": 0, "attributes": [], "error": ""}
@@ -648,6 +694,20 @@ class BigQmtOrderGateway:
                 entry["rows"] = len(rows)
                 if rows:
                     entry["attributes"] = _data_attribute_names(rows[0])
+                    if wanted_shapes:
+                        shapes = {}
+                        for name in wanted_shapes:
+                            distinct = {}
+                            for row in rows:
+                                shape = self._field_shape(_attr(row, (name,), ""))
+                                key = shape["mask"]
+                                if key not in distinct:
+                                    shape["rows"] = 0
+                                    distinct[key] = shape
+                                distinct[key]["rows"] += 1
+                            shapes[name] = sorted(
+                                distinct.values(), key=lambda s: -s["rows"])
+                        entry["shapes"] = shapes
             except Exception as exc:
                 entry["error"] = "%s: %s" % (type(exc).__name__, exc)
             described[str(detail_type)] = entry

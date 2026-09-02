@@ -688,6 +688,9 @@ def _build_rpc_service(context_info, app, config):
         settle_orders_inline=_config_bool(rpc_config.get("settle_orders_inline"), False),
         order_settle_timeout_seconds=float(rpc_config.get("order_settle_timeout_seconds", 3.0)),
         quote_subscription_manager=quote_manager,
+        # .get(key) not .get(key, default): "" is a real answer here (leave
+        # 报单来源 blank), and a default would swallow it -- issue #154.
+        default_strategy_name=rpc_config.get("default_strategy_name"),
     )
     # Neither of these may depend on the TRANSPORT. Only a redis transport
     # builds the two clients above, so on zmq both were None -- and each had a
