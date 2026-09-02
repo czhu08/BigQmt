@@ -277,6 +277,10 @@ BIGQMT_REDIS_CONFIG = {
     "username": "",
     "password": "",
     # Keep order RPC disabled unless you explicitly want remote order/cancel.
+    # This build cannot import redis at all, so the redis block must not be
+    # emitted -- otherwise every consumer dials a host that is not there
+    # (issues #145 / #147).
+    "redis_enabled": False,
     "rpc_allow_order_methods": False,
     # Requests drain through QMT's run_time("adjust", ...) callback, on the main
     # strategy thread. get_trade_detail_data returns EMPTY off that thread, so
@@ -540,7 +544,11 @@ try:
     BIGQMT_REDIS_CONFIG = dict(BIGQMT_REDIS_CONFIG or {})
     BIGQMT_REDIS_CONFIG["transport"] = "zmq"
     BIGQMT_REDIS_CONFIG["rpc_background_threads"] = True
-    print("[bigqmt_shell] no-redis mode: transport=zmq background_threads=True")
+    # Nothing here can reach redis, so say so instead of letting the runtime
+    # fill in 127.0.0.1:6379 from its defaults (issues #145 / #147).
+    BIGQMT_REDIS_CONFIG["redis_enabled"] = False
+    print("[bigqmt_shell] no-redis mode: transport=zmq background_threads=True "
+          "redis_enabled=False")
     _runtime.configure_runtime_redis(BIGQMT_REDIS_CONFIG)
 except Exception as redis_config_error:
     print("[bigqmt_shell] local redis config load failed: %s" % redis_config_error)

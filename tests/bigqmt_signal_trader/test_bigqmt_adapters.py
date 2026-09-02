@@ -177,6 +177,85 @@ class BigQmtAdaptersTest(unittest.TestCase):
             self.assertEqual(sorted(ticks), ["a2609.DF", "rb2708.SF"],
                              context.__class__.__name__)
 
+    def test_get_ticks_recovers_missing_option_from_latest_tick_row(self):
+        """Full Big-QMT may omit .SHO from get_full_tick while tick history is live."""
+        class OptionContext:
+            def __init__(self):
+                self.full_tick_calls = []
+                self.market_calls = []
+
+            def get_full_tick(self, codes):
+                self.full_tick_calls.append(list(codes))
+                return {"510050.SH": {"lastPrice": 3.05}}
+
+            def get_market_data_ex_ori(self, fields=None, stock_code=None,
+                                       period="1d", start_time="", end_time="",
+                                       count=-1, dividend_type="none"):
+                self.market_calls.append({
+                    "fields": fields, "stock_code": stock_code,
+                    "period": period, "count": count,
+                    "dividend_type": dividend_type,
+                })
+                return {
+                    "10010974.SHO": {
+                        "time": [1, 2],
+                        "lastPrice": [0.0458, 0.0459],
+                        "bidPrice": [[0.0457], [0.0458]],
+                    },
+                    "90009999.SZO": {
+                        "time": [2],
+                        "lastPrice": [0.1234],
+                        "askPrice": [[0.1235]],
+                    },
+                }
+
+        context = OptionContext()
+        ticks = BigQmtMarketDataProvider(context).get_ticks([
+            "510050.SH", "10010974.SHO", "90009999.SZO",
+        ])
+
+        self.assertEqual(ticks["510050.SH"]["lastPrice"], 3.05)
+        self.assertEqual(ticks["10010974.SHO"]["lastPrice"], 0.0459)
+        self.assertEqual(ticks["10010974.SHO"]["bidPrice"], [0.0458])
+        self.assertEqual(ticks["90009999.SZO"]["lastPrice"], 0.1234)
+        self.assertEqual(context.full_tick_calls, [[
+            "510050.SH", "10010974.SHO", "90009999.SZO",
+        ]])
+        self.assertEqual(context.market_calls, [{
+            "fields": [],
+            "stock_code": ["10010974.SHO", "90009999.SZO"],
+            "period": "tick",
+            "count": 1,
+            "dividend_type": "none",
+        }])
+
+    def test_get_ticks_does_not_fallback_for_missing_non_option(self):
+        class EmptyContext:
+            def get_full_tick(self, codes):
+                return {}
+
+            def get_market_data_ex(self, *args, **kwargs):
+                raise AssertionError("non-option code must not use tick-history fallback")
+
+        self.assertEqual(
+            BigQmtMarketDataProvider(EmptyContext()).get_ticks(["510050.SH"]),
+            {},
+        )
+
+    def test_get_ticks_keeps_native_results_when_option_fallback_fails(self):
+        class FailingContext:
+            def get_full_tick(self, codes):
+                return {"510050.SH": {"lastPrice": 3.05}}
+
+            def get_market_data_ex(self, *args, **kwargs):
+                raise RuntimeError("unsupported on old QMT")
+
+        ticks = BigQmtMarketDataProvider(FailingContext()).get_ticks([
+            "510050.SH", "10010974.SHO",
+        ])
+
+        self.assertEqual(ticks, {"510050.SH": {"lastPrice": 3.05}})
+
     def test_futures_exchange_tokens_reach_qmt_instead_of_raising(self):
         """A futures exchange token used to die in normalize_stock_code with
         "invalid stock code: IF", so a whole-exchange futures snapshot was

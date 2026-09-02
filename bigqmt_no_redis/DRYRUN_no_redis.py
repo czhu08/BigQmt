@@ -11,7 +11,12 @@ Use this when your QMT environment cannot import the redis package (e.g. broker
 whitelist blocks it) or when you want zero redis dependency.
 
 Config: set "transport": "zmq" in bigqmt_signal_trader_local_config.py (the
-no-redis runtime forces zmq regardless). Redis config fields are ignored.
+no-redis runtime forces zmq regardless). Redis config fields are ignored --
+this entry also forces redis_enabled=False, so nothing here ever dials redis.
+That costs the strategy_name backfill on queries (issue #133), async download
+jobs and the whole-quote snapshot cache; the last two are off by default on
+Big QMT anyway. Order and trade callbacks are unaffected -- they take the zmq
+push channel.
 """
 import builtins as _builtins
 import importlib as _importlib
@@ -207,7 +212,15 @@ try:
     BIGQMT_REDIS_CONFIG = dict(BIGQMT_REDIS_CONFIG or {})
     BIGQMT_REDIS_CONFIG["transport"] = "zmq"
     BIGQMT_REDIS_CONFIG["rpc_background_threads"] = True
-    print("[bigqmt_shell] no-redis mode: transport=zmq background_threads=True")
+    # And say so, rather than leaving the runtime to fill in 127.0.0.1:6379 from
+    # its defaults. Without this the redis block is emitted anyway, exec events
+    # prefer a client that can never connect, and every order/trade callback
+    # times out while the zmq push channel sits idle (issues #145 / #147). This
+    # file exists because the machine cannot import redis at all, so there is
+    # nothing to weigh up here.
+    BIGQMT_REDIS_CONFIG["redis_enabled"] = False
+    print("[bigqmt_shell] no-redis mode: transport=zmq background_threads=True "
+          "redis_enabled=False")
     _runtime.configure_runtime_redis(BIGQMT_REDIS_CONFIG)
 except Exception as redis_config_error:
     print("[bigqmt_shell] local redis config load failed: %s" % redis_config_error)

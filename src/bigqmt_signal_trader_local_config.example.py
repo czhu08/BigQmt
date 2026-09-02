@@ -18,6 +18,18 @@ BIGQMT_ACCOUNT_ID = "YOUR_ACCOUNT_ID"
 BIGQMT_ACCOUNT_TYPE = "STOCK"
 
 BIGQMT_REDIS_CONFIG = {
+    # 这台机器上有没有 redis 可用。默认 True，仅对非 redis 传输生效。
+    #
+    # 设 False 时整个 redis 块不再下发给策略，于是委托身份库、异步下载任务、
+    # 全推快照缓存、exec 事件推送都不会去连 redis —— 一次都不试。用在券商 QMT
+    # 的 import 白名单不含 redis、或纯 zmq 部署本来就没装 redis 的场景
+    # （issue #145 / #147）。下面的 host/port 有默认值，所以不设这一项时
+    # 「配了 redis」和「什么都没写」是分辨不出来的。
+    #
+    # 代价：查询里的 strategy_name 回填失效（那份记录只存在 redis 里，见 #133）；
+    # 异步下载任务和全推快照缓存不可用（这两个在大 QMT 上本来就默认关闭）。
+    # 委托/成交回调不受影响 —— 它们会走 zmq 推送通道。
+    # "redis_enabled": False,
     "host": "127.0.0.1",
     "port": 6379,
     "db": 5,

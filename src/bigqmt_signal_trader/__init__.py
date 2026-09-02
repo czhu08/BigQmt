@@ -13,6 +13,12 @@ from .models import (
     SignalStatus,
     TradeSignal,
 )
+from .option_analytics import (
+    black_scholes_price,
+    calculate_option_analytics,
+    implied_volatility,
+    option_greeks,
+)
 from .xtquant_compat import BigQmtRpcClient, BigQmtXtData, BigQmtXtTrader
 
 __all__ = [
@@ -29,4 +35,8 @@ __all__ = [
     "SignalTradingApp",
     "TradeSignal",
     "__version__",
+    "black_scholes_price",
+    "calculate_option_analytics",
+    "implied_volatility",
+    "option_greeks",
 ]

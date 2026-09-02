@@ -86,5 +86,21 @@ python -c "from bigqmt_signal_trader.xtquant_compat import configure, xtdata; co
 | 查询全空但账户有数据 | 账号没对上（服务端 `BIGQMT_ACCOUNT_ID` vs 客户端 `BIGQMT_ACCOUNT_ID`），或 QMT 不在实盘模式 |
 | QMT 报错 `unexpected keyword argument 'protocol'` | QMT 自带 redis-py 3.5.3 太旧——升级桥接包到 ≥0.2.9（已修，按版本能力透传） |
 | 启动面板没有任何输出 | 文件没拷全（4 项缺一不可），或加载的是 runtime 文件而不是 DRYRUN 入口 |
+| 面板像正常启动然后"结束运行"，外部连不上 | 看 `download globals bound=[]` 是不是**空的**、有没有 `init ok`。空的说明 QMT 没注入任何 API 全局 —— 文件被当**普通脚本**执行，`init()` 永远不会调用，RPC 服务不启动。两个已知原因：在**策略编辑器界面**运行、勾了**「独立 python 进程」**。0.3.8 起入口会直接把这段话打出来（issue #123） |
+| 改了代码但没生效 | QMT 跨重跑保留 `sys.modules`，**拷贝本身不生效**。先用 `xtdata.get_deployment_info()` 确认跑的是哪个 build，再让它重新加载 |
+
+## 改完代码怎么生效
+
+**0.3.8 起不用重启**：
+
+```python
+xt_trader.reload_deployment("why")   # 排期到下一个 adjust tick
+xt_trader.reload_status()            # -> {'ok': True, 'modules_purged': 28,
+                                     #     'version_before': ..., 'version_after': ...}
+```
+
+约 0.8 秒，期间约 1 秒的查询会超时（服务正在重建）。
+
+**但改这两个文件仍然要重启策略**：`bigqmt_signal_trader_strategy.py`、`BIGQMT_REDIS_DRYRUN.py` —— QMT 自己 exec 它们，模块没法 reload 自己所在的模块。
 
 更细的排错（日志位置、日志保留策略、启动诊断字段）见 README「日志与排错」。

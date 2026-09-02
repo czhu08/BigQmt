@@ -172,6 +172,8 @@ python scripts/qmt.py snapshot
 | `market-times [market]` | 日内交易时段 | `market-times SH` |
 | `trading-calendar [market]` | 交易日历(含时段) | `trading-calendar SH` |
 | `option-list <code>` | 期权列表 | `option-list 510050.SH` |
+| `option-greeks <code>` | 本地 IV + Delta/Gamma/Vega/Theta/Rho | `option-greeks 10010975.SHO` |
+| `option-greeks <underlying> --expiry <yyyymm>` | 整条到期月份 Greeks | `option-greeks 510050.SH --expiry 202609` |
 | `bsm-price ...` | BSM 期权定价 | `bsm-price C 3.0 2.8 0.03 0.3 30` |
 | `bsm-iv ...` | BSM 隐含波动率 | `bsm-iv C 3.0 2.8 0.25 0.03 30` |
 | `hkt-stats <code>` | 港股通统计 | `hkt-stats 600000.SH` |
@@ -316,6 +318,8 @@ python scripts/qmt.py north
 - `market-times [market]` — 日内交易时段
 - `trading-calendar [market]` — 交易日历（含时段）
 - `option-list <code>` — 期权列表
+- `option-greeks <option_code>` — 从合约元数据和最新 close 本地计算 IV、Delta/Gamma/Vega/Theta/Rho；可传 `--option-price` / `--underlying-price` 使用盘口中间价
+- `option-greeks <underlying> --expiry <yyyymm>` — 批量计算整条到期月份；坏价保留为逐合约 `analytics_error`
 - `bsm-price` / `bsm-iv` — BSM 期权定价/隐含波动率
 - `hkt-stats` / `hkt-details` / `hkt-rate` — 港股通统计/明细/汇率
 - `top10-holder <code>` / `holder-num <code>` — 十大股东/股东户数

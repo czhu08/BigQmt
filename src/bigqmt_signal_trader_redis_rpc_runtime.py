@@ -38,31 +38,71 @@ if _load_bridge_module is not None:
     _strategy_module = _load_bridge_module("bigqmt_signal_trader_strategy")
     adjust = _strategy_module.adjust
     bind_qmt_api = _strategy_module.bind_qmt_api
+    capture_qmt_injected_funcs = _strategy_module.capture_qmt_injected_funcs
     configure = _strategy_module.configure
     deal_callback = _strategy_module.deal_callback
     handlebar = _strategy_module.handlebar
     init = _strategy_module.init
     order_callback = _strategy_module.order_callback
+    reset_app = _strategy_module.reset_app
     set_account_id = _strategy_module.set_account_id
     sync_positions = _strategy_module.sync_positions
 else:
     from bigqmt_signal_trader_strategy import (  # noqa: E402
         adjust,
         bind_qmt_api,
+        capture_qmt_injected_funcs,
         configure,
         deal_callback,
         handlebar,
         init,
         order_callback,
+        reset_app,
         set_account_id,
         sync_positions,
     )
+
+# QMT mounts this file by exec and injects trade/download/query globals into
+# THIS module's namespace (same mechanism as passorder). They are invisible to
+# the strategy module -- its _EXTRA_QMT_GLOBAL_FUNCS resolution checks the
+# strategy module's globals and builtins only -- so without the capture below
+# every trade/download/query RPC is a silent no-op (verified live 2026-09-01:
+# get_ipo_info -> NotImplementedError, download_history_data -> False). A plain
+# import of this module (e.g. the DRYRUN loader) sees none of these names and
+# skips silently; DRYRUN's own explicit bind_runtime_api still governs there.
+# The capture goes through the strategy's capture_qmt_injected_funcs -- the
+# name list lives there and nowhere else, so no local hand-copied tuple.
+
+# QMT re-runs the strategy by re-exec'ing this file while the strategy module
+# stays cached in sys.modules -- reset its state (stop the old RPC service,
+# drop stale subscriptions) or the re-run leaks them.
+try:
+    reset_app()
+except NameError:
+    pass
+
+_qmt_injected = capture_qmt_injected_funcs(globals())
+if _qmt_injected:
+    bind_qmt_api(extra_funcs=_qmt_injected)
+    print("[bigqmt_runtime] bound QMT-injected globals: %s" % sorted(_qmt_injected))
 
 
 ACCOUNT_ID = ""
 # 账号类型：STOCK(股票) / CREDIT(信用/两融) / FUTURE(期货) / OPTION(期权)
 # 对应 xtconstant 枚举：SECURITY_ACCOUNT=2 / CREDIT_ACCOUNT=3 / FUTURE_ACCOUNT=1
 ACCOUNT_TYPE = "STOCK"
+# 这台机器上到底有没有 redis 可用。默认 True 只是为了不改变既有部署的行为；
+# 它并不代表「配了 redis」—— 下面 REDIS_HOST/PORT 有默认值，所以光看配置永远
+# 分辨不出「我配了 redis」和「我什么都没写」（issue #147）。
+#
+# 设成 False 时 configure_runtime 干脆不发 redis 块，于是 config["redis"] 为空，
+# 五个使用方（委托身份库、异步下载任务、全推快照缓存、exec 事件、身份回填）
+# 各自的 `if not redis_config: return None` 自然生效，一次都不会去连。
+#
+# 用在 redis 根本不可用的环境：券商 QMT 的 import 白名单不含 redis（issue #145），
+# 或者纯 zmq 部署本来就没打算装 redis。transport=redis 时这个开关被忽略 ——
+# 那种部署没有 redis 就没有 RPC。
+REDIS_ENABLED = True
 REDIS_HOST = "127.0.0.1"
 REDIS_PORT = 6379
 REDIS_DB = 5
@@ -196,6 +236,7 @@ def _report_account_type():
 
 _report_deployment()
 _report_account_type()
+REDIS_ENABLED = bool(BIGQMT_REDIS_CONFIG.get("redis_enabled", REDIS_ENABLED))
 REDIS_HOST = BIGQMT_REDIS_CONFIG.get("host", REDIS_HOST)
 REDIS_PORT = int(BIGQMT_REDIS_CONFIG.get("port", REDIS_PORT))
 REDIS_DB = int(BIGQMT_REDIS_CONFIG.get("db", REDIS_DB))
@@ -240,6 +281,30 @@ EXEC_EVENTS_DEBUG_RAW_FIELDS = bool(
 )
 
 
+def _redis_block():
+    """The redis settings, or {} when this deployment has no redis (#147).
+
+    An empty dict is the whole point: every consumer already guards with
+    `if not redis_config: return None`, and those guards were dead because
+    this block was emitted unconditionally with module defaults.
+
+    transport=redis overrides the switch -- that deployment cannot run without
+    redis, so honouring redis_enabled=False there would break the RPC bridge
+    itself rather than the optional extras.
+    """
+    if not REDIS_ENABLED and RPC_TRANSPORT not in ("redis", "", "default"):
+        return {}
+    return {
+        "host": REDIS_HOST,
+        "port": REDIS_PORT,
+        "db": REDIS_DB,
+        "username": REDIS_USERNAME,
+        "password": REDIS_PASSWORD,
+        "position_key_template": "bigqmt:positions:{account_id}",
+        "position_event_stream_template": "bigqmt:position_events:{account_id}",
+    }
+
+
 def _apply_config(account_id):
     account_id = str(account_id or "")
     if account_id:
@@ -252,15 +317,7 @@ def _apply_config(account_id):
         enable_rpc=True,
         schedule_adjust=SCHEDULE_ADJUST_ENABLED,
         schedule_adjust_interval=SCHEDULE_ADJUST_INTERVAL,
-        redis={
-            "host": REDIS_HOST,
-            "port": REDIS_PORT,
-            "db": REDIS_DB,
-            "username": REDIS_USERNAME,
-            "password": REDIS_PASSWORD,
-            "position_key_template": "bigqmt:positions:{account_id}",
-            "position_event_stream_template": "bigqmt:position_events:{account_id}",
-        },
+        redis=_redis_block(),
         rpc={
             "enabled": True,
             "account_id": account_id,
@@ -309,8 +366,9 @@ def configure_runtime_account(account_id):
 
 
 def configure_runtime_redis(redis_config):
-    global REDIS_HOST, REDIS_PORT, REDIS_DB, REDIS_USERNAME, REDIS_PASSWORD, RPC_ALLOW_ORDER_METHODS, RPC_PROCESS_IN_LISTENER, RPC_BACKGROUND_THREADS, RPC_LISTENER_METHODS, SCHEDULE_ADJUST_ENABLED, SCHEDULE_ADJUST_INTERVAL, FULL_TICK_CACHE_ENABLED, FULL_TICK_DEMAND_TTL_SECONDS, FULL_TICK_CACHE_TTL_SECONDS, FULL_TICK_REFRESH_INTERVAL_SECONDS, FULL_TICK_MARKET_REFRESH_INTERVAL_SECONDS, FULL_TICK_REFRESH_MAX_WALL_SECONDS, FULL_TICK_MAX_REQUESTS, RPC_TRANSPORT, RPC_ZMQ_CONFIG, RPC_MYSQL_CONFIG, DOWNLOAD_JOBS_ENABLED, DOWNLOAD_JOB_CHUNK_SIZE, DOWNLOAD_JOB_MAX_WALL_SECONDS, DOWNLOAD_JOB_TTL_SECONDS, EXEC_EVENTS_ENABLED, EXEC_EVENTS_DEBUG_RAW_FIELDS
+    global REDIS_ENABLED, REDIS_HOST, REDIS_PORT, REDIS_DB, REDIS_USERNAME, REDIS_PASSWORD, RPC_ALLOW_ORDER_METHODS, RPC_PROCESS_IN_LISTENER, RPC_BACKGROUND_THREADS, RPC_LISTENER_METHODS, SCHEDULE_ADJUST_ENABLED, SCHEDULE_ADJUST_INTERVAL, FULL_TICK_CACHE_ENABLED, FULL_TICK_DEMAND_TTL_SECONDS, FULL_TICK_CACHE_TTL_SECONDS, FULL_TICK_REFRESH_INTERVAL_SECONDS, FULL_TICK_MARKET_REFRESH_INTERVAL_SECONDS, FULL_TICK_REFRESH_MAX_WALL_SECONDS, FULL_TICK_MAX_REQUESTS, RPC_TRANSPORT, RPC_ZMQ_CONFIG, RPC_MYSQL_CONFIG, DOWNLOAD_JOBS_ENABLED, DOWNLOAD_JOB_CHUNK_SIZE, DOWNLOAD_JOB_MAX_WALL_SECONDS, DOWNLOAD_JOB_TTL_SECONDS, EXEC_EVENTS_ENABLED, EXEC_EVENTS_DEBUG_RAW_FIELDS
     redis_config = dict(redis_config or {})
+    REDIS_ENABLED = bool(redis_config.get("redis_enabled", REDIS_ENABLED))
     REDIS_HOST = redis_config.get("host", REDIS_HOST)
     REDIS_PORT = int(redis_config.get("port", REDIS_PORT))
     REDIS_DB = int(redis_config.get("db", REDIS_DB))

@@ -30,7 +30,7 @@ from xtquant.xttype import StockAccount
 from .full_tick_cache import request_full_tick_cache, wait_full_tick_cache
 from .local_cache import LocalMarketCache
 from .order_id import OrderId, order_sys_id_of
-from .redis_rpc import call_redis_rpc
+from .redis_rpc import TYPED_PAYLOAD_FLAG, call_redis_rpc
 from .logging_setup import get_logger
 
 log = get_logger("xtquant_compat")
@@ -354,6 +354,70 @@ def _as_list(value):
     return [value]
 
 
+def _account_type_name(value):
+    """The NAME of an account type, whatever form it arrives in.
+
+    StockAccount stores the numeric code, not the string it was constructed
+    with: StockAccount(id, "CREDIT").account_type is 3. Comparing that against
+    the server's "CREDIT" would report a mismatch on every credit account.
+    """
+    text = str("" if value is None else value).strip()
+    if not text:
+        return ""
+    if text.isdigit():
+        try:
+            from xtquant.xtconstant import ACCOUNT_TYPE_DICT
+
+            return str(ACCOUNT_TYPE_DICT.get(int(text), "")).strip().upper()
+        except Exception:
+            return ""
+    return text.upper()
+
+
+def _account_type_code(value):
+    """The xtconstant NUMBER for an account type, whatever form it arrives in.
+
+    The mirror of _account_type_name. XtOrder / XtTrade / XtPosition all carry
+    account_type as an int (xttype sets it to SECURITY_ACCOUNT), so a name has
+    to come back as a number before it reaches a caller. 0 means "nothing to
+    go on" -- the caller decides what to fall back to.
+    """
+    text = str("" if value is None else value).strip()
+    if not text:
+        return 0
+    try:
+        return int(text)
+    except (TypeError, ValueError):
+        pass
+    upper = text.upper()
+    try:
+        from xtquant import xtconstant
+    except Exception:
+        return 0
+    # NOT ACCOUNT_TYPE_DICT alone: the xtquant that wins inside Big QMT is the
+    # terminal's own bundled copy, which has 91 of this shim's 538 names and
+    # does not include that dict. A client can land on it too -- appending the
+    # QMT python directory to sys.path is a documented way to reach the config
+    # modules. Fall back to the individual *_ACCOUNT constants, which both
+    # copies have.
+    table = getattr(xtconstant, "ACCOUNT_TYPE_DICT", None)
+    if isinstance(table, dict):
+        for code, name in table.items():
+            if str(name).strip().upper() == upper:
+                try:
+                    return int(code)
+                except (TypeError, ValueError):
+                    break
+    for attribute in ("%s_ACCOUNT" % upper,
+                      "SECURITY_ACCOUNT" if upper == "STOCK" else ""):
+        if not attribute:
+            continue
+        code = getattr(xtconstant, attribute, None)
+        if isinstance(code, int) and not isinstance(code, bool):
+            return int(code)
+    return 0
+
+
 def _restore_jsonable(value):
     if isinstance(value, dict):
         marker = value.get("__bigqmt_type__")
@@ -364,6 +428,13 @@ def _restore_jsonable(value):
                 return pd.DataFrame(value.get("records") or [], columns=value.get("columns") or None)
             except Exception:
                 return value.get("records") or []
+        if marker == "Panel":
+            # pandas dropped Panel in 1.0, so a 3-D object cannot be rebuilt on
+            # a modern client. It comes back as what a caller can actually use:
+            # {item: DataFrame} (issue #115). The axis labels ride along for
+            # anyone who needs to know how the cube was sliced.
+            return {key: _restore_jsonable(item)
+                    for key, item in (value.get("data") or {}).items()}
         if marker == "Series":
             try:
                 import pandas as pd
@@ -394,6 +465,75 @@ def _parse_qmt_stime(value):
         except ValueError:
             return None
     return None
+
+
+# FormulaServer 快照滞后检测：实测它会把 1m 数据冻结数小时（11:30 后不再
+# 更新，收盘后还在发午间数据）。对直连回答的 intraday 数据做时间差检测：
+# 滞后即告警 + 本次自动回落 RPC 桥拿实时数据，并在冷却期内跳过直连
+# （冷却到期自动重新探测，自愈）。
+_FORMULA_STALE_INTRADAY_PERIODS = ("tick", "1m", "3m", "5m", "15m", "30m", "1h")
+_FORMULA_STALE_WARN_LAG_SECONDS = 30 * 60
+_FORMULA_STALE_COOLDOWN_SECONDS = 120.0
+_formula_stale_warned = {}
+_formula_stale_until = {"ts": 0.0}
+
+
+def _formula_bars_stale(data, params):
+    """返回 (code, newest_dt, lag_seconds) 或 None。只检测，不告警。"""
+    try:
+        period = str((params or {}).get("period") or "").lower()
+        if period not in _FORMULA_STALE_INTRADAY_PERIODS:
+            return None
+        now = _dt.datetime.now()
+        today = now.date()
+        for code, df in (data or {}).items():
+            # 公式直连返回的帧时间轴在 stime 列（RangeIndex），
+            # 兼容层归一化后的帧在索引上——两种形态都认。
+            newest_value = None
+            for col in ("stime", "time"):
+                if col in list(getattr(df, "columns", [])):
+                    newest_value = df[col].iloc[-1]
+                    break
+            if newest_value is None:
+                index = getattr(df, "index", None)
+                if index is not None and len(index):
+                    newest_value = index[-1]
+            newest = _parse_qmt_stime(newest_value)
+            if newest is None:
+                continue
+            lag = (now - newest).total_seconds()
+            if (newest.date() < today) or (lag > _FORMULA_STALE_WARN_LAG_SECONDS):
+                return (str(code), newest, lag)
+    except Exception:
+        pass
+    return None
+
+
+def _warn_stale_formula_bars(data, params, hit=None):
+    try:
+        period = str((params or {}).get("period") or "").lower()
+        today = _dt.datetime.now().date()
+        if hit is None:
+            hit = _formula_bars_stale(data, params)
+        if hit is None:
+            return
+        code, newest, lag = hit
+        key = (code, period, str(today))
+        if _formula_stale_warned.get(key):
+            return
+        _formula_stale_warned[key] = True
+        log.warning(
+            "FormulaServer data looks stale for %s %s: newest bar %s lags now by %.0fs. "
+            "Falling back to the RPC bridge for live reads (cooldown %.0fs).",
+            code, period, newest, lag, _FORMULA_STALE_COOLDOWN_SECONDS,
+        )
+    except Exception:
+        pass
+
+
+def _formula_stale_active():
+    """冷却期内跳过公式直连（检测到滞后之后的一段时间）。"""
+    return time.time() < _formula_stale_until.get("ts", 0.0)
 
 
 def _qmt_stime_index(value):
@@ -529,7 +669,7 @@ class BigQmtRpcClient:
             if timeout_seconds is not None
             else config_timeout
             if config_timeout is not None
-            else _env_float("BIGQMT_RPC_TIMEOUT_SECONDS", 6.0)
+            else _env_float("BIGQMT_RPC_TIMEOUT_SECONDS", DEFAULT_RPC_TIMEOUT_SECONDS)
         )
         config_download_wait = client_config.get("download_wait_seconds")
         self.download_wait_seconds = float(
@@ -689,7 +829,7 @@ class BigQmtRpcClient:
                 self._formula_router_instance = _Disabled()
         return self._formula_router_instance
 
-    def call(self, method, params=None, account_id=None, timeout_seconds=None):
+    def call(self, method, params=None, account_id=None, timeout_seconds=None, use_formula=True):
         target_account = str(account_id or self.account_id or "")
         if not target_account:
             raise ValueError(_missing_account_id_message())
@@ -698,12 +838,33 @@ class BigQmtRpcClient:
         # FormulaServer, bypassing the strategy process and its GIL. Anything it
         # declines (unmapped method, untranslatable params, server down) raises
         # Unroutable and drops through to the RPC bridge below.
-        router = self._formula_router()
-        if router.supports(method):
+        # use_formula=False 用于必须拿到最新数据的调用（如 subscribe_quote 的
+        # 盘中形成 bar 轮询）——FormulaServer 的快照可能滞后数小时（实测盘中
+        # 11:30 后冻结），形成 bar 只能走 RPC 桥读 QMT 实时数据。
+        router = self._formula_router() if use_formula else None
+        # 冷却期（公式数据刚被检出滞后）只对 get_market_data_ex 跳过直连——
+        # 其他方法是静态参考数据，不受时间序列滞后影响，照常走快速路径。
+        skip_formula = (
+            router is not None
+            and method == "get_market_data_ex"
+            and _formula_stale_active()
+        )
+        if router is not None and router.supports(method) and not skip_formula:
             from .formula_server import Unroutable
 
             try:
-                return _restore_jsonable(router.call(method, params or {}))
+                result = _restore_jsonable(router.call(method, params or {}))
+                if method == "get_market_data_ex":
+                    # 直连快照可能滞后（实测冻结数小时）——滞后即告警、
+                    # 本次调用自动回落 RPC 桥拿实时数据，并进入冷却期
+                    # 让后续调用直接跳过直连（到期重新探测，自愈）。
+                    hit = _formula_bars_stale(result, params or {})
+                    if hit is not None:
+                        _warn_stale_formula_bars(result, params or {}, hit=hit)
+                        _formula_stale_until["ts"] = time.time() + _FORMULA_STALE_COOLDOWN_SECONDS
+                        return self.call(method, params, account_id=account_id,
+                                         timeout_seconds=timeout_seconds, use_formula=False)
+                return result
             except Unroutable:
                 pass
         transport = self._transport()
@@ -735,6 +896,12 @@ class BigQmtRpcClient:
         server_error = str(response.get("server_error") or "")
         if server_error:
             raise RuntimeError("Big QMT %s server_error: %s" % (method, server_error))
+        # The transport already scanned the raw text for a typed envelope; when
+        # it found none there is provably nothing to rebuild, and skipping the
+        # walk turns 345.9ms into 3.7ms on a 51285-instrument snapshot. A None
+        # flag means the text was never seen (in-process routing), so walk.
+        if response.pop(TYPED_PAYLOAD_FLAG, None) is False:
+            return response.get("data")
         return _restore_jsonable(response.get("data"))
 
     # ------------------------------------------------------------------
@@ -878,6 +1045,15 @@ def ipo_market_of(code):
 MARKET_TOKENS = frozenset({"SH", "SZ", "BJ", "HK"})
 # Above this many explicit codes, one RPC's single timeout starts to matter more
 # than the extra payload of reading the exchange and filtering (issue #104).
+# Measured against a live bridge: query_orders 1.5s, get_asset 1.4s,
+# get_financial_data 0.8s warm, a whole-market get_full_tick 7.7s. The old
+# 6s default sat under the cost of ordinary QMT data calls, and timing out
+# here is worse than waiting: the bridge keeps working on the abandoned
+# request, so the next call queues behind it and one timeout breeds more.
+# 30s is also what the whole-market snapshot path already used, so there is
+# one number rather than two.
+DEFAULT_RPC_TIMEOUT_SECONDS = 30.0
+
 LARGE_CODE_LIST = 1000
 # What the fallback reads first. Stocks are 8.7% of an exchange listing, so
 # starting narrow is 1.08s against 7.4s; it widens to "all" only if that misses.
@@ -920,8 +1096,9 @@ def _notice_field_list_cost(field_list):
     """Say once that naming fields is what enables the fast path.
 
     Not a warning about a mistake: an empty field_list correctly returns all 11
-    columns and only RPC can do that. But the 30x is invisible unless someone
-    tells you it exists (issue #104)."""
+    columns and only RPC can do that. But the speedup is invisible unless
+    someone tells you it exists (issue #104). Asking for a field the direct
+    path lacks is safe -- it falls back to RPC rather than returning NaN."""
     if field_list or _FIELD_LIST_NOTICE["shown"]:
         return
     _FIELD_LIST_NOTICE["shown"] = True
@@ -929,8 +1106,10 @@ def _notice_field_list_cost(field_list):
         log.info(
             "get_market_data_ex with an empty field_list returns all 11 columns "
             "and must go over RPC. If the six OHLCV columns %s are enough, pass "
-            "them as field_list -- that path is served by FormulaServer, ~30x "
-            "faster (0.03s vs 0.97s measured).", ", ".join(DIRECT_PATH_FIELDS))
+            "them as field_list -- that path is served by FormulaServer, 0.015s "
+            "against 5.8s measured. Naming preClose / suspendFlag / "
+            "settelementPrice / openInterest falls back to RPC, so a wider "
+            "field_list is safe, just not faster.", ", ".join(DIRECT_PATH_FIELDS))
     except Exception:
         pass
 
@@ -1180,8 +1359,9 @@ class BigQmtXtData:
         Args:
             code_list: stock codes to query.
             timeout_seconds: per-request RPC timeout. None = auto (30s for whole-market
-                snapshots, else client default 120s). Callers can pass a larger value
-                when querying many codes (e.g. 1256 ETF options may need 150-180s).
+                snapshots, else the client default, DEFAULT_RPC_TIMEOUT_SECONDS).
+                Callers can pass a larger value when querying many codes (e.g. 1256
+                ETF options may need 150-180s).
         """
         codes = list(code_list or [])
         if not codes:
@@ -1221,20 +1401,42 @@ class BigQmtXtData:
             rpc_timeout = timeout_seconds
         else:
             rpc_timeout = 30 if upper_codes & {"SH", "SZ", "BJ", "HK"} else None
+        failure = None
         try:
             data = self.client.call(
                 "get_full_tick", _full_tick_params(codes, types),
                 timeout_seconds=rpc_timeout) or {}
-        except Exception:
+        except Exception as exc:
             data = None
+            failure = exc
             if not self._can_fall_back_to_markets(codes, upper_codes):
                 raise
         if self._should_fall_back(codes, upper_codes, data):
-            recovered = self._full_tick_via_markets(codes, rpc_timeout, types)
+            fallback_errors = []
+            recovered = self._full_tick_via_markets(
+                codes, rpc_timeout, types, errors=fallback_errors)
             if recovered is not None:
                 return recovered
-            if data is None:
-                raise
+            if failure is not None:
+                # A bare `raise` here has no active exception -- the except
+                # block above has already exited -- so it produced
+                # "RuntimeError: No active exception to reraise" and buried
+                # the real timeout (reported on issue #104). Re-raise the
+                # actual failure, and say why the recovery did not help.
+                if fallback_errors:
+                    log.warning(
+                        "get_full_tick: %d codes failed directly (%s) and the "
+                        "market re-read failed too (%s: %s); raising the "
+                        "original failure.",
+                        len(codes), failure,
+                        fallback_errors[-1].__class__.__name__,
+                        fallback_errors[-1])
+                else:
+                    log.warning(
+                        "get_full_tick: %d codes failed directly (%s) and "
+                        "could not be recovered from a market read.",
+                        len(codes), failure)
+                raise failure
         return data or {}
 
     def _can_fall_back_to_markets(self, codes, upper_codes):
@@ -1255,7 +1457,7 @@ class BigQmtXtData:
         # than was asked for (issue #104).
         return len(data) < len(set(str(c) for c in codes))
 
-    def _full_tick_via_markets(self, codes, rpc_timeout, types=None):
+    def _full_tick_via_markets(self, codes, rpc_timeout, types=None, errors=None):
         """Read the exchange(s) these codes live on, then filter to them.
 
         A long explicit list is one RPC carrying one timeout, so it either fits
@@ -1287,7 +1489,11 @@ class BigQmtXtData:
                     for key, value in snapshot.items():
                         if str(key) in wanted:
                             merged[key] = value
-            except Exception:
+            except Exception as exc:
+                # Swallowing the reason here left the caller with nothing to
+                # report; hand it back so the raise can name it (issue #104).
+                if errors is not None:
+                    errors.append(exc)
                 return None
             if len(merged) >= len(wanted):
                 break          # everything asked for; no need to widen
@@ -1320,6 +1526,40 @@ class BigQmtXtData:
 
     def get_instrument_type(self, stock_code, variety_list=None):
         return self._call("get_instrument_type", code=stock_code, variety_list=variety_list)
+
+    def get_stock_type(self, stock_code, variety_list=None):
+        """xtdata.get_stock_type 的同名封装 —— 大 QMT 上答不了，直接报错。
+
+        服务端走的是 ContextInfo.get_stock_type(stock)。这个 stub 在大 QMT 上
+        存在（缺失会抛 NotImplementedError），但**对任何代码都返回 0**：实测
+        股票 600000.SH、ETF 589820.SH、沪市债券 186511.SH、期权
+        10011096.SHO 全部是 0，换代码格式（600000 / SH600000 /
+        600000.SSE）也一样。
+
+        返回一个恒为 0 的"类型"比报 AttributeError 更糟：报错看得见，一个
+        错的分类看不见。所以这里显式拒绝，并指向真正能用的那个：
+        get_instrument_type()，实测能区分 stock / fund / etf / bond / index。
+        """
+        raise NotImplementedError(
+            "get_stock_type is not usable on Big QMT: the server-side "
+            "ContextInfo.get_stock_type stub returns 0 for every code "
+            "(verified live against a stock, an ETF, a bond and an option, and "
+            "against every code format). Use get_instrument_type(stock_code) "
+            "instead -- it returns "
+            "{'stock': ..., 'fund': ..., 'etf': ..., 'bond': ..., 'index': ...}."
+        )
+
+    def subscribe_l2thousand(self, stock_code, gear_num=None, callback=None):
+        """千档盘口订阅。
+
+        callback 在 RPC 模型下没有回调通道，服务端会忽略它 —— 想要推送请用
+        subscribe_whole_quote。这里保留形参只为和 xtdata 签名一致。
+        """
+        return self._call(
+            "subscribe_l2thousand",
+            stock_code=stock_code,
+            gear_num=0 if gear_num is None else gear_num,
+        )
 
     def get_stock_list_in_sector(self, sector_name, real_timetag=-1):
         name = str(sector_name or "")
@@ -1357,9 +1597,14 @@ class BigQmtXtData:
         # Self-heal adjusted reads (all-zero bars -> server raw download + retry).
         return self._heal_adjusted("get_market_data", params, data)
 
-    def _get_market_data_ex_batch(self, params, timeout_seconds=None):
+    def _get_market_data_ex_batch(self, params, timeout_seconds=None, use_formula=True):
         """One RPC's worth of bars, healed and normalized. No caching."""
-        data = self.client.call("get_market_data_ex", params, timeout_seconds=timeout_seconds)
+        if use_formula:
+            data = self.client.call("get_market_data_ex", params, timeout_seconds=timeout_seconds)
+        else:
+            # 只在绕路时显式传参——保持既有调用方/桩签名不变。
+            data = self.client.call("get_market_data_ex", params, timeout_seconds=timeout_seconds,
+                                    use_formula=False)
         # Self-heal adjusted reads (all-zero bars -> server raw download + retry).
         data = self._heal_adjusted("get_market_data_ex", params, data, timeout_seconds=timeout_seconds)
         # Normalize Big QMT's stime-indexed frame to MiniQMT shape (time-indexed).
@@ -1379,6 +1624,7 @@ class BigQmtXtData:
         fill_data=True,
         chunk_size=None,
         timeout_seconds=None,
+        use_formula=True,
     ):
         """Pull bars over RPC, in batches of ``chunk_size`` codes.
 
@@ -1395,11 +1641,15 @@ class BigQmtXtData:
         ``chunk_size=0`` restores the old single-request behaviour.
 
         An empty ``field_list`` means "every field", which only the RPC path can
-        answer -- FormulaServer serves the six OHLCV columns and returns NaN for
-        settelementPrice / openInterest / preClose / suspendFlag, where RPC has
-        real values (preClose 9.07 against nan, measured). So the default stays
-        on RPC rather than quietly handing back NaN; naming the six fields you
-        actually want is what unlocks the ~30x direct path (issue #104).
+        answer: FormulaServer has the six bar columns plus time, and not the
+        four daily ones (settelementPrice, openInterest, preClose,
+        suspendFlag). Naming the fields you actually want is what unlocks the
+        direct path -- 0.015s against 5.8s, measured (issue #104).
+
+        Asking it for a field it lacks is now refused at the router and served
+        by RPC instead. It used to answer with a column of NaN, so naming all
+        eleven columns looked like a free speedup and quietly cost four of them
+        (see formula_server.SERVED_FIELDS).
         """
         _notice_field_list_cost(field_list)
         codes = list(stock_list or [])
@@ -1416,7 +1666,8 @@ class BigQmtXtData:
 
         if step <= 0 or len(codes) <= step:
             data = self._get_market_data_ex_batch(
-                dict(base, stock_list=codes), timeout_seconds=timeout_seconds
+                dict(base, stock_list=codes), timeout_seconds=timeout_seconds,
+                use_formula=use_formula,
             )
         else:
             data = {}
@@ -1425,7 +1676,8 @@ class BigQmtXtData:
                 batch = codes[index:index + step]
                 try:
                     part = self._get_market_data_ex_batch(
-                        dict(base, stock_list=batch), timeout_seconds=timeout_seconds
+                        dict(base, stock_list=batch), timeout_seconds=timeout_seconds,
+                        use_formula=use_formula,
                     )
                 except Exception as exc:
                     # Losing one batch must not lose the others: a partial
@@ -1565,16 +1817,43 @@ class BigQmtXtData:
         except Exception:
             pass
 
+    @staticmethod
+    def _served_codes(data):
+        """Codes the server actually served, across both return shapes:
+        get_market_data_ex is code-keyed ({code: DataFrame}), get_market_data
+        is field-keyed ({field: {code: [..]}}) -- reading keys off the wrong
+        level would make every code look missing."""
+        if not isinstance(data, dict):
+            return set()
+        nested = {code for value in data.values() if isinstance(value, dict) for code in value}
+        return nested if nested else set(data.keys())
+
     def _heal_adjusted(self, method, params, data, wait_seconds=2.0, timeout_seconds=None):
-        """Self-heal adjusted reads: if the adjusted pull came back all-zero,
-        trigger a server-side raw download, wait for async landing, retry once."""
+        """Self-heal reads served from an unready raw store: if the adjusted
+        pull came back all-zero, or a none-adjusted pull came back missing
+        most requested codes, trigger a server-side raw download, wait for
+        async landing, retry once."""
         dividend_type = str(params.get("dividend_type") or "none").lower()
-        if dividend_type in ("", "none"):
-            return data
-        if not self._is_all_zero_any(data):
-            return data
         codes = list(params.get("stock_list") or params.get("stock_code") or [])
         if not codes:
+            return data
+        if dividend_type in ("", "none"):
+            # None-adjusted bars are never zero-filled, so the all-zero
+            # detector does not apply -- a *missing* code means the server
+            # has no raw bars for it at all. Big QMT's raw store is not
+            # auto-populated market-wide (a --tick pipeline read 8 of 5225
+            # codes on 2026-08-30 because nothing ever downloaded the raw
+            # dailies), so heal that the same way. But a full-market read
+            # always has a few codes the server can never serve (delisted,
+            # suspended, no quote permission), and healing on *any* missing
+            # code made those a per-call cost -- raw download + sleep + full
+            # re-read, every time. Heal only when the majority came back
+            # missing: that is the raw-store-not-populated signal.
+            served = self._served_codes(data)
+            missing = sum(1 for code in codes if code not in served)
+            if missing < max(1, len(codes) // 2):
+                return data
+        elif not self._is_all_zero_any(data):
             return data
         self._ensure_server_raw(
             codes,
@@ -1643,9 +1922,13 @@ class BigQmtXtData:
         seq = self._next_seq()
 
         def fetch():
+            # 盘中形成 bar 必须读 QMT 实时数据——FormulaServer 快照可能滞后数
+            # 小时（实测 11:30 后冻结，收盘后还停在午间数据），订阅推送如果走
+            # 直连会把"刚完成的 bar"发成数小时前的旧快照（issue #104 实测）。
             return self.get_market_data_ex(
                 stock_list=[stock_code], period=period,
-                start_time=start_time, end_time=end_time, count=count or 1)
+                start_time=start_time, end_time=end_time, count=count or 1,
+                use_formula=False)
 
         poller = _BarPoller(
             fetch, callback, self._bar_poll_interval_seconds(),
@@ -1808,12 +2091,15 @@ class BigQmtXtData:
 
         ``download_timeout_seconds`` covers the server-side download only; it is
         generous because a cold code with a wide window can take minutes.
+
+        The server-side download is best-effort while the client pull can still
+        save it (cache enabled), but with the local cache disabled it is the
+        entire job -- its failure raises instead of reporting {finished: total},
+        which would be the fake progress of issue #47.
         """
         codes = [str(c) for c in (stock_list or []) if str(c or "").strip()]
         if not codes:
             return {"finished": 0, "total": 0}
-        if self._local_cache() is None:
-            raise RuntimeError("local cache is disabled (set local_cache_enabled=True to download)")
 
         # Server-side download first, for EVERY dividend_type.
         #
@@ -1832,6 +2118,7 @@ class BigQmtXtData:
         # Adjusted data additionally NEEDS this: QMT computes front/back-adjusted
         # bars from raw bars + dividend factors, and both must exist server-side
         # or the result is all zeros.
+        server_download_error = None
         try:
             self.client.call(
                 "download_history_data2",
@@ -1843,10 +2130,30 @@ class BigQmtXtData:
                 },
                 timeout_seconds=float(download_timeout_seconds),
             )
-        except Exception:
-            # Best-effort: some deployments lack the QMT global; the pull below
-            # may still work if the data already exists server-side.
-            pass
+        except Exception as exc:
+            # Best-effort only while the pull below can still save the
+            # download (data already on the server). With the local cache
+            # disabled there is no pull -- the server-side download is the
+            # whole job, and reporting {finished: total} after a failed one
+            # is the fake progress of issue #47.
+            server_download_error = exc
+
+        if self._local_cache() is None:
+            # local cache disabled: server-side download only (step 1). The
+            # data lands in the server-side DATs, so this is real work -- not
+            # the fake progress download of issue #47. The client pull is
+            # skipped uniformly for every period (tick and bars alike) and
+            # progress is reported per code without any pull.
+            if server_download_error is not None:
+                raise server_download_error
+            total = len(codes)
+            for index, code in enumerate(codes, 1):
+                if callback is not None:
+                    try:
+                        callback({"finished": index, "total": total, "stockcode": code})
+                    except Exception:
+                        pass
+            return {"finished": total, "total": total}
 
         total = len(codes)
         step = int(chunk_size or 300)
@@ -1918,6 +2225,23 @@ class BigQmtXtData:
     def download_etf_info(self):
         return self._call("download_etf_info")
 
+    # 下面四个的服务端实现和 RPC 白名单一直都在（market_bigqmt 的
+    # download_* 方法 + redis_rpc 的 MARKET_DATA_METHODS），只是客户端漏了这层
+    # 包装，于是外部调用直接撞 AttributeError（issue #130）。
+    def download_sector_data(self):
+        return self._call("download_sector_data")
+
+    def download_cb_data(self):
+        return self._call("download_cb_data")
+
+    def download_index_weight(self):
+        return self._call("download_index_weight")
+
+    def download_history_contracts(self, incrementally=True):
+        # 形参保留是为了和 xtdata.download_history_contracts(incrementally=True)
+        # 签名一致；大 QMT 那边这个调用没有增量参数，服务端按全量下载处理。
+        return self._call("download_history_contracts")
+
     def get_option_list(self, undl_code, dedate, opttype="", isavailavle=False):
         return self._call("get_option_list", undl_code=undl_code, dedate=dedate, opttype=opttype, isavailavle=isavailavle)
 
@@ -1959,8 +2283,15 @@ class BigQmtXtData:
             callback(result)
         return result
 
-    def get_sector_list(self):
-        return self._call("get_sector_list")
+    def get_sector_list(self, allow_fallback=False):
+        """Sector names, or an error saying the terminal cannot list them.
+
+        ``allow_fallback=True`` opts into the 13 curated well-known names,
+        which still drive ``get_stock_list_in_sector``. Big QMT cannot
+        enumerate real sectors at all, and handing back the curated list
+        unasked made a fake answer indistinguishable from a real one (#143).
+        """
+        return self._call("get_sector_list", allow_fallback=bool(allow_fallback))
 
     def download_sector_data(self):
         provider = getattr(self.client, "_market_data_provider", None)
@@ -2106,6 +2437,60 @@ class BigQmtXtData:
     def get_option_iv(self, opt_code):
         return self._call("get_option_iv", opt_code=opt_code)
 
+    def get_option_analytics(
+        self,
+        opt_code,
+        option_price=None,
+        underlying_price=None,
+        as_of=None,
+        risk_free_rate=None,
+        dividend_yield=None,
+        price_period="1m",
+        include_native_iv=False,
+    ):
+        """Return client-side IV and Greeks for one option contract."""
+        from .option_analytics_client import get_option_analytics
+
+        return get_option_analytics(
+            self,
+            opt_code,
+            option_price=option_price,
+            underlying_price=underlying_price,
+            as_of=as_of,
+            risk_free_rate=risk_free_rate,
+            dividend_yield=dividend_yield,
+            price_period=price_period,
+            include_native_iv=include_native_iv,
+        )
+
+    def get_option_chain_analytics(
+        self,
+        undl_code,
+        dedate,
+        opttype="",
+        isavailavle=False,
+        underlying_price=None,
+        as_of=None,
+        risk_free_rate=None,
+        dividend_yield=None,
+        price_period="1m",
+    ):
+        """Return batched client-side IV and Greeks for one option expiry."""
+        from .option_analytics_client import get_option_chain_analytics
+
+        return get_option_chain_analytics(
+            self,
+            undl_code,
+            dedate,
+            opttype=opttype,
+            isavailavle=isavailavle,
+            underlying_price=underlying_price,
+            as_of=as_of,
+            risk_free_rate=risk_free_rate,
+            dividend_yield=dividend_yield,
+            price_period=price_period,
+        )
+
     def get_option_detail_data(self, stockcode):
         return self._call("get_option_detail_data", stockcode=stockcode)
 
@@ -2144,8 +2529,24 @@ class BigQmtXtData:
     def get_hkt_details(self, stock_code):
         return self._call("get_hkt_details", stock_code=stock_code)
 
+    # 自定义板块写入（issue #143）。每一个都在服务端写入后回读校验，所以
+    # 「没报错」现在真的代表写进去了 —— 以前 create_sector 是静默空操作。
     def create_sector(self, sector_name, stock_list):
         return self._call("create_sector", sector_name=sector_name, stock_list=list(stock_list or []))
+
+    def create_sector_folder(self, parent_node, folder_name, overwrite=False):
+        return self._call("create_sector_folder", parent_node=parent_node,
+                          folder_name=folder_name, overwrite=overwrite)
+
+    def reset_sector_stock_list(self, sector, stock_list):
+        return self._call("reset_sector_stock_list", sector=sector,
+                          stock_list=list(stock_list or []))
+
+    def add_stock_to_sector(self, sector, stock_code):
+        return self._call("add_stock_to_sector", sector=sector, stock_code=stock_code)
+
+    def remove_stock_from_sector(self, sector, stock_code):
+        return self._call("remove_stock_from_sector", sector=sector, stock_code=stock_code)
 
     def get_stock_name(self, stock):
         return self._call("get_stock_name", stock=stock)
@@ -2284,6 +2685,12 @@ class BigQmtXtTrader:
         self._async_order_lock = threading.Lock()
         # int -> 合同编号 for ids handed out as OrderId (issue #113).
         self._order_sys_ids = _OrderedDict()
+        # on_account_status used to report a hardcoded "STOCK" even for a
+        # credit deployment (issue #103). The server is authoritative -- the
+        # client's StockAccount(..., "CREDIT") never travels -- so prefer what
+        # ping reports, fall back to what the caller declared.
+        self._server_account_type = ""
+        self._declared_account_type = ""
 
     def _cached_position_snapshot(self, account_id):
         key = "bigqmt:positions:%s" % str(account_id or self.client.account_id or "")
@@ -2331,7 +2738,9 @@ class BigQmtXtTrader:
 
     def connect(self):
         if self.client.account_id:
-            mismatch = warn_on_version_mismatch(self.client.call("ping"))
+            pong = self.client.call("ping")
+            self._note_server_account_type(pong)
+            mismatch = warn_on_version_mismatch(pong)
             if mismatch and auto_sync_enabled():
                 self.sync_deployment()
         self._fire_account_status()
@@ -2374,6 +2783,10 @@ class BigQmtXtTrader:
         return result
 
     def subscribe(self, account):
+        declared = _account_type_name(getattr(account, "account_type", None))
+        if declared:
+            self._declared_account_type = declared
+            self._warn_on_account_type_mismatch()
         if not self.client.account_id:
             self.client.account_id = _account_id(account)
         # (Re)start the listener now that the account is known; the loop resubscribes
@@ -2399,6 +2812,35 @@ class BigQmtXtTrader:
         )
         self._event_thread.start()
 
+    def _note_server_account_type(self, pong):
+        """Remember what the deployment says it trades as."""
+        try:
+            reported = str((pong or {}).get("account_type") or "").strip().upper()
+        except Exception:
+            return
+        if reported:
+            self._server_account_type = reported
+            self._warn_on_account_type_mismatch()
+
+    def _warn_on_account_type_mismatch(self):
+        """Say so when the caller and the deployment disagree.
+
+        A client asking for CREDIT against a STOCK deployment gets an all-zero
+        asset row and no error at all -- that was issue #92, and it cost the
+        reporter a long time because nothing anywhere said the two disagreed.
+        """
+        server = self._server_account_type
+        declared = self._declared_account_type
+        if not server or not declared or server == declared:
+            return
+        log.warning(
+            "account_type mismatch: this client asked for %s but the QMT "
+            "deployment is configured as %s. The client's StockAccount type "
+            "does NOT travel to the server -- set BIGQMT_ACCOUNT_TYPE = %r in "
+            "the QMT-side local config and restart the strategy. Until then "
+            "queries answer as %s (a credit account read as STOCK returns an "
+            "all-zero asset row).", declared, server, declared, server)
+
     def _fire_account_status(self):
         """Fire on_account_status after connect/subscribe (MiniQMT parity).
 
@@ -2413,7 +2855,8 @@ class BigQmtXtTrader:
             callback.on_account_status(
                 CompatObject(
                     account_id=str(self.client.account_id or ""),
-                    account_type="STOCK",
+                    account_type=(self._server_account_type
+                                  or self._declared_account_type or "STOCK"),
                     status=1,  # ACCOUNT_STATUS_ONLINE (MiniQMT XtAccountStatus)
                 )
             )
@@ -2650,7 +3093,9 @@ class BigQmtXtTrader:
         if market_value is None:
             market_value = price * volume
         return CompatObject(
-            account_type=2,
+            # 以前硬编码 2（SECURITY_ACCOUNT），信用账户上就是错的 —— 和 #103
+            # 报的 on_account_status 同一类。现在跟服务端说的走。
+            account_type=self._account_type_value(item),
             account_id=account_id,
             stock_code=stock_code,
             stock_name=stock_name,
@@ -2875,6 +3320,47 @@ class BigQmtXtTrader:
             account_id=account_id,
         ) or []
         return [self._trade_from_dict(account_id, item) for item in _as_list(data)]
+
+    def describe_trade_detail_fields(self, account, detail_types=None):
+        """Which attributes QMT's own ORDER / DEAL rows carry. Names only.
+
+        A debugging aid, not part of MiniQMT: when a field comes back empty,
+        this says whether the terminal is not providing it or the bridge is
+        not forwarding it. Those two look identical from the client and have
+        cost a deploy-and-restart each time (#113, #130, #133).
+
+            xt_trader.describe_trade_detail_fields(account)
+            -> {'ORDER': {'rows': 15, 'attributes': [...], 'error': ''}, ...}
+        """
+        account_id = _account_id(account, self.client.account_id)
+        params = {"account_id": account_id}
+        if detail_types:
+            params["detail_types"] = list(detail_types)
+        return self.client.call("describe_trade_detail_fields", params,
+                                account_id=account_id) or {}
+
+    def reload_deployment(self, reason="", account=None):
+        """Re-import the deployed package and re-run init, without a restart.
+
+        Returns as soon as the reload is SCHEDULED -- it runs on the next
+        adjust tick, because performing it stops the RPC service answering the
+        request. Poll reload_status() (or get_deployment_info()) for the
+        outcome.
+
+        Refreshes everything under bigqmt_signal_trader/. It cannot refresh
+        bigqmt_signal_trader_strategy.py or the BIGQMT_REDIS_DRYRUN entry --
+        QMT execs those, and a module cannot reload the one it is running in.
+        Changes there still need a strategy restart.
+        """
+        account_id = _account_id(account, self.client.account_id)
+        return self.client.call("reload_deployment", {"reason": str(reason or "")},
+                                account_id=account_id) or {}
+
+    def reload_status(self, account=None):
+        """Outcome of the last reload_deployment, or what is still pending."""
+        account_id = _account_id(account, self.client.account_id)
+        return self.client.call("reload_status", {},
+                                account_id=account_id) or {}
 
     def query_execution_snapshot(
         self,
@@ -3699,6 +4185,28 @@ class BigQmtXtTrader:
         # 语义：seq 为 -1 表示委托失败）。
         return -1
 
+    def _account_type_value(self, item=None):
+        """account_type for an XtOrder / XtTrade / XtPosition, as an int.
+
+        Server first (it is the one that knows what this deployment trades
+        as -- #103), then what the caller declared, then SECURITY_ACCOUNT so
+        the field is never absent. Positions used to hardcode 2 and orders and
+        trades did not carry it at all (#133).
+        """
+        code = _account_type_code((item or {}).get("account_type"))
+        if code:
+            return code
+        code = _account_type_code(self._server_account_type
+                                 or self._declared_account_type)
+        if code:
+            return code
+        try:
+            from xtquant.xtconstant import SECURITY_ACCOUNT
+
+            return int(SECURITY_ACCOUNT)
+        except Exception:
+            return 2
+
     def _order_from_dict(self, account_id, item):
         action = item.get("action")
         order_type = _action_to_order_type(action)
@@ -3728,6 +4236,14 @@ class BigQmtXtTrader:
             # MiniQMT XtOrder.status_msg —— 废单时柜台给的原因 (issue #60)。
             status_msg=str(item.get("status_msg") or ""),
             price_type=item.get("price_type"),
+            # xttype.XtOrder 契约里有、以前没发的字段 (issue #133)。旧部署不发
+            # 这些键，所以每个都要能在缺失时给出 MiniQMT 语义的默认值，而不是
+            # 让调用方撞 AttributeError —— 那正是这个 issue 报的现象。
+            account_type=self._account_type_value(item),
+            instrument_name=str(item.get("instrument_name") or ""),
+            secu_account=str(item.get("secu_account") or ""),
+            offset_flag=item.get("offset_flag"),
+            direction=item.get("direction"),
         )
 
     def _trade_from_dict(self, account_id, item):
@@ -3761,7 +4277,13 @@ class BigQmtXtTrader:
             traded_at=str(item.get("traded_at") or ""),
             strategy_name=str(item.get("strategy_name") or ""),
             order_remark=str(item.get("user_order_id") or item.get("remark") or ""),
-            commission=float(item.get("commission") or 0),
+            # 同 _order_from_dict：xttype.XtTrade 契约里有而以前没发的 (issue #133)。
+            account_type=self._account_type_value(item),
+            instrument_name=str(item.get("instrument_name") or ""),
+            secu_account=str(item.get("secu_account") or ""),
+            commission=_safe_float(item.get("commission"), 0.0),
+            offset_flag=item.get("offset_flag"),
+            direction=item.get("direction"),
         )
 
 

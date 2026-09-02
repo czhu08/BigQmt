@@ -39,8 +39,28 @@ def get_stock_list_in_sector(sector_name, real_timetag=-1):
     return _compat.xtdata.get_stock_list_in_sector(sector_name, real_timetag=real_timetag)
 
 
-def get_sector_list():
-    return _compat.xtdata.get_sector_list()
+def get_sector_list(allow_fallback=False):
+    return _compat.xtdata.get_sector_list(allow_fallback=allow_fallback)
+
+
+def create_sector(sector_name, stock_list):
+    return _compat.xtdata.create_sector(sector_name, stock_list)
+
+
+def create_sector_folder(parent_node, folder_name, overwrite=False):
+    return _compat.xtdata.create_sector_folder(parent_node, folder_name, overwrite)
+
+
+def reset_sector_stock_list(sector, stock_list):
+    return _compat.xtdata.reset_sector_stock_list(sector, stock_list)
+
+
+def add_stock_to_sector(sector, stock_code):
+    return _compat.xtdata.add_stock_to_sector(sector, stock_code)
+
+
+def remove_stock_from_sector(sector, stock_code):
+    return _compat.xtdata.remove_stock_from_sector(sector, stock_code)
 
 
 def get_sector_info(sector_name=""):
@@ -105,7 +125,10 @@ def get_trading_dates(market, start_time="", end_time="", count=-1):
 
 
 def get_stock_type(stock):
-    return _compat.xtdata.call_method("get_stock_type", stock=stock)
+    # 走包装而不是 call_method：包装里写了为什么这个方法在大 QMT 上答不了
+    # （ContextInfo stub 对任何代码都返回 0）。两条路径必须一致，否则
+    # 顶层 xtdata 还会把那个 0 递给调用方。
+    return _compat.xtdata.get_stock_type(stock)
 
 
 def get_holidays():

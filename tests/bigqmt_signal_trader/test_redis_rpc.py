@@ -10,7 +10,13 @@ sys.path.insert(0, os.path.join(ROOT, "src"))
 
 from bigqmt_signal_trader.adapters.market_bigqmt import BigQmtMarketDataProvider
 from bigqmt_signal_trader.adapters.order_dryrun import DryRunOrderGateway
-from bigqmt_signal_trader.models import AssetSnapshot, OrderSnapshot, PositionSnapshot, TradeSnapshot
+from bigqmt_signal_trader.models import (
+    AssetSnapshot,
+    CancelResult,
+    OrderSnapshot,
+    PositionSnapshot,
+    TradeSnapshot,
+)
 from bigqmt_signal_trader.redis_rpc import (
     RPC_REVISION,
     BigQmtRpcHandlers,
@@ -280,6 +286,170 @@ class LateLandingOrderGateway(DryRunOrderGateway):
                 status="50",
             )
         ]
+
+
+class FalseyCancelGateway(DryRunOrderGateway):
+    """Full QMT #148: native cancel is falsey before status confirms success."""
+
+    def __init__(self, statuses, native_success=False, query_error=None):
+        super().__init__()
+        self.statuses = list(statuses)
+        self.native_success = native_success
+        self.query_error = query_error
+        self.lookups = 0
+
+    def cancel(self, order_ref):
+        self.cancelled.append(order_ref)
+        return CancelResult(
+            success=self.native_success,
+            message="" if self.native_success else "cancel returned false",
+        )
+
+    def query_orders(self, account_id, strategy_name):
+        self.lookups += 1
+        if self.query_error is not None:
+            raise self.query_error
+        if not self.statuses:
+            return []
+        status = self.statuses[min(self.lookups - 1, len(self.statuses) - 1)]
+        return [
+            OrderSnapshot(
+                order_sys_id="cancel-1",
+                user_order_id="remark-cancel-1",
+                stock_code="510050.SH",
+                action="BUY",
+                volume=100,
+                traded_volume=0,
+                status=status,
+            )
+        ]
+
+
+class AsyncCancelSettlementTest(unittest.TestCase):
+    """issue #148: order status, not cancel() truthiness, is authoritative."""
+
+    @staticmethod
+    def _service(gateway, timeout=5.0):
+        redis_client = FakeRedis()
+        handlers = BigQmtRpcHandlers(
+            account_id="acct",
+            market_data=FakeMarketData(),
+            position_provider=FakePositionProvider(),
+            order_gateway=gateway,
+            allow_order_methods=True,
+            order_settle_timeout_seconds=timeout,
+        )
+        return redis_client, RedisPubSubRpcService(
+            redis_client, handlers, account_id="acct")
+
+    @staticmethod
+    def _cancel(service, request_id="cancel-request-1"):
+        service.enqueue_payload({
+            "request_id": request_id,
+            "account_id": "acct",
+            "method": "cancel_order_stock_sysid",
+            "params": {"order_sysid": "cancel-1"},
+        })
+
+    def test_falsey_native_return_waits_for_status_54_and_reports_success(self):
+        gateway = FalseyCancelGateway(["50", "54"])
+        redis_client, service = self._service(gateway)
+        self._cancel(service)
+
+        service.drain_pending()
+        self.assertNotIn(
+            "bigqmt:rpc:resp:acct:cancel-request-1", redis_client.kv)
+        self.assertEqual(service.pending_settlement_count(), 1)
+
+        service.drain_pending()
+
+        response = json.loads(
+            redis_client.kv["bigqmt:rpc:resp:acct:cancel-request-1"])
+        self.assertTrue(response["ok"], response["error"])
+        self.assertTrue(response["data"]["success"])
+        self.assertEqual(response["data"]["message"], "")
+        self.assertEqual(gateway.lookups, 2)
+        self.assertEqual(len(gateway.cancelled), 1)
+
+    def test_partial_cancel_status_53_also_reports_success(self):
+        gateway = FalseyCancelGateway(["53"])
+        redis_client, service = self._service(gateway)
+        self._cancel(service)
+
+        service.drain_pending()
+
+        response = json.loads(
+            redis_client.kv["bigqmt:rpc:resp:acct:cancel-request-1"])
+        self.assertTrue(response["data"]["success"])
+
+    def test_terminal_filled_status_does_not_become_cancel_success(self):
+        gateway = FalseyCancelGateway(["56"])
+        redis_client, service = self._service(gateway)
+        self._cancel(service)
+
+        service.drain_pending()
+
+        response = json.loads(
+            redis_client.kv["bigqmt:rpc:resp:acct:cancel-request-1"])
+        self.assertTrue(response["ok"], response["error"])
+        self.assertFalse(response["data"]["success"])
+        self.assertIn("reached status 56", response["data"]["message"])
+
+    def test_active_order_at_deadline_remains_cancel_failure(self):
+        gateway = FalseyCancelGateway(["50"])
+        redis_client, service = self._service(gateway, timeout=0.0)
+        self._cancel(service)
+
+        service.drain_pending()
+
+        response = json.loads(
+            redis_client.kv["bigqmt:rpc:resp:acct:cancel-request-1"])
+        self.assertFalse(response["data"]["success"])
+        self.assertIn("is still status 50", response["data"]["message"])
+
+    def test_lookup_error_at_deadline_remains_cancel_failure(self):
+        gateway = FalseyCancelGateway(
+            ["54"], query_error=RuntimeError("QMT query unavailable"))
+        redis_client, service = self._service(gateway, timeout=0.0)
+        self._cancel(service)
+
+        service.drain_pending()
+
+        response = json.loads(
+            redis_client.kv["bigqmt:rpc:resp:acct:cancel-request-1"])
+        self.assertFalse(response["data"]["success"])
+        self.assertIn("cancel status lookup failed", response["data"]["message"])
+
+    def test_truthy_native_return_verified_by_immediate_lookup(self):
+        # #151: truthy is no more trustworthy than falsey (a cancel of an
+        # order that does not exist returns success=True). The fast path
+        # survives, but only through one immediate status lookup -- not by
+        # believing the native return.
+        gateway = FalseyCancelGateway(["54"], native_success=True)
+        redis_client, service = self._service(gateway)
+        self._cancel(service)
+
+        service.drain_pending()
+
+        response = json.loads(
+            redis_client.kv["bigqmt:rpc:resp:acct:cancel-request-1"])
+        self.assertTrue(response["data"]["success"])
+        self.assertEqual(gateway.lookups, 1)
+        self.assertEqual(service.pending_settlement_count(), 0)
+
+    def test_truthy_native_return_without_confirmation_is_not_success(self):
+        # The #151 shape exactly: native success=True, order still active
+        # at the deadline -> the reply must not be a bare success.
+        gateway = FalseyCancelGateway(["50"], native_success=True)
+        redis_client, service = self._service(gateway, timeout=0.0)
+        self._cancel(service)
+
+        service.drain_pending()
+
+        response = json.loads(
+            redis_client.kv["bigqmt:rpc:resp:acct:cancel-request-1"])
+        self.assertFalse(response["data"]["success"])
+        self.assertIn("is still status 50", response["data"]["message"])
 
 
 class AsyncOrderSettlementTest(unittest.TestCase):

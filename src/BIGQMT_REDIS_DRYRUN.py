@@ -107,6 +107,45 @@ def _set_parent_attribute(name, module):
     setattr(parent, child_name, module)
 
 
+# A strategy file that arrived corrupted fails with a bare NameError naming a
+# 200-character token, which says nothing about the file being broken (issue
+# #102). Real symptom, from a reporter's terminal:
+#
+#     File "...\bigqmt_signal_trader_strategy.py", line 1, in <module>
+#         MiFBOecYoHXT4UUBBOIr3m5aTVbA5Rbt6OnG52cfBT5EAtPG9kA7kQnEsKuDUOORy...
+#     NameError: name 'MiFBOecYoHXT4UUB...' is not defined
+#
+# Python read line 1 as a variable name because that is all it was: the file
+# had been saved from something other than the source -- a download page, a
+# proxy that served a token instead of the file. Every version behaves the
+# same way, so "try a different version" sends people in the wrong direction.
+_TOKEN_CHARS = set(
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_=+/")
+
+
+def _looks_like_a_token_not_python(source):
+    """True when the first real line cannot be Python at all.
+
+    Deliberately narrow. A Python line this long with no whitespace and
+    nothing outside the base64 alphabet would have to be a bare identifier,
+    which is already broken -- so a false positive costs a clearer message on
+    code that was going to fail anyway.
+    """
+    try:
+        if isinstance(source, bytes):
+            source = source.decode("utf-8", "replace")
+        for line in source.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            return (len(line) >= 40
+                    and not any(char.isspace() for char in line)
+                    and all(char in _TOKEN_CHARS for char in line))
+    except Exception:
+        pass
+    return False
+
+
 def _load_local_module(name):
     existing = sys.modules.get(name)
     if existing is not None:
@@ -133,9 +172,23 @@ def _load_local_module(name):
         exec(compile(source, source_path, "exec"), module.__dict__)
     except Exception:
         sys.modules.pop(name, None)
+        if _looks_like_a_token_not_python(source):
+            raise RuntimeError(
+                "%s is not Python source -- its first line is one long token, "
+                "so the file was saved from something other than the code "
+                "(a download page, a mirror that served a token). Fetch it "
+                "again: pip install --upgrade xtquant-big-convert then "
+                "xt_trader.sync_deployment(), or copy src/ from the release. "
+                "A different version will not help; every version fails the "
+                "same way on this file." % source_path)
         raise
     _set_parent_attribute(name, module)
     return module
+
+
+# Names proven not to be modules. A miss costs a full sys.path
+# walk, so it is worth remembering; a hit never changes back.
+_MISSING_LOCAL_MODULES = set()
 
 
 def _local_import(name, module_globals=None, module_locals=None, fromlist=(), level=0):
@@ -145,10 +198,21 @@ def _local_import(name, module_globals=None, module_locals=None, fromlist=(), le
     module = _load_local_module(absolute_name)
     for child in fromlist or ():
         if child != "*":
+            child_name = absolute_name + "." + child
+            # A fromlist entry is usually an attribute, not a submodule.
+            # Looking one up walks _SOURCE_ROOT plus every sys.path entry
+            # doing os.path.isfile, then raises -- and nothing remembered the
+            # answer, so it ran again on EVERY `from X import Y` in the
+            # sandbox. Measured in the live terminal: a ping whose handler is
+            # one such import took 1493ms in handle(); with the miss
+            # remembered it takes 0ms, and the round trip went from ~1800ms to
+            # ~95-200ms.
+            if child_name in _MISSING_LOCAL_MODULES:
+                continue
             try:
-                _load_local_module(absolute_name + "." + child)
+                _load_local_module(child_name)
             except ModuleNotFoundError:
-                pass
+                _MISSING_LOCAL_MODULES.add(child_name)
     if fromlist:
         return module
     return _load_local_module(absolute_name.split(".", 1)[0])
@@ -275,6 +339,24 @@ try:
         get_trade_detail_data_func=globals().get("get_trade_detail_data"),
         extra_funcs=qmt_extra or None,
     )
+    # QMT injects passorder / get_trade_detail_data / download_history_data
+    # into a file it runs AS A STRATEGY. When none of them are here the file is
+    # being exec'd as a plain script: the module body runs, init() is never
+    # called, no RPC service starts, and the run simply ends -- which from the
+    # log looks like a successful start followed by "finished" (issue #123).
+    # ASCII only: this file declares #coding:gbk and is stored as UTF-8, so it
+    # holds together only while every byte is ASCII.
+    if not any(name in globals() for name in
+               ("passorder", "get_trade_detail_data", "download_history_data")):
+        print("[bigqmt_shell] WARNING: QMT injected none of its API globals "
+              "(passorder / get_trade_detail_data / download_history_data), so "
+              "this file is running as a plain script rather than as a "
+              "strategy. init() will never be called, the RPC service will not "
+              "start, and the run ends here with nothing listening. Two known "
+              "causes: running it from the strategy EDITOR window instead of "
+              "adding it under model trading, and the 'standalone python "
+              "process' option, which makes QMT exec the file as __main__ "
+              "without calling init(). See issue #123.")
 except NameError:
     pass
 

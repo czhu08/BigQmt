@@ -110,6 +110,64 @@ class FakeTransportTest(unittest.TestCase):
         self.assertIn("handler exploded", sent[0]["error"])
 
 
+class ZmqSendBackpressureTest(unittest.TestCase):
+    """出站堆积自动清理：peer 水位满（Again）时让位进队列，不阻塞 router 线程。"""
+
+    def test_muted_peer_falls_back_to_queue(self):
+        import threading
+        from bigqmt_signal_trader.transports.zmq_transport import ZmqTransport
+
+        t = ZmqTransport(account_id="acct")
+        calls = []
+
+        class _Again(Exception):
+            pass
+
+        class FakeZmq:
+            DONTWAIT = 1
+            Again = _Again
+
+        class FakeRouter:
+            def send_multipart(self, frames, flags=0):
+                calls.append(flags)
+                raise _Again("peer muted")
+
+        t._zmq = FakeZmq()
+        t._router = FakeRouter()
+        t._router_thread = threading.current_thread()  # 触发内联路径
+        t._pending_identities["rid-1"] = b"peer-1"
+
+        t.send_response({"request_id": "rid-1"},
+                        {"request_id": "rid-1", "method": "ping", "ok": True, "data": {}})
+
+        # 内联发送用 DONTWAIT 尝试过一次，失败后让位进队列（不阻塞不丢）
+        self.assertEqual(calls, [1])
+        self.assertEqual(t._response_queue.qsize(), 1)
+
+    def test_queue_overflow_drops_oldest(self):
+        import threading
+        from bigqmt_signal_trader.transports.zmq_transport import ZmqTransport
+
+        t = ZmqTransport(account_id="acct")
+        t._max_queued_responses = 3
+
+        class FakeZmq:
+            DONTWAIT = 1
+
+            class Again(Exception):
+                pass
+
+        t._zmq = FakeZmq()
+        t._router = None
+        for i in range(5):
+            t._pending_identities["rid-%d" % i] = b"peer"
+            t._queue_response(b"peer", b"payload-%d" % i, reason="test")
+
+        # 5 条进、上限 3，丢 2 条最旧，剩 3 条
+        self.assertEqual(t._response_queue.qsize(), 3)
+        self.assertEqual(t._dropped_response_count, 2)
+
+
 class FactoryTest(unittest.TestCase):
     def test_unknown_transport_rejected(self):
         with self.assertRaises(ValueError):

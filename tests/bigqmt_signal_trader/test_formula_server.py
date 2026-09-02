@@ -148,6 +148,31 @@ class ParamTranslationTest(unittest.TestCase):
                 )
         self.assertEqual(client.calls, [])
 
+    def test_market_data_refuses_non_bar_periods(self):
+        """Non-bar periods must not go through the fastpath: a period='tick'
+        getMarketData request wedged the whole FormulaServer behind the shared
+        socket lock (drip-fed response, no timeout) on 2026-08-30, taking every
+        fastpath read with it. Refuse and let RPC answer."""
+        router, client = self._router({"getMarketData": {"result": []}})
+
+        for period in ("tick", "l2quote", "l2order"):
+            with self.assertRaises(fs.Unroutable):
+                router.call(
+                    "get_market_data_ex",
+                    {"field_list": ["close"], "stock_list": ["000001.SZ"], "period": period},
+                )
+        self.assertEqual(client.calls, [])
+
+    def test_market_data_allows_bar_periods(self):
+        router, client = self._router({"getMarketData": {"result": []}})
+
+        router.call(
+            "get_market_data_ex",
+            {"field_list": ["close"], "stock_list": ["000001.SZ"], "period": "5m"},
+        )
+
+        self.assertEqual(client.calls[0][1]["period"], "5m")
+
     def test_market_data_allows_unadjusted(self):
         router, client = self._router({"getMarketData": {"result": []}})
 

@@ -21,6 +21,11 @@ ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)
 sys.path.insert(0, os.path.join(ROOT, "src"))
 
 from bigqmt_signal_trader import init_config
+from bigqmt_signal_trader.transports.zmq_transport import (
+    DEFAULT_ZMQ_HOST,
+    _default_zmq_address,
+    _default_zmq_port,
+)
 
 
 class _Script(object):
@@ -114,8 +119,56 @@ class RenderedConfigTest(unittest.TestCase):
         loaded = _load(init_config.render_client_config(
             _answers(transport="zmq", host="192.168.1.9")), "c.py")
 
-        address = loaded["BIGQMT_REDIS_CONFIG"]["zmq"]["connect_address"]
+        zmq = loaded["BIGQMT_REDIS_CONFIG"]["zmq"]
+        address = zmq["connect_address"]
         self.assertTrue(address.startswith("tcp://192.168.1.9:"), address)
+        self.assertEqual(zmq["host"], "192.168.1.9")
+        self.assertEqual(zmq["port"], _default_zmq_port("8886800503"))
+
+    def test_zmq_client_address_matches_the_server_transport_default(self):
+        """The generated client must dial the endpoint ZmqTransport binds."""
+        for account_id in ("8886800503", "account-without-digits"):
+            loaded = _load(init_config.render_client_config(
+                _answers(account_id=account_id, transport="zmq",
+                         host="192.168.1.9")), "c.py")
+
+            address = loaded["BIGQMT_REDIS_CONFIG"]["zmq"]["connect_address"]
+            self.assertEqual(
+                address,
+                _default_zmq_address(account_id, host="192.168.1.9"),
+            )
+
+    def test_zmq_same_host_configs_use_the_same_loopback_endpoint(self):
+        answers = _answers(
+            account_id="8886800503", transport="zmq", host=DEFAULT_ZMQ_HOST
+        )
+        server = _load(init_config.render_server_config(answers), "s.py")
+        client = _load(init_config.render_client_config(answers), "c.py")
+
+        expected = _default_zmq_address("8886800503", host=DEFAULT_ZMQ_HOST)
+        self.assertEqual(
+            server["BIGQMT_REDIS_CONFIG"]["zmq"]["bind_address"], expected
+        )
+        self.assertEqual(
+            client["BIGQMT_REDIS_CONFIG"]["zmq"]["connect_address"], expected
+        )
+
+    def test_zmq_remote_host_connects_to_qmt_and_server_binds_all_interfaces(self):
+        answers = _answers(
+            account_id="8886800503", transport="zmq", host="192.168.8.13"
+        )
+        server = _load(init_config.render_server_config(answers), "s.py")
+        client = _load(init_config.render_client_config(answers), "c.py")
+        port = _default_zmq_port("8886800503")
+
+        self.assertEqual(
+            client["BIGQMT_REDIS_CONFIG"]["zmq"]["connect_address"],
+            "tcp://192.168.8.13:%d" % port,
+        )
+        self.assertEqual(
+            server["BIGQMT_REDIS_CONFIG"]["zmq"]["bind_address"],
+            "tcp://0.0.0.0:%d" % port,
+        )
 
     def test_credentials_survive_characters_that_would_break_naive_quoting(self):
         nasty = "a'b\"c\\d#e"
@@ -185,6 +238,8 @@ class PromptFlowTest(unittest.TestCase):
         self.assertEqual(answers["transport"], "zmq")
         self.assertEqual(answers["password"], "")
         self.assertNotIn("Redis 密码", "".join(script.prompts))
+        self.assertIn("0.0.0.0", script.text())
+        self.assertIn("防火墙", script.text())
 
     def test_no_redis_single_file_forces_zmq(self):
         """Choosing a build that cannot import redis must not leave the config

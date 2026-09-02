@@ -227,5 +227,45 @@ class OpenQmtTest(unittest.TestCase):
             os.path.isdir = orig
 
 
+class LoginWindowDetectionTest(unittest.TestCase):
+    def test_login_detection_is_dpi_scale_independent(self):
+        # Same QMT login shell before/after 150% DPI scaling.
+        self.assertTrue(qmt_launcher._looks_like_login_window(
+            (544, 280, 1376, 871), 1920, 1200))
+        self.assertTrue(qmt_launcher._looks_like_login_window(
+            (816, 420, 2064, 1306), 2880, 1800))
+
+    def test_main_window_is_not_treated_as_login(self):
+        self.assertFalse(qmt_launcher._looks_like_login_window(
+            (0, 0, 1920, 1160), 1920, 1200))
+        self.assertFalse(qmt_launcher._looks_like_login_window(
+            (250, 120, 1650, 1020), 1920, 1200))
+
+    def test_login_completion_waits_for_the_main_window(self):
+        login = (816, 420, 2064, 1306)
+        main = (0, 0, 2880, 1740)
+        handles = iter((10, 20))
+        rects = {10: login, 20: main}
+
+        result = qmt_launcher._wait_for_main_window(
+            lambda: next(handles), rects.get, 2880, 1800,
+            timeout_seconds=1.0, poll_interval=0.0,
+        )
+
+        self.assertEqual(result, 20)
+
+    def test_login_completion_rejects_a_persistent_login_dialog(self):
+        result = qmt_launcher._wait_for_main_window(
+            lambda: 10,
+            lambda _handle: (816, 420, 2064, 1306),
+            2880,
+            1800,
+            timeout_seconds=0.0,
+            poll_interval=0.0,
+        )
+
+        self.assertIsNone(result)
+
+
 if __name__ == "__main__":
     unittest.main()

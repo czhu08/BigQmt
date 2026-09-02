@@ -10,7 +10,9 @@
 
 已发布 PyPI，客户端一行安装：`pip install xtquant-big-convert`（详见下文「环境要求与依赖安装」）。
 
-另附 [qmt-trader skill](qmt-trader/)：让 Claude Code / ZCode / Cursor 等 AI 助手通过统一 CLI（46 个子命令）直接查行情、查持仓、下单撤单，详见下文「AI 助手 Skill：qmt-trader」。
+另附 [qmt-trader skill](qmt-trader/)：让 Claude Code / ZCode / Cursor 等 AI 助手通过统一 CLI（47 个子命令）直接查行情、算期权 Greeks、查持仓、下单撤单，详见下文「AI 助手 Skill：qmt-trader」。
+
+想看跑在这座桥上的完整应用长什么样，见 [bigqmt-dashboard](https://github.com/litaolemo/bigqmt_dashboard)——一个多账号持仓监控与下单面板，详见下文「基于本项目的应用」。
 
 ---
 
@@ -87,7 +89,16 @@ python -m bigqmt_signal_trader.init_config
 
 - `bigqmt_signal_trader.xtquant_compat`：把旧代码的 `xt_trader` / `xtdata` 调用转成 RPC，无需改业务代码。
 - 兼容 MiniQMT 方法名：`query_stock_asset` / `query_stock_positions` / `query_stock_orders` / `get_full_tick` / `order_stock` 等。
-- 顶层 `xtquant.xtdata.get_stock_type(stock)` 显式转发到 RPC；完整 QMT 的交易日 ContextInfo fallback 会把 `SH/SZ` 转成代表指数代码。委托快照增量暴露 `price_type` / `traded_price`，旧 QMT 不提供时分别保持 `None` / `0.0`。
+- **本地 IV/Greeks fallback**：`xtdata.get_option_analytics(option_code)` 从合约元数据和期权/标的最新 K 线 close 计算隐含波动率及 Delta/Gamma/Vega/Theta/Rho；`xtdata.get_option_chain_analytics("510050.SH", "202609")` 一次价格批读计算整条到期月份。显式传 `option_price` / `underlying_price` 可改用盘口中间价。无套利边界不成立的陈旧价格按合约返回 `analytics_error`，不会用一个伪 IV 污染整条链。原生 `get_option_iv` 保持不变，可用 `include_native_iv=True` 对照。
+- **委托/成交对象补齐 MiniQMT 契约**（0.3.8 起，issue #133）：`query_stock_orders` / `query_stock_trades` 返回的对象新增 `account_type`（xtconstant 数字码，取部署实际配置的类型而非硬编码 2）、`instrument_name`、`secu_account`、`offset_flag`、`direction`，成交多一个 `commission`。
+
+  **`strategy_name` 只对经本桥下的委托有效**：实测 QMT 的 ORDER（120 个属性）和 DEAL（47 个属性）行上**都没有 `m_strStrategyName` —— `get_trade_detail_data` 按策略过滤却从不回报。本桥下的单从自己的委托身份库回填（下单时按作为备注发出的 `user_order_id` 记录）；**手工在终端下的单没有备注，保持为空**。
+
+  `secu_account` 同理恒为空：两种行都不带股东代码。字段保留是为了读到 `""` 而不是 `AttributeError`。
+
+- **`describe_trade_detail_fields(account)` 诊断 RPC**（0.3.8 起）：返回 QMT 自己的 ORDER / DEAL 行上**有哪些属性名**（只返回名字不返回值）。遇到"某字段为空"时，它回答的是"**是终端没给，还是桥没转发**"——这两种从客户端看完全一样。
+
+- **`get_stock_type` 在大 QMT 上不可用，会显式抛错**（0.3.8 起）：服务端走 `ContextInfo.get_stock_type`，而这个 stub 对**任何**代码都返回 `0` —— 实测股票 / ETF / 债券 / 期权、以及各种代码格式全是 0。恒为 0 的"类型"比报错更糟（报错看得见，错的分类看不见），所以改成抛 `NotImplementedError` 并指向真正能用的 `get_instrument_type(code)`，后者实测能区分 `stock` / `fund` / `etf` / `bond` / `index`。完整 QMT 的交易日 ContextInfo fallback 会把 `SH/SZ` 转成代表指数代码。委托快照增量暴露 `price_type` / `traded_price`，旧 QMT 不提供时分别保持 `None` / `0.0`。
 - **完整 xtconstant 枚举**（539 个常量，涵盖原生 MiniQMT 全部 90 个，值逐一比对无改动）：账号类型、委托类型（股票/期货/信用/期权）、报价类型、委托状态、账号状态、`ORDER_TYPE_SET`。
 
 ```python
@@ -212,7 +223,7 @@ xt_trader.ipo_subscribe_all(acc, markets=("SH", "SZ", "BJ"))
 
 ### 全推行情订阅（subscribe_whole_quote 真推送）
 
-`subscribe_whole_quote` 是**服务端真推送**——对齐 MiniQMT 全推行情订阅。服务端引用计数管理 `ContextInfo.subscribe_whole_quote` 回调，通过独立 PUB/SUB 通道向客户端**增量推送**行情（不是一次性快照）：
+`subscribe_whole_quote` 是**服务端真推送**——对齐 MiniQMT 全推行情订阅。服务端引用计数管理大 QMT 行情回调，通过独立 PUB/SUB 通道向客户端**增量推送**行情（不是一次性快照）：
 
 **架构（三通道）**：
 1. **控制面 RPC**——`subscribe_whole_quote` / `unsubscribe_whole_quote` / `quote_keepalive` 方法（复用现有 transport）
@@ -224,6 +235,7 @@ xt_trader.ipo_subscribe_all(acc, markets=("SH", "SZ", "BJ"))
 - **引用计数**：按 `(client_id, sub_id)` 计数，全部退订或 30s keepalive 超时才销毁
 - **客户端心跳**：周期 `quote_keepalive`；检测推送静默（默认 10 轮心跳）自动重放订阅，**服务端重启后自动恢复**
 - **初始快照**：客户端用 `get_full_tick` 预拉快照（big-QMT 回调是增量的）
+- **期权兼容**：显式 `.SHO/.SZO` 合约在部分完整大 QMT 版本中不会从 `subscribe_whole_quote` 推送，因此服务端对这些代码逐合约使用 `ContextInfo.subscribe_quote(..., result_type="list")`；股票、ETF 和市场代码仍走原有全推路径。混合组合对客户端保持一个订阅号。
 
 **用法**：
 
@@ -243,7 +255,7 @@ seq = xtdata.subscribe_whole_quote(["600000.SH", "000001.SZ"], callback=on_quote
 xtdata.unsubscribe_quote(seq)
 ```
 
-**验证**：实盘交易日验证 1/20/50/100 只标的，3s 推送节奏稳定，零丢失零乱序；多客户端共享/退订隔离/同客户端多 sub_id 全过；服务端重启恢复（42s 中断后验证两次）。详见 [docs/SUBSCRIBE_WHOLE_QUOTE_PUSH.md](docs/SUBSCRIBE_WHOLE_QUOTE_PUSH.md) 和 [docs/SUBSCRIBE_WHOLE_QUOTE_LIVE_VERIFICATION.md](docs/SUBSCRIBE_WHOLE_QUOTE_LIVE_VERIFICATION.md)。
+**验证**：实盘交易日验证 1/20/50/100 只标的，3s 推送节奏稳定，零丢失零乱序；多客户端共享/退订隔离/同客户端多 sub_id 全过；服务端重启恢复（42s 中断后验证两次）。另在完整大 QMT 2.1.19.0 盘中验证显式 `.SHO` 快照、500ms 实时推送及 ETF+期权混合组合。详见 [docs/SUBSCRIBE_WHOLE_QUOTE_PUSH.md](docs/SUBSCRIBE_WHOLE_QUOTE_PUSH.md) 和 [docs/SUBSCRIBE_WHOLE_QUOTE_LIVE_VERIFICATION.md](docs/SUBSCRIBE_WHOLE_QUOTE_LIVE_VERIFICATION.md)。
 
 ### 全市场快照的品种过滤（`types`）
 
@@ -295,6 +307,68 @@ field_list=[open,high,low,close,volume,amount]
 
 **只要 OHLCV 就显式写出来**，那 30 倍就到手了。首次不传 `field_list` 时会在 `bigqmt.log` 记一条说明。
 
+### 启动预热与卡顿监控
+
+**重启策略后，第一次调用 `get_financial_data` 可能要几分钟。** 实测过一次 **346 秒**——当时 QMT 自身完全健康（全推行情每几秒一批、线程池正常），主策略线程也空闲（adjust 每 10 秒 100 拍，每拍 < 2ms）。当天之后的所有调用都在 1 秒内，**包括从没查过的票和没查过的表**，所以这是一次性代价，不是按代码的缓存未命中。
+
+问题在于它的传染性：**RPC 处理是串行的**，一个调用卡住，后面排队的全部超时。客户端看到的是一片超时，和「桥死了」完全一样。
+
+#### 启动时自动预热（默认开启）
+
+启动后会在**后台线程**上先跑一次这个调用，把这份等待提前付掉：
+
+```
+[bigqmt_warmup] get_financial_data: first call after a restart can take
+minutes; running it now so a caller does not have to wait
+[bigqmt_warmup] get_financial_data warm after 346.0s -- that wait is now paid
+```
+
+热了之后就是这样：
+
+```
+[bigqmt_warmup] get_financial_data warm in 0.31s
+```
+
+**预热不会让这个代价变便宜**，它只是把代价挪到一个确定的时刻、一个没人等待的线程上，并且留下一行说明——而不是让它以「第一个调用方莫名卡死」的形式出现。
+
+> **为什么不放在 init 里？** 启动诊断（`_diag_startup`）跑在主线程的 `init()` 中。把一个可能 346 秒的调用加进去，会在 adjust 定时器都还没排上的时候冻住整个启动——比原问题更糟。所以预热走独立守护线程，`init()` 立即返回。
+
+关掉它（服务端 local config）：
+
+```python
+BIGQMT_REDIS_CONFIG = {
+    # ...
+    "warm_context_data": False,
+}
+```
+
+#### 卡顿监控：区分「桥卡住」和「桥死了」
+
+handler 还在跑的时候就会报，不用等它结束：
+
+```
+[bigqmt_rpc] zmq handler STILL RUNNING method=get_financial_data 40s
+thread=bigqmt-zmq-rpc queued=3 -- the bridge is blocked, not dead
+```
+
+- 默认 **20 秒**触发。比实测最慢的健康调用（整市场快照 7.7s）长得多，又短于客户端 30 秒的默认超时，**所以日志会在调用方放弃之前就点名**
+- 指数退避，一次长阻塞不会把它自己要解释的日志淹掉
+- 调整或关闭（注意它在 **`zmq` 子块**里，不是顶层）：
+
+```python
+BIGQMT_REDIS_CONFIG = {
+    # ...
+    "zmq": {
+        "stall_warn_seconds": 45,   # 0 = 关闭
+    },
+}
+```
+
+**看到成片超时时，先在服务端日志里搜 `STILL RUNNING` 或 `slow handler`。** 有这两行之一，就说明桥没死，只是被一个慢调用堵住了——等它跑完，或者查那个方法。
+
+> 注意 `slow handler` 是**事后**打的（handler 返回才计时），`STILL RUNNING` 才是进行中的。
+
+
 ### 版本检测与部署同步
 
 部署到 QMT 是**文件拷贝**，而 QMT 跨策略重跑保留 `sys.modules`。所以「忘了拷」和「拷了但没被加载」从外部看**一模一样**——这是本项目最容易浪费时间的一类问题：本地修好了，实盘却像没修。
@@ -344,7 +418,27 @@ xt_trader.sync_deployment()               # 真同步
 | **覆盖前备份** | 每个被覆盖的文件留 `.bak_<时间戳>` |
 | **原子写入** | 先写临时文件再替换，中断不会留下半个模块 |
 
-> **同步之后仍然必须手动重启策略。** QMT 跨重跑保留 `sys.modules`，拷贝本身不生效——每次同步结果都带 `restart_required` 并在日志里提示。
+> **同步之后必须让策略重新加载。** QMT 跨重跑保留 `sys.modules`，拷贝本身不生效——每次同步结果都带 `restart_required` 并在日志里提示。
+
+#### 让同步生效：`reload_deployment()`（0.3.8 起，不用重启）
+
+```python
+xt_trader.reload_deployment("why")   # -> {'scheduled': True, 'version_before': '0.3.7'}
+xt_trader.reload_status()            # -> {'ok': True, 'modules_purged': 28,
+                                     #     'version_before': '0.3.7',
+                                     #     'version_after': '0.3.8', 'seconds': 0.79}
+```
+
+把所有 `bigqmt_signal_trader.*` 从 `sys.modules` 清掉、重新绑定策略模块 import 时持有的引用、再跑一次 `init()` 重建对象图。**约 0.8 秒。**
+
+**只是"已排期"**：执行它要 `reset_app()`，那会停掉正在应答这个请求的 RPC 服务，所以回复必须先发出去；真正的重载在下一个 adjust tick 上做，轮询 `reload_status()` 看结果。期间约 1 秒的查询会超时（服务正在重建）。
+
+| | |
+|---|---|
+| **能刷新** | `bigqmt_signal_trader/` 下的一切——适配器、RPC handler、models、传输层 |
+| **刷新不了** | `bigqmt_signal_trader_strategy.py` 和 `BIGQMT_REDIS_DRYRUN.py`。QMT 自己 exec 这两个文件，**模块没法 reload 自己所在的模块**——改这两个仍要重启策略 |
+
+用 purge 而不是 `importlib.reload`：reload 必须按依赖顺序（`order_bigqmt` 在 import 时 `from ..models import OrderSnapshot`，顺序错了会**静默**留住旧类），purge 没有顺序问题。
 
 **同步逻辑跑在客户端，不在 QMT 里。** 让交易进程盘中改写自己的代码，等于把源码树里的任何东西（包括改到一半的）直接送上实盘。
 
@@ -414,6 +508,10 @@ pymongo 的 `bson`，两者输出实测逐字节一致），客户端不需要�
 
 大 QMT 基本每天早上要重启一次，卡点在登录框。两条路绕过它：
 
+> **依赖**：进程枚举优先用 `psutil`；Win11 起系统不再带 `wmic`，没有 psutil 时
+> `close_qmt`/`status` 会直接报 `cannot enumerate processes`（issue #128）。
+> 装上即可：`pip install psutil`。
+
 ```bash
 python -m bigqmt_signal_trader.qmt_launcher status  --dir "D:\国金证券QMT交易端_lemo"
 python -m bigqmt_signal_trader.qmt_launcher restart --dir "D:\国金证券QMT交易端_lemo"
@@ -421,16 +519,64 @@ python -m bigqmt_signal_trader.qmt_launcher restart --dir "D:\国金证券QMT交
 
 | mode | 做什么 | 需要登录框交互 |
 |------|--------|---------------|
-| `linkmini`（默认优先）| `XtMiniQmt.exe linkMini`，MiniQMT 免密启动 | 否 |
+| `linkmini` | `XtMiniQmt.exe linkMini`，MiniQMT 免密启动 | 否 |
 | `bat` | 跑指定批处理（如 `免密登录qmt.bat`）| 否 |
 | `exe` | 直接起 `XtItClient.exe`，靠终端自身恢复会话 | 否 |
-| `login` | 起 exe 后向登录框输入账号密码 | 是，需 pywin32 |
+| `login` | 起 exe 后向登录框输入账号密码 | 是，需 pywin32 + pyautogui |
 
-**关于「pywinauto/pyautogui 要求 Windows 处于登录状态」**：`login` 模式用的是
-`win32api.SendMessage` 直接投递到窗口句柄，不是 pyautogui 那种按屏幕坐标重放物理输入。
-前者不要求窗口置于前台，锁屏下也能工作（会话还在即可，完全注销则不行）。密码从
-环境变量 `BIGQMT_LOGIN_USER` / `BIGQMT_LOGIN_PASSWORD` 读，不走命令行参数——argv
+> ⚠️ **`linkmini` 对本项目不可用**：它起的是迷你终端（MiniQMT），没有策略编辑器和
+> ContextInfo 运行时，桥作为大 QMT 策略跑不进去。本项目的桥必须用 `exe` / `bat` /
+> `login` 三种模式（都起大终端）。`linkmini` 只在你**同时需要迷你终端**（给外部
+> xtquant SDK 提供行情/交易服务）时才有意义——那是另一个进程，与桥互不影响。
+
+**`login` 模式需要未锁屏的交互式桌面。** 它用的是 `keybd_event` / `mouse_event`
+物理输入（经 ctypes），不是 `SendMessage`——消息式输入投不到 Qt 对话框的焦点控件上，
+当别的窗口在前台时会静默失败，什么也不输入。物理输入要求对话框在最前，所以启动前会
+先把它置顶并核验；锁屏或 RDP 注销的会话直接抛 `QmtLauncherError` 而不是打一半密码。
+
+> 需要**无人值守定时重启**（重启的是**大终端**+桥策略）的话，用 `bat` / `exe` / `login`
+> 三种模式。`bat`/`exe` 不碰登录框、锁屏也能跑，但要求终端自身能恢复会话（设了自动登录）；
+> `login` 会替你输密码，但受锁屏限制。
+
+密码从环境变量 `BIGQMT_LOGIN_USER` / `BIGQMT_LOGIN_PASSWORD` 读，不走命令行参数——argv
 对同机任何进程可见。
+
+#### Python API
+
+除了命令行，也可以在代码/计划任务脚本里直接调函数（语义与 CLI 一致）：
+
+```python
+from bigqmt_signal_trader.qmt_launcher import (
+    close_qmt, open_qmt, restart_qmt,
+    is_qmt_running, find_qmt_processes, wait_until_ready, session_is_locked,
+)
+
+# 关：先礼貌 terminate（QMT 会冲刷本地数据），force_after_seconds 后才强杀。
+# 只终结该安装目录 bin.x64 下的进程；拿不到 exe 路径的进程直接跳过而不是误杀。
+close_qmt(r"D:\国金证券QMT交易端_lemo", force_after_seconds=20)
+
+# 开：mode 见上表（exe/bat/login；linkmini 对本项目不可用）。
+# login 模式自动填账号密码：Alt 解锁前台 + 置顶 + 字段级像素验证打字，
+# 打完逐段验证（账号必须进账号区、密码必须进密码区），错了清空中止，不提交错表单。
+open_qmt(
+    r"D:\国金证券QMT交易端_lemo",
+    mode="login",
+    credentials={"user": "你的账号", "password": "你的密码"},
+    window_title_prefix="QMT",          # 登录框标题包含串（模拟端 "国金QMT交易端模拟" 也能匹配）
+    ready_timeout_seconds=180,          # 等 FormulaServer(58600) 就绪的超时
+)
+
+# 一把重启：close_qmt → 等端口释放 → open_qmt。会话锁屏且需要 login 时直接抛错
+# （而不是关掉终端却登不回去）。
+restart_qmt(r"D:\国金证券QMT交易端_lemo", mode="login",
+            credentials={"user": "...", "password": "..."})
+
+# 状态查询
+is_qmt_running(r"D:\国金证券QMT交易端_lemo")      # 进程在不在
+find_qmt_processes(r"D:\国金证券QMT交易端_lemo")  # [(pid, 进程名, exe 路径)]
+wait_until_ready(port=58600)                       # 阻塞到 FormulaServer 可连接
+session_is_locked()                                # 交互式会话是否锁屏
+```
 
 两个设计要点：
 
@@ -1053,7 +1199,7 @@ tests/bigqmt_signal_trader/        单元测试（无 QMT 环境可跑）
 tests/bigqmt_backtest/             回测、确定性、隔离和 ZMQ 往返测试
 qmt-trader/                        AI 助手 Skill（大模型直接操作 QMT，见下文专节）
 │   ├── SKILL.md                   skill 说明书（命令速查 + 工作流 + 安全须知）
-│   ├── scripts/qmt.py             统一 CLI（46 子命令 + rpc 兜底）
+│   ├── scripts/qmt.py             统一 CLI（47 子命令 + rpc 兜底）
 │   └── references/api_reference.md  完整 API 参考
 docs/                              详细文档
 test_all_apis.py                   端到端 API 测试（发现生产问题）
@@ -1172,7 +1318,7 @@ Get-Content "D:\...\python\logs\bigqmt.log" | Select-String "ERROR|WARN"
 ```
 qmt-trader/
 ├── SKILL.md                        skill 说明书（触发条件 + 命令速查 + 典型工作流 + 安全须知）
-├── scripts/qmt.py                  统一 CLI 入口（46 个子命令 + 通用 rpc 兜底，约 1000 行）
+├── scripts/qmt.py                  统一 CLI 入口（47 个子命令 + 通用 rpc 兜底，约 1000 行）
 └── references/api_reference.md     完整 API 参考（参数/返回值/常量/已知陷阱）
 ```
 
@@ -1241,6 +1387,7 @@ python qmt-trader/scripts/qmt.py buy 600000.SH 100 --price 7.50 --dry-run
 | **连通/全景** | `ping` / `snapshot` |
 | **账户** | `account`（资产）/ `positions`（持仓含浮动盈亏）/ `orders`（委托含语义化状态）/ `trades`（成交） |
 | **行情** | `tick` / `kline` / `instrument` / `sector` / `trading-dates` / `north`（北向）/ `longhubang`（龙虎榜）/ `financial`（财务）/ `download`（历史数据下载）/ `quote-subscribe`（全推订阅） |
+| **期权分析** | `option-greeks <option_code>`（单合约）/ `option-greeks 510050.SH --expiry 202609`（整条链，本地 IV + Delta/Gamma/Vega/Theta/Rho） |
 | **扩展查询（25 个快捷命令）** | `holiday` / `stock-name` / `instrument-type` / `divid-factors` / `market-times` / `trading-calendar` / `option-list` / `bsm-price` / `bsm-iv` / `hkt-stats` / `hkt-details` / `hkt-rate` / `top10-holder` / `holder-num` / `ipo` / `ipo-limit` / `credit-assure` / `credit-short` / `credit-debt` / `his-st` / `index-weight` / `industry` / `sector-info` / `local-data` / `timetag2dt` / `dt2timetag` |
 | **交易** | `buy` / `sell` / `cancel`（均支持 `--dry-run`，buy/sell 支持 `--latest` / `--strategy` / `--remark`） |
 | **通用兜底** | `rpc <method> [json]` — 调用白名单内**任意**方法（如 `rpc get_l2_quote '{"stock_code":"600000.SH"}'`），未列出的方法都能这样调 |
@@ -1253,6 +1400,33 @@ python qmt-trader/scripts/qmt.py buy 600000.SH 100 --price 7.50 --dry-run
 - 下单的 `--strategy` 与查询的 `--strategy` 需一致；查全部委托用 `orders --strategy ""`（空 = 不过滤）。
 
 完整命令表、四个典型工作流（行情分析 / 持仓监控 / 下单交易 / 批量分析）和 API 参数细节见 [qmt-trader/SKILL.md](qmt-trader/SKILL.md) 与 [qmt-trader/references/api_reference.md](qmt-trader/references/api_reference.md)。
+
+---
+
+## 基于本项目的应用：bigqmt-dashboard
+
+[**bigqmt-dashboard**](https://github.com/litaolemo/bigqmt_dashboard) —— 大QMT 直连的多账号持仓监控与下单面板。浏览器里看持仓、资金曲线、买卖流水，点一下就把单子报进大QMT。
+
+[![面板总览](https://raw.githubusercontent.com/litaolemo/bigqmt_dashboard/main/docs/screenshots/01-overview.png)](https://github.com/litaolemo/bigqmt_dashboard)
+
+它是本项目目前最完整的下游使用者，几乎把这里的接口都跑了一遍——如果你想知道某个 API 在真实业务里怎么用，那边有现成的代码：
+
+| 它用了什么 | 对应到本项目 |
+|---|---|
+| 每账号独立连接、可连不同机器上的大QMT | 直接构造 `BigQmtXtTrader(account_id=..., redis_config=...)`，**不用** `configure()` 的模块级单例 |
+| 账户数据同步 | `query_stock_positions` / `query_stock_asset` / `query_execution_snapshot` |
+| 实时委托与成交回报 | `register_callback` + `start()`，回报经 `exec_events` 推来 |
+| 下单撤单 | `order_stock_result` / `cancel_order_stock`（需 `rpc_allow_order_methods=True`） |
+| 实时行情与分钟线 | `get_full_tick` / `get_market_data_ex`（缺数据时先 `download_history_data2` 再重试） |
+| 合约属性 | `get_instrument_detail` / `get_instrument_type`，走 FormulaServer 直连快速路径 |
+| 打新债 | `ipo_subscribe_all(stock_type="BOND")` |
+| 换传输不改代码 | 账号配置里的 `rpc` 段整包透传给 `BigQmtRpcClient`，`transport` 改 `redis`/`zmq` 即可 |
+
+几个从对接中反馈回来、值得单独提一句的点：
+
+- **可转债的下单规整要自己写。** `code_utils.min_lot()` 只认「688 开头 = 200，其余 = 100」，可转债最小 10 张会被 `(10 // 100) * 100` 规整成 **0**；`normalize_stock_code()` 对裸 6 位码按「5/6 开头 = 沪市」判断，沪市转债 `110xxx` 会被判到深市。面板那边重写了一份全品种规则（含科创板 200 股起按 1 股递增、ETF/转债 0.001 报价精度），并拿 `get_instrument_detail` 返回的 `PriceTick` 交叉验证过 9 个品种，全部吻合。
+- **`get_market_data_ex` 读的是 QMT 本地库。** 没 `download_history_data2` 过的标的返回 0 根而不是报错——面板实测 10 只持仓全都没有 1m 数据，走势图整列是空的，加了「缺数据先下载再重试」才好。
+- **`docs/XTQUANT_COMPAT_REPLACEMENT.md` 里「RPC 暂不推送回调」是旧文。** 代码里 `BigQmtXtTrader.start()` 会拉起执行事件监听线程，`on_stock_order` / `on_stock_trade` 是真的会触发的。
 
 ---
 
@@ -1270,7 +1444,20 @@ python qmt-trader/scripts/qmt.py buy 600000.SH 100 --price 7.50 --dry-run
 - [docs/XTQUANT_COMPAT_REPLACEMENT.md](docs/XTQUANT_COMPAT_REPLACEMENT.md) — 用兼容层替换旧 xtquant 的步骤
 - [docs/BIG_QMT_SIGNAL_TRADER_RUNBOOK.md](docs/BIG_QMT_SIGNAL_TRADER_RUNBOOK.md) — 信号交易运行手册
 - [docs/ZMQ_BACKTEST_BRIDGE.md](docs/ZMQ_BACKTEST_BRIDGE.md) — 独立 ZMQ 回测协议、撮合规则和 QMT 入口
-- [qmt-trader/](qmt-trader/) — **QMT Trader skill**：AI 助手统一 CLI 驱动全部 QMT API（46 子命令 + 通用 rpc 兜底），用法见上文「AI 助手 Skill：qmt-trader」专节
+- [qmt-trader/](qmt-trader/) — **QMT Trader skill**：AI 助手统一 CLI 驱动全部 QMT API（47 子命令 + 通用 rpc 兜底），用法见上文「AI 助手 Skill：qmt-trader」
+- [bigqmt-dashboard](https://github.com/litaolemo/bigqmt_dashboard) — **基于本项目的持仓监控与下单面板**：多账号、服务端风控闸门、完整可转债支持，可当作接口的实际用法参考专节
+
+---
+
+## Star History
+
+<a href="https://www.star-history.com/?type=date&repos=litaolemo%2Fxtquant_big_convert">
+ <picture>
+   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=litaolemo/xtquant_big_convert&type=date&theme=dark&legend=top-left&sealed_token=M0zvEpSA9HcfTNWQLSFDhW5u4faF-JaCYJmiaUKLSFKGUD6RPGYRuYtgiy3aVlnmFbNsaaAo_vCGfrlSwG8FMsUkGoEXJUqdBLwY_JzksEBgYSTtAJFhrw" />
+   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=litaolemo/xtquant_big_convert&type=date&legend=top-left&sealed_token=M0zvEpSA9HcfTNWQLSFDhW5u4faF-JaCYJmiaUKLSFKGUD6RPGYRuYtgiy3aVlnmFbNsaaAo_vCGfrlSwG8FMsUkGoEXJUqdBLwY_JzksEBgYSTtAJFhrw" />
+   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=litaolemo/xtquant_big_convert&type=date&legend=top-left&sealed_token=M0zvEpSA9HcfTNWQLSFDhW5u4faF-JaCYJmiaUKLSFKGUD6RPGYRuYtgiy3aVlnmFbNsaaAo_vCGfrlSwG8FMsUkGoEXJUqdBLwY_JzksEBgYSTtAJFhrw" />
+ </picture>
+</a>
 
 ---
 
