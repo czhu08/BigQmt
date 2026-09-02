@@ -2864,33 +2864,34 @@ class BigQmtXtTrader:
             log.exception("user callback failed: on_account_status")
 
     def _event_loop_push_channel(self):
-        """zmq: exec events arrive on the same PUB socket as whole-quote data.
+        """One push-channel round: zmq exec events arrive on the same PUB
+        socket as whole-quote data.
 
         Reuses _build_quote_push_channel so the address derivation stays in one
-        place. The subscriber runs its own thread, so this loop only keeps the
-        channel alive and rebuilds it if the account changes or it dies.
+        place. Single round: returns when the account changes or the channel
+        dies, so the caller's per-round channel selection runs again (Redis may
+        have come back, or gone away).
         """
         from .exec_events import EXEC_TOPICS
 
         topics = sorted(set(EXEC_TOPICS.values()))
-        while self._event_running:
-            channel = None
-            account_id = str(self.client.account_id or "")
-            try:
-                channel = self._build_quote_push_channel()
-                channel.start_subscriber(topics, self._on_push_exec_event)
-                while self._event_running:
-                    if str(self.client.account_id or "") != account_id:
-                        break      # account changed -> rebuild against the new address
-                    time.sleep(0.5)
-            except Exception:
-                time.sleep(1.0)
-            finally:
-                if channel is not None:
-                    try:
-                        channel.stop()
-                    except Exception:
-                        pass
+        channel = None
+        account_id = str(self.client.account_id or "")
+        try:
+            channel = self._build_quote_push_channel()
+            channel.start_subscriber(topics, self._on_push_exec_event)
+            while self._event_running:
+                if str(self.client.account_id or "") != account_id:
+                    return       # account changed -> rebuild against the new address
+                time.sleep(0.5)
+        except Exception:
+            time.sleep(1.0)
+        finally:
+            if channel is not None:
+                try:
+                    channel.stop()
+                except Exception:
+                    pass
 
     def _on_push_exec_event(self, topic, data):
         """Push-channel callback. The payload is already a decoded dict, unlike
@@ -2901,18 +2902,56 @@ class BigQmtXtTrader:
             pass
 
     def _event_loop(self):
-        """Receive exec events. Redis deployments subscribe to the per-account
-        channels; zmq deployments ride the quote push channel.
+        """Receive exec events, mirroring the server's sink choice.
 
-        Exec events used to be Redis-only, so a zmq deployment received no
-        order/trade callbacks at all -- silently, since the loop just failed to
-        connect and retried forever (issue #76).
+        The server publishes to Redis FIRST whenever it can build a Redis
+        client (its channels carry streams for short replay), even when the
+        RPC transport is zmq, and only falls to the quote push channel after
+        repeated Redis publish failures (strategy _exec_event_sink, issue
+        #145).  This loop used to choose by transport instead -- zmq -> push
+        channel only -- so a zmq deployment with a working Redis published
+        every order/trade event to Redis while the client listened on the
+        push channel: callbacks never fired (issue #144; reproduced
+        2026-09-02, the day's events sat in the Redis stream while a
+        zmq-transport listener saw nothing).
+
+        Re-select per reconnect round, so the client follows a server that
+        demotes Redis mid-session (its Redis publish failing usually means
+        our Redis reads fail too).
         """
-        transport = str(getattr(self.client, "transport_name", "redis") or "redis").lower()
-        if transport == "zmq":
-            self._event_loop_push_channel()
-            return
+        while self._event_running:
+            redis_client = self._exec_events_redis_or_none()
+            if redis_client is not None:
+                self._event_loop_redis(redis_client)
+            elif self._exec_transport_is_zmq():
+                self._event_loop_push_channel()
+            else:
+                # redis transport with redis down: nothing else carries
+                # events; keep retrying as before.
+                time.sleep(1.0)
 
+    def _exec_transport_is_zmq(self):
+        return str(getattr(self.client, "transport_name", "redis") or "redis").lower() == "zmq"
+
+    def _exec_events_redis_or_none(self):
+        """A REACHABLE Redis client for the exec-event channels, or None.
+
+        _redis() only builds the client object; the connection is lazy, so
+        an unreachable server would still return one. Ping it -- the channel
+        choice must reflect reachability, not configuration.
+        """
+        try:
+            client = self.client._redis()
+            if client is None:
+                return None
+            client.ping()
+            return client
+        except Exception:
+            return None
+
+    def _event_loop_redis(self, redis_client):
+        """One Redis round: subscribe the per-account channels until the
+        account changes or the connection dies, then return for re-selection."""
         from .exec_events import (
             order_channel,
             trade_channel,
@@ -2920,32 +2959,31 @@ class BigQmtXtTrader:
             cancel_error_channel,
         )
 
-        while self._event_running:
-            account_id = str(self.client.account_id or "")
-            pubsub = None
+        account_id = str(self.client.account_id or "")
+        pubsub = None
+        try:
+            pubsub = redis_client.pubsub(ignore_subscribe_messages=True)
+            pubsub.subscribe(
+                order_channel(account_id),
+                trade_channel(account_id),
+                order_error_channel(account_id),
+                cancel_error_channel(account_id),
+            )
+            while self._event_running:
+                if str(self.client.account_id or "") != account_id:
+                    return  # account changed -> reconnect and resubscribe
+                message = pubsub.get_message(timeout=1.0)
+                if not message or message.get("type") != "message":
+                    continue
+                self._dispatch_event(message.get("data"))
+        except Exception:
+            time.sleep(1.0)
+        finally:
             try:
-                pubsub = self.client._redis().pubsub(ignore_subscribe_messages=True)
-                pubsub.subscribe(
-                    order_channel(account_id),
-                    trade_channel(account_id),
-                    order_error_channel(account_id),
-                    cancel_error_channel(account_id),
-                )
-                while self._event_running:
-                    if str(self.client.account_id or "") != account_id:
-                        break  # account changed -> reconnect and resubscribe
-                    message = pubsub.get_message(timeout=1.0)
-                    if not message or message.get("type") != "message":
-                        continue
-                    self._dispatch_event(message.get("data"))
+                if pubsub is not None:
+                    pubsub.close()
             except Exception:
-                time.sleep(1.0)
-            finally:
-                try:
-                    if pubsub is not None:
-                        pubsub.close()
-                except Exception:
-                    pass
+                pass
 
     def _dispatch_event(self, raw):
         """Accepts raw bytes/str (Redis pub/sub) or an already-decoded dict.
