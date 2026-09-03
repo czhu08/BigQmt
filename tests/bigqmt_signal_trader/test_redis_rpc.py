@@ -1060,6 +1060,27 @@ class RedisRpcTest(unittest.TestCase):
         response = json.loads(redis_client.kv["bigqmt:rpc:resp:acct:queued-asset"])
         self.assertTrue(response["ok"], response["error"])
 
+    def test_listener_wildcard_defers_execution_snapshot_to_strategy_thread(self):
+        redis_client, service = _service_with_listener_methods(
+            process_in_listener=True,
+            listener_methods=("*",),
+        )
+
+        service.enqueue_payload(
+            {
+                "request_id": "queued-execution-snapshot",
+                "account_id": "acct",
+                "method": "query_execution_snapshot",
+                "params": {"order_strategy_name": "", "trade_strategy_name": ""},
+            }
+        )
+
+        response_key = "bigqmt:rpc:resp:acct:queued-execution-snapshot"
+        self.assertNotIn(response_key, redis_client.kv)
+        self.assertEqual(service.drain_pending(), 1)
+        response = json.loads(redis_client.kv[response_key])
+        self.assertTrue(response["ok"], response["error"])
+
     def test_account_mismatch_is_rejected(self):
         redis_client, service = _service()
 

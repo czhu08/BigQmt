@@ -1357,6 +1357,7 @@ def adjust(ContextInfo, _source="timer"):
     _record_adjust_source(_source)
     config = _build_config()
     _adjust_phase("drain", _drain_rpc_service, config)
+    _adjust_phase("exec_hold", _flush_held_presysid_orders, config)
     # AFTER the drain, and not on the tick that scheduled it. The drain is what
     # flushes queued RPC responses, and reset_app() tears the transport down
     # with any reply still in it -- reloading first killed the reply to
@@ -1403,6 +1404,112 @@ def handlebar(ContextInfo):
 # push channel sitting right next to it never gets used (issue #145).
 _EXEC_REDIS_FAILURE_LIMIT = 3
 _exec_sink_state = {"redis_failures": 0, "reports": 0, "demoted": False}
+
+# issue #161: QMT fires the order callback once when the order row appears and
+# again when m_strOrderSysID is populated (#152's window) -- the client then
+# logs two identical 已报 events, the first degenerate (no sysid, order_id=0).
+# A sysid-less order event is held for a short window; if its sysid-bearing
+# twin arrives the held one is dropped, otherwise the adjust tick publishes it.
+_held_presysid_orders = {}      # key -> (event, held_at, raw_obj)
+_HELD_PRESYSID_DEFAULT_SECONDS = 0.8
+_instrument_name_cache = {}     # stock_code -> name (only non-empty cached)
+
+
+def _presysid_key(event):
+    """Identity for pairing a sysid-less event with its sysid-bearing twin."""
+    remark = str(event.get("user_order_id") or event.get("remark") or "").strip()
+    if remark:
+        return ("remark", remark)
+    stock = str(event.get("stock_code") or "")
+    if not stock:
+        return None  # cannot key safely -- publish immediately
+    return ("fields", (
+        stock, event.get("price"),
+        event.get("volume") or event.get("order_volume"),
+        event.get("direction"),
+    ))
+
+
+def _hold_presysid_order(event, event_config, raw_obj=None):
+    """Hold a sysid-less order event instead of publishing it. True if held."""
+    if str(event.get("order_sys_id") or ""):
+        return False
+    hold_s = float(event_config.get("hold_presysid_order_seconds",
+                                    _HELD_PRESYSID_DEFAULT_SECONDS) or 0)
+    if hold_s <= 0:
+        return False
+    key = _presysid_key(event)
+    if key is None:
+        return False
+    _held_presysid_orders[key] = (event, time.time(), raw_obj)
+    return True
+
+
+def _drop_held_presysid_twin(event):
+    """A sysid-bearing event supersedes its held sysid-less twin."""
+    if not str(event.get("order_sys_id") or ""):
+        return
+    key = _presysid_key(event)
+    if key is not None:
+        _held_presysid_orders.pop(key, None)
+
+
+def _flush_held_presysid_orders(config):
+    """Publish held events whose window expired. Runs on the adjust tick."""
+    if not _held_presysid_orders:
+        return
+    event_config = dict(config.get("exec_events") or {})
+    hold_s = float(event_config.get("hold_presysid_order_seconds",
+                                    _HELD_PRESYSID_DEFAULT_SECONDS) or 0)
+    now = time.time()
+    expired = [key for key, entry in _held_presysid_orders.items()
+               if now - entry[1] >= hold_s]
+    if not expired:
+        return
+    exec_events = _exec_events
+    account_id = str(event_config.get("account_id") or config.get("account_id")
+                     or _account_id or "")
+    sink = _exec_event_sink(config)
+    if exec_events is None or sink is None or not account_id:
+        for key in expired:
+            _held_presysid_orders.pop(key, None)
+        return
+    for key in expired:
+        entry = _held_presysid_orders.pop(key, None)
+        if entry is None:
+            continue
+        event, _held_at, raw_obj = entry
+        _publish_one(exec_events, sink, account_id, event, "order", config)
+        try:
+            status = int(event.get("status") or 0)
+        except (TypeError, ValueError):
+            status = 0
+        if status == 57:
+            # the held event turns out to be a junk: it still owes the
+            # order_error twin the non-held path would have published.
+            _publish_one(exec_events, sink, account_id,
+                         exec_events.normalize_order_error_event(raw_obj, account_id),
+                         "order_error", config)
+
+
+def _event_instrument_name(context_info, stock_code):
+    """Resolve the instrument name for an event, cached; empty never cached."""
+    code = str(stock_code or "")
+    if not code:
+        return ""
+    cached = _instrument_name_cache.get(code)
+    if cached:
+        return cached
+    name = ""
+    getter = getattr(context_info, "get_stock_name", None) if context_info is not None else None
+    if getter is not None:
+        try:
+            name = str(getter(code) or "")
+        except Exception:
+            name = ""
+    if name:
+        _instrument_name_cache[code] = name
+    return name
 
 
 def _push_channel_sink():
@@ -1499,6 +1606,10 @@ def _exec_event_redis(config):
     Previously a new client was built per order/trade callback when the RPC
     service had none (the zmq-transport case), leaking a connection pool per
     event. Reuse one; build failure returns None so publishing just skips.
+
+    A non-Redis transport may retain a Redis block for optional download jobs
+    or exec-event replay. Skip that block only when both consumers are
+    explicitly disabled; omitted flags retain the legacy enabled behavior.
     """
     global _exec_event_redis_client
     existing = getattr(_rpc_service, "redis", None) if _rpc_service is not None else None
@@ -1506,6 +1617,10 @@ def _exec_event_redis(config):
         return existing
     if _exec_event_redis_client is not None:
         return _exec_event_redis_client
+    if not _config_bool((config.get("download_jobs") or {}).get("enabled"), True) and not _config_bool(
+        (config.get("exec_events") or {}).get("enabled"), True
+    ):
+        return None
     redis_config = dict(config.get("redis") or {})
     if not redis_config:
         return None
@@ -1526,7 +1641,7 @@ def _exec_event_redis(config):
     return _exec_event_redis_client
 
 
-def _publish_exec_event(kind, obj):
+def _publish_exec_event(kind, obj, context_info=None):
     """Push a normalized order/trade event to Redis for real-time client callbacks."""
     config = _build_config()
     event_config = dict(config.get("exec_events") or {})
@@ -1555,6 +1670,9 @@ def _publish_exec_event(kind, obj):
     try:
         if kind == "trade":
             event = exec_events.normalize_trade_event(obj, account_id)
+            if not event.get("instrument_name"):
+                event["instrument_name"] = _event_instrument_name(
+                    context_info, event.get("stock_code"))
             if raw_fields:
                 event["raw_fields"] = raw_fields
             _publish_one(exec_events, sink, account_id, event, kind, config)
@@ -1567,6 +1685,16 @@ def _publish_exec_event(kind, obj):
             redis_client = _exec_event_redis(config)
             if redis_client is not None:
                 event = exec_events.enrich_order_identity(redis_client, account_id, event)
+            if not event.get("instrument_name"):
+                event["instrument_name"] = _event_instrument_name(
+                    context_info, event.get("stock_code"))
+            # QMT fires this callback once with the row pre-sysid and again
+            # once the id lands (#152's window) -- two identical 已报 events,
+            # the first degenerate (issue #161). Hold the sysid-less one; the
+            # twin drops it, the adjust flush publishes it if no twin comes.
+            if _hold_presysid_order(event, event_config, obj):
+                return
+            _drop_held_presysid_twin(event)
             if raw_fields:
                 event["raw_fields"] = raw_fields
             _publish_one(exec_events, sink, account_id, event, kind, config)
@@ -1596,13 +1724,13 @@ def _publish_exec_event(kind, obj):
 
 def order_callback(ContextInfo, orderInfo):
     """Standard Big QMT order callback."""
-    _publish_exec_event("order", orderInfo)
+    _publish_exec_event("order", orderInfo, ContextInfo)
     return forward_order_event(BigQmtRuntimeAdapter.to_order_event(orderInfo))
 
 
 def deal_callback(ContextInfo, dealInfo):
     """Standard Big QMT deal callback."""
-    _publish_exec_event("trade", dealInfo)
+    _publish_exec_event("trade", dealInfo, ContextInfo)
     return forward_trade_event(BigQmtRuntimeAdapter.to_trade_event(dealInfo))
 
 

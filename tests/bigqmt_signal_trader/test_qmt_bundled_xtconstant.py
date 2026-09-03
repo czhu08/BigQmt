@@ -29,10 +29,12 @@ defines. Refresh it from a real install if the terminal is upgraded.
 """
 
 import ast
+import builtins
 import io
 import os
 import re
 import sys
+import types
 import unittest
 
 
@@ -223,6 +225,31 @@ class AccountTypeCodesWithoutTheDictTest(unittest.TestCase):
         codes = self._codes_from(Empty())
 
         self.assertEqual(codes["STOCK"], 2)
+
+    def test_qmt_without_importable_xtquant_loads_the_order_gateway(self):
+        """Exercise the same per-module import hook used by the QMT loader."""
+        module_name = "bigqmt_signal_trader.adapters._order_bigqmt_without_xtquant"
+        source_path = os.path.join(
+            SRC, "bigqmt_signal_trader", "adapters", "order_bigqmt.py")
+        real_import = builtins.__import__
+
+        def import_without_xtquant(name, globals=None, locals=None, fromlist=(), level=0):
+            if name == "xtquant" or name.startswith("xtquant."):
+                raise ImportError("xtquant is unavailable in this QMT runtime")
+            return real_import(name, globals, locals, fromlist, level)
+
+        module = types.ModuleType(module_name)
+        module.__file__ = source_path
+        module.__package__ = "bigqmt_signal_trader.adapters"
+        module.__dict__["__builtins__"] = dict(
+            vars(builtins), __import__=import_without_xtquant)
+        with open(source_path, "rb") as source_file:
+            exec(compile(source_file.read(), source_path, "exec"), module.__dict__)
+
+        self.assertIsInstance(module._xtconstant, module._QmtFallbackXtConstant)
+        self.assertEqual(module.ACCOUNT_TYPE_CODES["STOCK"], 2)
+        self.assertEqual(module.ACCOUNT_TYPE_CODES["CREDIT"], 3)
+        self.assertEqual(module.CREDIT_OPTYPE_BY_ORDER_TYPE[40], 70)
 
     def test_the_gateway_resolves_its_configured_type(self):
         from bigqmt_signal_trader.adapters.order_bigqmt import BigQmtOrderGateway

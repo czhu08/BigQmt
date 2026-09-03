@@ -122,6 +122,50 @@ class ConfigFilesAreNeverWrittenTest(unittest.TestCase):
             self.assertNotIn(name.replace(".py", ".example.py"), NEVER_OVERWRITE)
 
 
+class TraderSyncWrapperTest(unittest.TestCase):
+    """xt_trader.sync_deployment() must work from the trader object.
+
+    The wrapper called self.get_deployment_info(), which only exists on
+    BigQmtXtData -- so the trader path died with AttributeError before
+    copying a single byte (found while deploying #160: had to drive
+    sync.sync_deployment by hand).
+    """
+
+    def _trader(self, target):
+        import types
+
+        from bigqmt_signal_trader.xtquant_compat import BigQmtXtTrader
+
+        trader = BigQmtXtTrader(account_id="acct")
+        calls = []
+
+        def fake_call(method, params=None, **kwargs):
+            calls.append(method)
+            if method == "get_deployment_info":
+                return {"qmt_python_dir": target, "version": "0.0.0-test"}
+            return {}
+
+        trader.client = types.SimpleNamespace(account_id="acct", call=fake_call)
+        return trader, calls
+
+    def test_trader_wrapper_completes(self):
+        target = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, target, True)
+        trader, calls = self._trader(target)
+
+        result = trader.sync_deployment()
+
+        self.assertIn("get_deployment_info", calls)
+        self.assertFalse(result.get("error"))
+        self.assertTrue(os.path.isfile(
+            os.path.join(target, "bigqmt_signal_trader", "version.py")))
+
+    def test_trader_wrapper_reports_a_missing_dir_instead_of_raising(self):
+        trader, _ = self._trader("")
+        result = trader.sync_deployment()
+        self.assertEqual(result.get("error"), "no qmt_python_dir reported")
+
+
 class DoesNotGrowTheDeploymentTest(unittest.TestCase):
     def setUp(self):
         self.source = tempfile.mkdtemp()

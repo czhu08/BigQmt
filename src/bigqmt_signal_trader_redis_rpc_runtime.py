@@ -159,6 +159,11 @@ EXEC_EVENTS_ENABLED = True
 # every callback. Turn on to settle what m_nDirection/m_nOffsetFlag actually
 # carry live, which the buy/sell direction mapping currently assumes.
 EXEC_EVENTS_DEBUG_RAW_FIELDS = False
+# QMT fires order_callback once with the row pre-sysid and again once the id
+# lands (#152's window) -- the client then sees two identical 已报 events
+# (issue #161). Sysid-less order events are held this many seconds waiting for
+# the twin; 0 disables (every event publishes immediately, old behaviour).
+EXEC_EVENTS_HOLD_PRESYSID_SECONDS = 0.8
 
 try:
     # Keep optional account-type config backward compatible: an old local
@@ -284,6 +289,11 @@ EXEC_EVENTS_ENABLED = bool(BIGQMT_REDIS_CONFIG.get("exec_events_enabled", EXEC_E
 EXEC_EVENTS_DEBUG_RAW_FIELDS = bool(
     BIGQMT_REDIS_CONFIG.get("exec_events_debug_raw_fields", EXEC_EVENTS_DEBUG_RAW_FIELDS)
 )
+# issue #161: sysid-less order events are held this long waiting for their
+# sysid-bearing twin; 0 publishes every event immediately (old behaviour).
+EXEC_EVENTS_HOLD_PRESYSID_SECONDS = float(
+    BIGQMT_REDIS_CONFIG.get("exec_events_hold_presysid_seconds", 0.8)
+)
 
 
 def _redis_block():
@@ -363,6 +373,7 @@ def _apply_config(account_id):
             "enabled": EXEC_EVENTS_ENABLED,
             "account_id": account_id,
             "debug_raw_fields": EXEC_EVENTS_DEBUG_RAW_FIELDS,
+            "hold_presysid_order_seconds": EXEC_EVENTS_HOLD_PRESYSID_SECONDS,
         },
     )
 
@@ -372,7 +383,7 @@ def configure_runtime_account(account_id):
 
 
 def configure_runtime_redis(redis_config):
-    global REDIS_ENABLED, REDIS_HOST, REDIS_PORT, REDIS_DB, REDIS_USERNAME, REDIS_PASSWORD, RPC_ALLOW_ORDER_METHODS, RPC_DEFAULT_STRATEGY_NAME, RPC_PROCESS_IN_LISTENER, RPC_BACKGROUND_THREADS, RPC_LISTENER_METHODS, SCHEDULE_ADJUST_ENABLED, SCHEDULE_ADJUST_INTERVAL, FULL_TICK_CACHE_ENABLED, FULL_TICK_DEMAND_TTL_SECONDS, FULL_TICK_CACHE_TTL_SECONDS, FULL_TICK_REFRESH_INTERVAL_SECONDS, FULL_TICK_MARKET_REFRESH_INTERVAL_SECONDS, FULL_TICK_REFRESH_MAX_WALL_SECONDS, FULL_TICK_MAX_REQUESTS, RPC_TRANSPORT, RPC_ZMQ_CONFIG, RPC_MYSQL_CONFIG, DOWNLOAD_JOBS_ENABLED, DOWNLOAD_JOB_CHUNK_SIZE, DOWNLOAD_JOB_MAX_WALL_SECONDS, DOWNLOAD_JOB_TTL_SECONDS, EXEC_EVENTS_ENABLED, EXEC_EVENTS_DEBUG_RAW_FIELDS
+    global REDIS_ENABLED, REDIS_HOST, REDIS_PORT, REDIS_DB, REDIS_USERNAME, REDIS_PASSWORD, RPC_ALLOW_ORDER_METHODS, RPC_DEFAULT_STRATEGY_NAME, RPC_PROCESS_IN_LISTENER, RPC_BACKGROUND_THREADS, RPC_LISTENER_METHODS, SCHEDULE_ADJUST_ENABLED, SCHEDULE_ADJUST_INTERVAL, FULL_TICK_CACHE_ENABLED, FULL_TICK_DEMAND_TTL_SECONDS, FULL_TICK_CACHE_TTL_SECONDS, FULL_TICK_REFRESH_INTERVAL_SECONDS, FULL_TICK_MARKET_REFRESH_INTERVAL_SECONDS, FULL_TICK_REFRESH_MAX_WALL_SECONDS, FULL_TICK_MAX_REQUESTS, RPC_TRANSPORT, RPC_ZMQ_CONFIG, RPC_MYSQL_CONFIG, DOWNLOAD_JOBS_ENABLED, DOWNLOAD_JOB_CHUNK_SIZE, DOWNLOAD_JOB_MAX_WALL_SECONDS, DOWNLOAD_JOB_TTL_SECONDS, EXEC_EVENTS_ENABLED, EXEC_EVENTS_DEBUG_RAW_FIELDS, EXEC_EVENTS_HOLD_PRESYSID_SECONDS
     redis_config = dict(redis_config or {})
     REDIS_ENABLED = bool(redis_config.get("redis_enabled", REDIS_ENABLED))
     REDIS_HOST = redis_config.get("host", REDIS_HOST)
@@ -426,6 +437,9 @@ def configure_runtime_redis(redis_config):
     EXEC_EVENTS_ENABLED = bool(redis_config.get("exec_events_enabled", EXEC_EVENTS_ENABLED))
     EXEC_EVENTS_DEBUG_RAW_FIELDS = bool(
         redis_config.get("exec_events_debug_raw_fields", EXEC_EVENTS_DEBUG_RAW_FIELDS)
+    )
+    EXEC_EVENTS_HOLD_PRESYSID_SECONDS = float(
+        redis_config.get("exec_events_hold_presysid_seconds", EXEC_EVENTS_HOLD_PRESYSID_SECONDS)
     )
     _apply_config(ACCOUNT_ID)
 

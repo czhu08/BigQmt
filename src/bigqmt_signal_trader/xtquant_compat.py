@@ -2759,7 +2759,10 @@ class BigQmtXtTrader:
         """
         from .sync import sync_deployment as _sync
 
-        info = self.get_deployment_info()
+        # get_deployment_info lives on BigQmtXtData; this class never had it,
+        # so xt_trader.sync_deployment() died with AttributeError. Call the
+        # RPC directly -- the trader's client is the same one.
+        info = self.client.call("get_deployment_info", {}) or {}
         target = info.get("qmt_python_dir") or ""
         if not target:
             log.warning("sync_deployment: the bridge did not report a "
@@ -2796,6 +2799,9 @@ class BigQmtXtTrader:
         return 0
 
     def stop(self):
+        # Drain first: orders already queued must go out before teardown.
+        # Costs nothing when the queue is empty (issue #156).
+        self._drain_async_orders_on_exit()
         self._event_running = False
         thread = self._event_thread
         if thread is not None and thread.is_alive():
@@ -3565,6 +3571,45 @@ class BigQmtXtTrader:
             self._async_order_thread = thread
             thread.start()
 
+    def _register_exit_drain(self):
+        """atexit hook, registered once: a fire-and-forget script that exits
+        right after queueing must not drop the queued orders silently
+        (issue #156)."""
+        with self._async_order_lock:
+            if getattr(self, "_exit_drain_registered", False):
+                return
+            self._exit_drain_registered = True
+        import atexit
+        atexit.register(self._drain_async_orders_on_exit)
+
+    def _drain_async_orders_on_exit(self):
+        """Best-effort flush of queued async orders at stop()/process exit.
+
+        The async worker is a daemon thread: a script that exits right after
+        queueing kills it mid-queue, and every order past the first is lost
+        without a word (issue #156: "循环下单只有第一条成功，加 sleep 才正常"
+        -- the sleep was keeping the process alive; reproduced live as 1/3 vs
+        3/3 orders reaching QMT). Drain the queue, then give armed barriers a
+        bounded moment so in-flight responses can fire their callbacks.
+        Never raises: this runs at interpreter exit and inside stop().
+        """
+        try:
+            self.wait_async_orders(timeout=self.ASYNC_EXIT_DRAIN_SECONDS)
+        except Exception:
+            pass
+        barrier_lock = getattr(self, "_async_barrier_lock", None)
+        if barrier_lock is None:
+            return
+        deadline = time.time() + self.ASYNC_EXIT_CALLBACK_GRACE_SECONDS
+        try:
+            while time.time() < deadline:
+                with barrier_lock:
+                    if not getattr(self, "_async_barrier", None):
+                        return
+                time.sleep(0.05)
+        except Exception:
+            pass
+
     # ------------------------------------------------------------------
     # issue #51 A: 同一笔委托的 async_response 必须先于它的 order/trade 到达。
     #
@@ -3581,6 +3626,10 @@ class BigQmtXtTrader:
     # 委托号异步分配：推送通常比 RPC 应答快，几百毫秒内就能学到；超时则按
     # 原样发 response（order_id 回落 remark），不拖住回调。
     ASYNC_SYSID_WAIT_SECONDS = 2.0
+    # stop()/进程退出时：等队列里已排队的 async 委托发完的上限，以及给
+    # 在途 response 触发回调的宽限（issue #156）。
+    ASYNC_EXIT_DRAIN_SECONDS = 5.0
+    ASYNC_EXIT_CALLBACK_GRACE_SECONDS = 3.0
 
     def _order_barrier(self):
         barrier = getattr(self, "_async_barrier", None)
@@ -3780,11 +3829,18 @@ class BigQmtXtTrader:
         Now the submit runs on a worker thread and the outcome arrives through
         on_order_stock_async_response / on_order_error, both carrying the seq so
         callers can correlate. Returns the seq without touching the network.
+
+        The worker is a daemon thread: a script whose main thread exits right
+        after queueing kills it mid-queue, losing every order not yet
+        submitted (issue #156). stop() and an atexit hook both drain the queue
+        (bounded); callbacks still require the process to be alive -- they
+        cannot arrive after it is gone. Long-running strategies are unaffected.
         """
         seq = self._next_async_seq()
         # 屏障要在入队之前设好: 委托可能在本函数返回之前就被推送出来。
         self._arm_order_barrier(self._async_remark(args, kwargs), seq)
         self._ensure_async_order_worker()
+        self._register_exit_drain()
         self._async_order_queue.put((seq, args, kwargs))
         return seq
 

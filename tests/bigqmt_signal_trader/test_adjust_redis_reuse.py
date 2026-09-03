@@ -108,6 +108,17 @@ class RedisClientReuseTest(unittest.TestCase):
         self.assertIsNone(result)
         self.assertEqual(self.built, [])
 
+    def test_disabled_redis_features_do_not_build_a_client_for_zmq(self):
+        result = strategy._exec_event_redis({
+            "rpc": {"transport": "zmq"},
+            "redis": {"host": "127.0.0.1", "port": 6379},
+            "download_jobs": {"enabled": False},
+            "exec_events": {"enabled": False},
+        })
+
+        self.assertIsNone(result)
+        self.assertEqual(self.built, [])
+
     def test_service_client_is_preferred_over_building_one(self):
         """With the redis transport the service already holds a client."""
         class _Service(object):

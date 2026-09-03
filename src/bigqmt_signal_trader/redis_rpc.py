@@ -7,6 +7,7 @@ callback thread.
 """
 
 import base64
+import collections
 import datetime as _dt
 import json
 import math
@@ -135,6 +136,7 @@ LISTENER_DEFERRED_METHODS = {
     "query_stock_position",
     "query_orders",
     "query_trades",
+    "query_execution_snapshot",
     "describe_trade_detail_fields",
     "reload_deployment",
     "query_account_infos",
@@ -520,6 +522,13 @@ class BigQmtRpcHandlers:
         # 融资融券查询等)。由 strategy._build_config 解析注入。
         self.qmt_api = dict(qmt_api or {})
         self._submit_journal = {}
+        # In-process order-identity journal: remark -> strategy_name, written
+        # at submit time and read back at query time. The Redis identity store
+        # covers restarts and other processes; this covers deployments with no
+        # Redis at all (zmq single-file), where attribution used to silently
+        # read "" forever (issue #156 follow-up to #133). Bounded FIFO,
+        # same 24h TTL as the Redis store.
+        self._order_identity_local = collections.OrderedDict()
         # Order settlement. Async by default: blocking here holds the QMT main
         # strategy thread, which serializes every other request behind it and
         # caps throughput at ~2 orders/sec (issue #44).
@@ -1047,22 +1056,58 @@ class BigQmtRpcHandlers:
         if not unnamed:
             return rows
         redis_client = self._identity_redis()
-        if redis_client is None:
-            return rows
-        try:
-            from .exec_events import order_identity_map
+        if redis_client is not None:
+            try:
+                from .exec_events import order_identity_map
 
-            identities = order_identity_map(
-                redis_client, account_id,
-                [getattr(row, "user_order_id", "") for row in unnamed])
-        except Exception:
-            return rows
-        for row in unnamed:
-            identity = identities.get(
-                str(getattr(row, "user_order_id", "") or "").strip())
-            if identity and identity.get("strategy_name"):
-                row.strategy_name = str(identity.get("strategy_name") or "")
+                identities = order_identity_map(
+                    redis_client, account_id,
+                    [getattr(row, "user_order_id", "") for row in unnamed])
+                for row in unnamed:
+                    identity = identities.get(
+                        str(getattr(row, "user_order_id", "") or "").strip())
+                    if identity and identity.get("strategy_name"):
+                        row.strategy_name = str(identity.get("strategy_name") or "")
+            except Exception:
+                pass
+        # No-Redis deployments still name what THIS process submitted: the
+        # in-process journal written at submit time (issue #156).
+        journal = getattr(self, "_order_identity_local", None)
+        if journal:
+            now = time.time()
+            for row in unnamed:
+                if str(getattr(row, "strategy_name", "") or "").strip():
+                    continue
+                key = (str(account_id or ""),
+                       str(getattr(row, "user_order_id", "") or "").strip())
+                entry = journal.get(key)
+                if not entry:
+                    continue
+                ts, name = entry
+                if name and now - ts <= self._ORDER_IDENTITY_LOCAL_TTL_SECONDS:
+                    row.strategy_name = name
         return rows
+
+    _ORDER_IDENTITY_LOCAL_LIMIT = 5000
+    _ORDER_IDENTITY_LOCAL_TTL_SECONDS = 86400.0
+
+    def _remember_order_identity_local(self, account_id, remark, strategy_name):
+        remark = str(remark or "").strip()
+        if not remark:
+            return
+        key = (str(account_id or ""), remark)
+        try:
+            journal = getattr(self, "_order_identity_local", None)
+            if journal is None:
+                # Tests (and the QMT sandbox) build handlers via __new__ and
+                # skip __init__ -- create on first use.
+                journal = self._order_identity_local = collections.OrderedDict()
+            journal[key] = (time.time(), str(strategy_name or ""))
+            journal.move_to_end(key)
+            while len(journal) > self._ORDER_IDENTITY_LOCAL_LIMIT:
+                journal.popitem(last=False)
+        except Exception:
+            pass
 
     def _handle_describe_trade_detail_fields(self, params):
         """Report which attributes QMT's ORDER / DEAL rows carry. Names only.
@@ -1518,6 +1563,10 @@ class BigQmtRpcHandlers:
             )
         except Exception:
             pass
+        # Always journal locally too -- cheap, and the only attribution a
+        # no-Redis deployment has (issue #156).
+        self._remember_order_identity_local(
+            request.account_id, request.remark, request.strategy_name)
 
         result = self.order_gateway.submit(request)
 

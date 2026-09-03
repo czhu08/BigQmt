@@ -387,6 +387,10 @@ def normalize_order_event(order, account_id=""):
         "action": _action_from_direction(direction),
         "offset_flag": _attr(order, ["m_nOffsetFlag", "offset_flag"]),
         "strategy_name": str(_attr(order, ["strategyName", "m_strStrategyName", "strategy_name"], "") or ""),
+        # QMT sometimes puts the name right on the object; usually absent and
+        # the publisher fills it from ContextInfo (issue #161).
+        "instrument_name": str(
+            _attr(order, ["m_strInstrumentName", "instrument_name"], "") or ""),
         "remark": str(_attr(order, ["m_strRemark", "order_remark", "remark", "user_order_id"], "") or ""),
         "user_order_id": str(_attr(order, ["m_strRemark", "user_order_id", "order_remark", "remark"], "") or ""),
         "opt_name": str(_attr(order, ["m_strOptName", "opt_name"], "") or ""),
@@ -529,6 +533,8 @@ def normalize_trade_event(trade, account_id=""):
         "stock_code": _with_exchange_suffix(
             _attr(trade, ["m_strInstrumentID", "stock_code"], ""), trade
         ),
+        "instrument_name": str(
+            _attr(trade, ["m_strInstrumentName", "instrument_name"], "") or ""),
         "order_sys_id": str(_attr(trade, ["m_strOrderSysID", "order_sys_id", "order_sysid", "order_id"], "") or ""),
         "trade_id": str(_attr(trade, ["m_strTradeID", "trade_id"], "") or ""),
         "volume": _attr(trade, ["m_nVolume", "volume", "traded_volume"]),

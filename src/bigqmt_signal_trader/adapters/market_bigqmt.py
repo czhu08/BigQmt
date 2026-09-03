@@ -27,6 +27,7 @@ This module does not make trading decisions.
 """
 
 import importlib
+import time
 
 from ..code_utils import (
     EXCHANGE_TOKENS, FUTURES_MARKET_CODES, normalize_stock_code)
@@ -353,24 +354,49 @@ class BigQmtMarketDataProvider:
             self._native_xtdata = _load_native_xtdata()
         return self._native_xtdata
 
+    # In a Big QMT terminal the SDK never gains a quote service mid-process, so
+    # a failed native call is retried only once per this window instead of on
+    # every call: measured on Guojin 2.1.19.0, EVERY get_trading_dates paid the
+    # SDK's ~2.1s service-dial failure before falling back, and the first call
+    # after a strategy start paid 21.6s (issue #160).
+    NATIVE_FAILURE_CACHE_SECONDS = 600.0
+
+    def _native_dead_marks(self):
+        marks = getattr(self, "_native_dead_marks_dict", None)
+        if marks is None:
+            marks = self._native_dead_marks_dict = {}
+        return marks
+
+    def _native_known_dead(self, func_name):
+        ts = self._native_dead_marks().get(func_name)
+        return ts is not None and (time.time() - ts) < self.NATIVE_FAILURE_CACHE_SECONDS
+
     def _native_or_context(self, func_name, context_caller, *args, **kwargs):
         """Prefer the xtdata SDK function, fall back to a ContextInfo call.
 
         Several data APIs exist only as xtdata module functions. When the SDK
         is available AND its quote service is reachable we use it. Otherwise
         we fall back to ContextInfo so callers get a best-effort answer.
+
+        A native failure is remembered per function for
+        NATIVE_FAILURE_CACHE_SECONDS: in Big QMT the failure mode is "SDK
+        present, quote service absent", which does not heal mid-process, and
+        paying its multi-second dial timeout on every call made
+        get_trading_dates cost 2.1s per call forever (issue #160).
         """
         module = self._native()
-        if module is not None:
+        if module is not None and not self._native_known_dead(func_name):
             fn = getattr(module, func_name, None)
             if fn is not None:
                 try:
-                    return fn(*args, **kwargs)
-                except Exception as exc:
+                    result = fn(*args, **kwargs)
+                    self._native_dead_marks().pop(func_name, None)
+                    return result
+                except Exception:
                     # Big QMT path: SDK present but no quote service to talk
                     # to ("无法连接行情服务"). Don't crash — let the ContextInfo
                     # fallback have a turn.
-                    pass
+                    self._native_dead_marks()[func_name] = time.time()
         return context_caller()
 
     def _call_first_supported(self, shapes):
