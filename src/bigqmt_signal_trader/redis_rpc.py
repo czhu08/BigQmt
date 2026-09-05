@@ -34,6 +34,7 @@ READ_METHODS = {
     "ping",
     "get_deployment_info",
     "probe_capabilities",
+    "probe_order_identity",
     "get_ticks",
     "get_instrument",
     "get_instrument_type",
@@ -51,6 +52,7 @@ READ_METHODS = {
     "get_trading_dates",
     "get_holidays",
     "download_holiday_data",
+    "download_his_st_data",
     "get_ipo_info",
     "get_etf_info",
     "download_etf_info",
@@ -112,6 +114,10 @@ ORDER_METHODS = {
     "submit_order",
     "submit_orders_batch",
     "cancel_order",
+    # Raw native-passorder passthrough (route 2). Gated behind
+    # allow_order_methods like every other write, and deferred to the adjust
+    # thread by virtue of not being in READ_METHODS.
+    "passorder",
 }
 
 # Whole-quote push subscription control methods. These drive a server-side
@@ -222,6 +228,7 @@ MARKET_DATA_METHODS = {
     "get_trading_dates",
     "get_holidays",
     "download_holiday_data",
+    "download_his_st_data",
     "get_ipo_info",
     "get_etf_info",
     "download_etf_info",
@@ -590,11 +597,12 @@ class BigQmtRpcHandlers:
             "allow_order_methods": bool(self.allow_order_methods),
             "rpc_revision": RPC_REVISION,
             "version": _deployed_version(),
-            "account_type": self._reported_account_type(),
+            "account_type": self._reported_account_type(
+                params.get("account_id") or self.account_id),
             "server_time": _dt.datetime.now(),
         }
 
-    def _reported_account_type(self):
+    def _reported_account_type(self, account_id=None):
         """What this deployment will actually trade as.
 
         The client's StockAccount(..., "CREDIT") never reaches the server --
@@ -602,10 +610,16 @@ class BigQmtRpcHandlers:
         caller declaring CREDIT against a STOCK deployment has no way to see
         the mismatch. It shows up as an all-zero credit asset row instead
         (issue #92). Empty when there is no gateway to ask.
+
+        When account_id is given and the gateway supports per-request
+        resolution, the map-aware type is returned (same #92 class of bug
+        for multi-account deployments where a FUTURE account sees "STOCK").
         """
         gateway = self.order_gateway
         if gateway is None:
             return ""
+        if account_id is not None and hasattr(gateway, "_resolve_account_type"):
+            return str(gateway._resolve_account_type(account_id) or "").strip().upper()
         return str(getattr(gateway, "account_type", "") or "").strip().upper()
 
     def _handle_get_deployment_info(self, params):
@@ -737,7 +751,54 @@ class BigQmtRpcHandlers:
                     "error": "%s: %s" % (exc.__class__.__name__, exc),
                 }
         info["sector_probe"] = self._probe_sector_channels()
+        info["order_watch"] = self._probe_order_watch()
+        info["reply_residency"] = self._probe_reply_residency()
         return info
+
+    def _probe_reply_residency(self):
+        """How long finished replies wait for the transport to send them.
+
+        Handlers run on the adjust thread, so on zmq every reply is queued for
+        the router thread and only leaves at the top of its loop. This says
+        whether that wait is where the round trip goes (#104).
+        """
+        transport = getattr(self, "rpc_transport", None)
+        stats = getattr(transport, "reply_residency_stats", None)
+        if not callable(stats):
+            return {"available": False}
+        try:
+            report = dict(stats())
+        except Exception as exc:
+            return {"available": False,
+                    "error": "%s: %s" % (exc.__class__.__name__, exc)}
+        report["available"] = True
+        return report
+
+    def _probe_order_watch(self):
+        """Is the callback-fed settlement table live here (issue #164)?
+
+        The table is wired onto the handlers by bigqmt_signal_trader_strategy,
+        a top-level file QMT execs -- reload_deployment cannot refresh it. So a
+        deployment can carry every line of the #164 code and still be running
+        the old poll loop until someone restarts the strategy, with nothing to
+        tell the two apart. This says which one is running.
+
+        Counts only: remarks and order ids identify orders.
+        """
+        table = getattr(self, "order_watch_table", None)
+        if table is None:
+            return {
+                "wired": False,
+                "note": ("settlement is polling; the watch table is wired in "
+                         "the strategy file, which needs a strategy RESTART "
+                         "(reload_deployment cannot refresh it)"),
+            }
+        report = {"wired": True}
+        try:
+            report.update(table.stats())
+        except Exception as exc:
+            report["stats_error"] = "%s: %s" % (exc.__class__.__name__, exc)
+        return report
 
     # 板块通道探测（issue #143）。写入板块有三条可能的通道，名字还各不相同：
     #   * ContextInfo.create_sector           大 QMT 内置 Python
@@ -1235,9 +1296,29 @@ class BigQmtRpcHandlers:
         # Some brokers hand back rows even here; normalise rather than drop.
         return _normalize_detail_rows(data)
 
-    def _configured_account_type(self):
+    def _configured_account_type(self, account_id=None):
+        """The account type this deployment will trade as, per-request aware.
+
+        When the gateway supports per-request account_type resolution (i.e.
+        has ``_resolve_account_type`` from BIGQMT_ACCOUNT_TYPE_MAP), this
+        returns the map-aware type for the given account_id.  When no map
+        is configured, returns the gateway's own ``account_type`` unchanged.
+
+        The *account_id* parameter is explicit (not read from instance state)
+        because zmq deployments have a background listener thread calling
+        market-data methods concurrently with the adjust thread calling trade
+        methods -- storing params on ``self`` would race (issue #43, #164).
+        """
+        gateway = self.order_gateway
+        if gateway is not None and hasattr(gateway, "_resolve_account_type"):
+            try:
+                aid = account_id or self.account_id or ""
+                if aid:
+                    return str(gateway._resolve_account_type(aid)).strip().upper()
+            except Exception:
+                pass
         return str(
-            getattr(self.order_gateway, "account_type", "CREDIT") or "CREDIT"
+            getattr(gateway, "account_type", "CREDIT") or "CREDIT"
         ).strip().upper()
 
     def _query_trade_detail(self, params, detail_type, strategy_name=""):
@@ -1251,8 +1332,11 @@ class BigQmtRpcHandlers:
         gateway = self.order_gateway
         if gateway is None or gateway.get_trade_detail_data is None:
             return []
+        account_type = (gateway._resolve_account_type(account_id)
+                        if hasattr(gateway, "_resolve_account_type")
+                        else getattr(gateway, "account_type", "STOCK"))
         try:
-            rows = gateway.get_trade_detail_data(account_id, gateway.account_type, detail_type, strategy_name)
+            rows = gateway.get_trade_detail_data(account_id, account_type, detail_type, strategy_name)
             return _normalize_detail_rows(rows)
         except Exception:
             return []
@@ -1274,7 +1358,7 @@ class BigQmtRpcHandlers:
         return self._call_qmt_global(
             "get_unclosed_compacts",
             self._request_account_id(params),
-            self._configured_account_type(),
+            self._configured_account_type(self._request_account_id(params)),
         )
 
     def _handle_query_credit_subjects(self, params):
@@ -1354,14 +1438,14 @@ class BigQmtRpcHandlers:
         return self._call_qmt_global(
             "get_unclosed_compacts",
             self._request_account_id(params),
-            self._configured_account_type(),
+            self._configured_account_type(self._request_account_id(params)),
         )
 
     def _handle_get_closed_compacts(self, params):
         return self._call_qmt_global(
             "get_closed_compacts",
             self._request_account_id(params),
-            self._configured_account_type(),
+            self._configured_account_type(self._request_account_id(params)),
         )
 
     def _handle_get_debt_contract(self, params):
@@ -1446,6 +1530,69 @@ class BigQmtRpcHandlers:
             return self._handle_market_data_method("download_history_data2", params)
         except (NotImplementedError, AttributeError):
             return False
+
+    def _handle_probe_order_identity(self, params):
+        """Diagnose the strategy_name backfill chain, one link at a time.
+
+        #156's reporter: the identity record exists in Redis, the key matches,
+        and the query still reads strategy_name="". Nothing along the chain
+        can say which link dropped it from the outside -- this answers that
+        from the inside: is the identity Redis wired at all, does the key
+        exist under THIS account, is the local journal covering it (#156's
+        in-process fallback), and does the raw lookup raise.
+        """
+        account_id = self._request_account_id(params)
+        remark = str(params.get("remark") or params.get("user_order_id") or "").strip()
+        redis_client = self._identity_redis()
+        journal = getattr(self, "_order_identity_local", None) or {}
+        out = {
+            "account_id": account_id,
+            "remark": remark,
+            "identity_redis_wired": redis_client is not None,
+            "local_journal_size": len(journal),
+        }
+        if not remark:
+            out["note"] = "pass remark=<the order's remark> to check the key"
+            return out
+        from .exec_events import order_identity_key
+
+        key = order_identity_key(account_id, remark)
+        out["identity_key"] = key
+        if redis_client is not None:
+            try:
+                out["redis_hit"] = bool(redis_client.get(key))
+            except Exception as exc:
+                out["redis_hit"] = None
+                out["lookup_error"] = "%s: %s" % (exc.__class__.__name__, exc)
+        entry = journal.get((account_id, remark))
+        out["local_hit"] = bool(entry and entry[1])
+        if entry:
+            out["local_strategy_name"] = entry[1]
+        return out
+
+    def _handle_download_holiday_data(self, params):
+        # MiniQMT downloads a holiday table from the xtdata service. Big QMT's
+        # terminal maintains the trading calendar itself (refreshed at login
+        # and by its own data updater), so there is nothing to download and no
+        # ContextInfo method to call -- the old generic path answered with
+        # NotImplementedError (issue #163). A clear no-op instead.
+        return {
+            "ok": True,
+            "downloaded": False,
+            "note": ("Big QMT maintains the trading calendar itself; nothing "
+                     "to download. get_trading_dates/get_holidays read the "
+                     "terminal's own data."),
+        }
+
+    def _handle_download_his_st_data(self, params):
+        # Same shape as download_holiday_data: ST history lives in the
+        # terminal's own data on Big QMT (issue #163).
+        return {
+            "ok": True,
+            "downloaded": False,
+            "note": ("Big QMT maintains ST history in the terminal's own data; "
+                     "nothing to download. get_his_st_data reads it directly."),
+        }
 
     def _order_action_from_params(self, params):
         action = str(params.get("action") or "").upper()
@@ -1621,6 +1768,20 @@ class BigQmtRpcHandlers:
         """
         request = settlement.order_request
         settlement.attempts += 1
+        # Fast path: QMT's order_callback already pushed the answer
+        # (issue #164). A miss means nothing -- fall through to the poll.
+        watch = getattr(self, "order_watch_table", None)
+        if watch is not None:
+            try:
+                watched_sysid = watch.sysid_for_remark(request.remark)
+            except Exception:
+                watched_sysid = None
+            if watched_sysid:
+                try:
+                    settlement.result.order_sys_id = watched_sysid
+                except Exception:
+                    pass
+                return True
         try:
             orders = self.order_gateway.query_orders(request.account_id, "") or []
             by_remark = [
@@ -1701,6 +1862,7 @@ class BigQmtRpcHandlers:
             raise ValueError("orders must be a non-empty list")
         if len(orders) > 500:
             raise ValueError("orders exceeds batch limit 500")
+        batch_started = time.time()
         batch_id = str(params.get("batch_id") or uuid.uuid4().hex)
         account_id = self._request_account_id(params)
         strategy_name = str(
@@ -1708,9 +1870,24 @@ class BigQmtRpcHandlers:
             or (orders[0] or {}).get("strategy_name")
             or self.default_strategy_name
         )
+        # order_stock_async routes a queued backlog through here (#181), but it
+        # never promised order_stock_batch's idempotency contract, and
+        # inheriting it swallowed orders while answering success (#190):
+        # no remark is normal for async (the single path invents
+        # "bqrpc:<uuid>"), and repeating one is legal there. Under this batch
+        # endpoint the first meant ORDER_TAG_REQUIRED and placed nothing, the
+        # second meant "already submitted" and placed one of N.
+        #
+        # Default True so deliberate order_stock_batch callers -- who supply
+        # tags precisely to be protected against a retry double-ordering --
+        # keep exactly today's behaviour. Only a caller that opts out gets the
+        # single path's semantics.
+        idempotent = params.get("idempotent")
+        idempotent = True if idempotent is None else bool(idempotent)
         existing_by_tag = {}
         lookup_ok = True
-        requires_lookup = any(bool((item or {}).get("require_idempotency_check")) for item in orders)
+        requires_lookup = idempotent and any(
+            bool((item or {}).get("require_idempotency_check")) for item in orders)
         if requires_lookup:
             try:
                 identity_query = getattr(self.order_gateway, "query_submission_identities_strict", None)
@@ -1734,7 +1911,35 @@ class BigQmtRpcHandlers:
         results = []
         for index, item in enumerate(orders):
             item = dict(item or {})
+            # No per-item settlement, and not negotiable per item (#181).
+            #
+            # _handle_submit_order defaults wait_settlement to True and parks
+            # the settlement in a SINGLE slot; the service takes that slot once
+            # per request. N orders in one request therefore overwrite each
+            # other and only the last survives -- carrying the batch's own
+            # request/response, so the whole batch reply gets held until that
+            # one order settles or times out, and that one order's diagnostic
+            # ("order not found in system", naming one stock, one price, one
+            # volume) is attached to a reply covering all of them. The
+            # order_sys_id it back-fills is read by nobody: each result dict is
+            # built from the submit result before any settlement runs.
+            #
+            # Nothing is lost by skipping it. The batch answers per item
+            # already, and order_sys_id arrives on the order_callback push the
+            # same way it does for order_stock_async (#50). Honouring an
+            # explicit wait_settlement per item would need a settlement queue
+            # keyed to one reply, which is the "把单槽改成队列" half of #181.
+            item["wait_settlement"] = False
             order_tag = str(item.get("order_remark") or item.get("remark") or item.get("signal_id") or "")
+            if not order_tag and not idempotent:
+                # Same invention as _handle_submit_order, so an async order
+                # with no remark reaches the broker instead of being rejected.
+                # Only the signal_id is set: _handle_submit_order derives the
+                # remark from it as "bqrpc:rpc-<hex>", and pre-building the
+                # remark here would double the prefix and change the string QMT
+                # shows in 备注 (which #152's settlement lookup matches on).
+                item.setdefault("signal_id", "rpc-%s" % uuid.uuid4().hex)
+                order_tag = "bqrpc:%s" % item["signal_id"]
             if not order_tag:
                 results.append({
                     "index": index,
@@ -1747,9 +1952,9 @@ class BigQmtRpcHandlers:
                     "user_order_id": "",
                 })
                 continue
-            known = existing_by_tag.get(order_tag)
+            known = existing_by_tag.get(order_tag) if idempotent else None
             journal_key = (account_id, strategy_name, order_tag)
-            journal = self._submit_journal.get(journal_key)
+            journal = self._submit_journal.get(journal_key) if idempotent else None
             if known is not None or journal is not None:
                 results.append({
                     "index": index,
@@ -1788,7 +1993,11 @@ class BigQmtRpcHandlers:
                     "order_sys_id": str(getattr(result, "order_sys_id", None) or ""),
                     "user_order_id": str(getattr(result, "user_order_id", None) or ""),
                 }
-                if order_tag:
+                # Not journalled when the caller opted out: those tags are not
+                # identities (async may repeat a remark for genuinely different
+                # orders), so recording them would let one suppress a later
+                # deliberate order_stock_batch item that reuses the string.
+                if order_tag and idempotent:
                     self._submit_journal[journal_key] = dict(response)
                 results.append(response)
             except Exception as exc:
@@ -1802,7 +2011,79 @@ class BigQmtRpcHandlers:
                     "error": "%s: %s" % (exc.__class__.__name__, exc),
                     "user_order_id": order_tag,
                 })
+        # One line per batch, always: a batch that outlives the client's
+        # timeout keeps running to completion here, and without this line the
+        # doubled orders that follow have no server-side trace.
+        try:
+            from .logging_setup import get_logger
+            get_logger("rpc").info(
+                "batch submit account=%s items=%d placed=%d failed=%d %.0fms",
+                account_id, len(orders),
+                sum(1 for r in results if r.get("success") and not r.get("idempotent")),
+                sum(1 for r in results if not r.get("success")),
+                (time.time() - batch_started) * 1000.0)
+        except Exception:
+            pass
         return results
+
+    def _handle_passorder(self, params):
+        """Raw native-passorder passthrough (route 2).
+
+        Forwards the 11-arg passorder signature straight through to QMT, with
+        ContextInfo supplied server-side. No opType validation, no code
+        normalization, no settlement read-back -- the caller owns the native
+        contract. See BigQmtOrderGateway.passorder_passthrough.
+
+        Accepts both the native argument names (op_type/order_type/price_type/
+        prType...) and passorder's own spellings, so a caller can paste the
+        signature they know. account defaults to the request/gateway account.
+        """
+        if self.order_gateway is None:
+            raise RuntimeError("order_gateway is not configured")
+        passthrough = getattr(self.order_gateway, "passorder_passthrough", None)
+        if not callable(passthrough):
+            raise RuntimeError("this deployment predates the passorder passthrough")
+
+        def pick(*names, **kw):
+            for name in names:
+                if name in params and params[name] is not None:
+                    return params[name]
+            return kw.get("default")
+
+        op_type = pick("op_type", "opType", "optype")
+        order_type = pick("order_type", "orderType", "ordertype",
+                          default=self.order_gateway.combo_type)
+        account_id = self._request_account_id(params)
+        order_code = pick("order_code", "orderCode", "stock_code", "code")
+        price_type = pick("price_type", "prType", "prtype",
+                          default=self.order_gateway.price_type)
+        price = pick("price", default=-1)
+        volume = pick("volume", "order_volume", "vol")
+        strategy_name = pick("strategy_name", "strategyName",
+                             default=self.default_strategy_name)
+        quick_trade = pick("quick_trade", "quickTrade",
+                           default=self.order_gateway.quick_trade)
+        user_order_id = pick("user_order_id", "userOrderId", "order_remark",
+                             "remark", default="")
+        if op_type is None:
+            raise ValueError("op_type is required")
+        if not order_code:
+            raise ValueError("order_code is required")
+        if volume is None:
+            raise ValueError("volume is required")
+        return passthrough(
+            op_type=op_type,
+            order_type=order_type,
+            account_id=account_id,
+            order_code=order_code,
+            price_type=price_type,
+            price=price,
+            volume=volume,
+            strategy_name=strategy_name,
+            quick_trade=quick_trade,
+            user_order_id=user_order_id,
+            dry_run=bool(pick("dry_run", "dryRun", default=False)),
+        )
 
     def _handle_cancel_order(self, params):
         if self.order_gateway is None:
@@ -1815,7 +2096,7 @@ class BigQmtRpcHandlers:
             order_sys_id=order_sys_id,
             user_order_id=str(params.get("user_order_id") or ""),
         )
-        result = self.order_gateway.cancel(order_ref)
+        result = self.order_gateway.cancel(order_ref, account_id=account_id)
 
         # The native cancel return is not trustworthy in EITHER direction.
         # #148: falsey while the broker accepted the cancel (status became 54
@@ -1849,41 +2130,8 @@ class BigQmtRpcHandlers:
             self._pending_settlement = settlement
         return result
 
-    def _apply_cancel_lookup(self, settlement, final=False):
-        """Resolve an ambiguous native cancel return from the order snapshot."""
-        settlement.attempts += 1
-        order_sys_id = str(settlement.order_ref.order_sys_id or "")
-        try:
-            strict_query = getattr(self.order_gateway, "query_orders_strict", None)
-            if callable(strict_query):
-                orders = strict_query(settlement.account_id, "") or []
-            else:
-                orders = self.order_gateway.query_orders(settlement.account_id, "") or []
-        except Exception as exc:
-            if not final:
-                return False
-            settlement.result.success = False
-            settlement.result.message = (
-                "cancel status lookup failed after %d attempt(s): %s: %s"
-                % (settlement.attempts, exc.__class__.__name__, exc)
-            )
-            return True
-
-        matches = [
-            order for order in orders
-            if str(getattr(order, "order_sys_id", "") or "") == order_sys_id
-        ]
-        if not matches:
-            if not final:
-                return False
-            settlement.result.success = False
-            settlement.result.message = (
-                "cancel was not confirmed: order %s was not found after %d lookup(s)"
-                % (order_sys_id, settlement.attempts)
-            )
-            return True
-
-        status = str(getattr(matches[0], "status", "") or "")
+    def _settle_cancel_from_status(self, settlement, status, order_sys_id, final):
+        """One status answer, from the watch table or the snapshot row."""
         if status in CANCELED_ORDER_STATUSES:
             settlement.result.success = True
             settlement.result.message = ""
@@ -1917,6 +2165,55 @@ class BigQmtRpcHandlers:
             % (settlement.attempts, order_sys_id, status or "unknown")
         )
         return True
+
+    def _apply_cancel_lookup(self, settlement, final=False):
+        """Resolve an ambiguous native cancel return from the order snapshot."""
+        settlement.attempts += 1
+        order_sys_id = str(settlement.order_ref.order_sys_id or "")
+        # Fast path: the order's own status change was pushed to us by QMT's
+        # order_callback (issue #164). A table miss falls through to the poll.
+        watch = getattr(self, "order_watch_table", None)
+        if watch is not None:
+            try:
+                watched = watch.status_for_sysid(order_sys_id)
+            except Exception:
+                watched = None
+            if watched is not None:
+                return self._settle_cancel_from_status(
+                    settlement, str(watched), order_sys_id, final)
+        try:
+            strict_query = getattr(self.order_gateway, "query_orders_strict", None)
+            if callable(strict_query):
+                orders = strict_query(settlement.account_id, "") or []
+            else:
+                orders = self.order_gateway.query_orders(settlement.account_id, "") or []
+        except Exception as exc:
+            if not final:
+                return False
+            settlement.result.success = False
+            settlement.result.message = (
+                "cancel status lookup failed after %d attempt(s): %s: %s"
+                % (settlement.attempts, exc.__class__.__name__, exc)
+            )
+            return True
+
+        matches = [
+            order for order in orders
+            if str(getattr(order, "order_sys_id", "") or "") == order_sys_id
+        ]
+        if not matches:
+            if not final:
+                return False
+            settlement.result.success = False
+            settlement.result.message = (
+                "cancel was not confirmed: order %s was not found after %d lookup(s)"
+                % (order_sys_id, settlement.attempts)
+            )
+            return True
+
+        status = str(getattr(matches[0], "status", "") or "")
+        return self._settle_cancel_from_status(
+            settlement, status, order_sys_id, final)
 
 
 def _bool_value(value, default=False):
@@ -2125,6 +2422,13 @@ class RedisPubSubRpcService:
                 print_prefix=print_prefix,
             )
         self._transport = transport
+        # Let the handlers reach the transport for read-only diagnostics
+        # (reply-queue residency, #104). Set here rather than in the
+        # strategy file so a reload picks it up without a restart.
+        try:
+            self.handlers.rpc_transport = transport
+        except Exception:
+            pass
         # Route inbound raw payloads through the service's dispatch (which
         # applies the inline-vs-deferred fork) instead of transport.deliver().
         self._transport.on_raw_payload = self._handle_received_payload
@@ -2393,6 +2697,11 @@ class RedisPubSubRpcService:
             # problem. Lets clients see why an operation silently failed.
             "server_error": "",
             "handled_at": _dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            # Wall clock, not perf_counter: the client is a separate process
+            # on the same machine, so these are directly comparable to its own
+            # time.time() and decompose the round trip into wait / handle /
+            # return without guessing (#104).
+            "_t_recv": time.time(),
         }
         try:
             if self.account_id and account_id and account_id != self.account_id:
@@ -2402,15 +2711,6 @@ class RedisPubSubRpcService:
             _t1 = time.perf_counter() if method == "ping" else 0.0
             response["data"] = to_jsonable(result)
             response["ok"] = True
-            if method == "ping":
-                try:
-                    from .logging_setup import get_logger
-                    get_logger("rpc").info(
-                        "ping breakdown handle=%.1fms jsonable=%.1fms",
-                        (_t1 - _t0) * 1000.0,
-                        (time.perf_counter() - _t1) * 1000.0)
-                except Exception:
-                    pass
             # Surface server-side diagnostics when the handler recorded one.
             server_error = getattr(self.handlers, "_last_server_error", None)
             if server_error:
@@ -2429,6 +2729,8 @@ class RedisPubSubRpcService:
                 return response
         except Exception as exc:
             response["error"] = "%s: %s" % (exc.__class__.__name__, exc)
+        response["_t_reply"] = time.time()
+        _t_pub0 = time.perf_counter() if method == "ping" else 0.0
         try:
             self._publish_response(request, response)
         except Exception:
@@ -2441,6 +2743,20 @@ class RedisPubSubRpcService:
                 get_logger("rpc").error(
                     "publish response failed method=%s:\n%s", method, _tb.format_exc()
                 )
+            except Exception:
+                pass
+        if method == "ping":
+            # Logged AFTER publish: this print goes to the QMT output panel,
+            # which costs ~1 adjust tick of GIL wait on the serving thread --
+            # between the handler and the send it inflated ping's round trip
+            # by ~100ms and made the breakdown lie (#104).
+            try:
+                from .logging_setup import get_logger
+                get_logger("rpc").info(
+                    "ping breakdown handle=%.1fms jsonable=%.1fms publish=%.1fms",
+                    (_t1 - _t0) * 1000.0,
+                    (_t_pub0 - _t1) * 1000.0,
+                    (time.perf_counter() - _t_pub0) * 1000.0)
             except Exception:
                 pass
         self._processed_count += 1

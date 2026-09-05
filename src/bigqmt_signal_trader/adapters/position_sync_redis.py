@@ -58,8 +58,16 @@ class RedisPositionSyncSink:
         else:
             self.redis.set(key, payload)
         if self.publish_events:
+            from .redis_common import note_stream_failure, streams_dead
+
             stream_key = self.event_stream_template.format(account_id=snapshot.account_id)
             # Cap the stream to prevent unbounded memory growth. Order/trade
             # events already use maxlen=2000; position events were missing it,
             # causing 4.2GB+ streams in production (issue #21).
-            self.redis.xadd(stream_key, {"payload": payload}, maxlen=2000, approximate=True)
+            # redis < 5.0 has no streams at all: learn it once and stop
+            # raising every tick (issue #163).
+            if not streams_dead():
+                try:
+                    self.redis.xadd(stream_key, {"payload": payload}, maxlen=2000, approximate=True)
+                except Exception as exc:
+                    note_stream_failure(exc)

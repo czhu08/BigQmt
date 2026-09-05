@@ -73,3 +73,43 @@ def decode_text(value):
 
 def redis_mapping_to_text(mapping):
     return {decode_text(key): decode_text(value) for key, value in (mapping or {}).items()}
+
+
+# redis streams (XADD/XREAD) need redis >= 5.0. Older servers (Windows builds
+# are often 3.0.x) answer with "unknown command 'XADD'". Learn it once from the
+# failure, say it once, and let callers skip xadd from then on -- pub/sub keeps
+# working on those servers (issue #163).
+_STREAMS_DEAD = False
+
+
+def streams_dead():
+    return _STREAMS_DEAD
+
+
+def note_stream_failure(exc, log=None):
+    """True when *exc* is the redis<5.0 'unknown command' stream failure.
+
+    The first such failure logs once and marks streams dead process-wide.
+    Any other exception returns False and changes nothing (transient redis
+    issues stay retried).
+    """
+    global _STREAMS_DEAD
+    if "unknown command" not in str(exc or "").lower():
+        return False
+    if _STREAMS_DEAD:
+        return True
+    _STREAMS_DEAD = True
+    message = (
+        "redis has no streams support (XADD: unknown command, redis < 5.0): "
+        "event/position replay streams are disabled for this process; pub/sub "
+        "callbacks keep working. Upgrade the redis server to >= 5.0 to "
+        "restore replay."
+    )
+    try:
+        if log is not None:
+            log.warning(message)
+        else:
+            print("[bigqmt] " + message)
+    except Exception:
+        pass
+    return True

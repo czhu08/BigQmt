@@ -36,6 +36,7 @@ if _load_bridge_module is not None:
     _adapter_factory = _load_bridge_module("bigqmt_signal_trader.adapter_factory")
     _runner = _load_bridge_module("bigqmt_signal_trader.runner")
     _runtime_bigqmt = _load_bridge_module("bigqmt_signal_trader.runtime_bigqmt")
+    _order_watch = _load_bridge_module("bigqmt_signal_trader.order_watch")
     _default_build_app = _adapter_factory.build_app
     forward_order_event = _runner.forward_order_event
     forward_trade_event = _runner.forward_trade_event
@@ -55,6 +56,21 @@ else:
         tick_app,
     )
     from bigqmt_signal_trader.runtime_bigqmt import BigQmtRuntimeAdapter
+    from bigqmt_signal_trader import order_watch as _order_watch
+
+
+# The order watch table (issue #164) lives at module level: created at module
+# load, written from the C++ callback thread, read from the adjust thread.
+_order_watch_table = _order_watch.OrderWatchTable()
+
+
+def _note_order_watch(order_info):
+    """Learn remark->sysid and sysid->status from a raw QMT orderInfo."""
+    try:
+        _order_watch_table.note(
+            _exec_events.normalize_order_event(order_info, ""))
+    except Exception:
+        pass
 
 
 # exec_events is loaded here, at module load, and never from inside the
@@ -551,14 +567,28 @@ def _is_redis_transport(transport_name):
 def _resolve_background_threads(transport_name, configured):
     """Decide whether the RPC service runs its own background receive threads.
 
-    Redis honors the configured value because it has a blocking brpop path AND
-    an adjust-driven lpop drain. ZMQ and all other transports MUST run their
-    receiver threads — without the background router loop, requests are never
-    received (ZMQ's start_receiving(background_threads=False) only binds the
-    socket and does not poll it).
+    ``configured`` is None when the local config never set
+    ``rpc_background_threads`` (the runtime only forwards the key when it was
+    given explicitly) -- that case keeps the historical default: background
+    receiver threads on for every transport.
+
+    An explicit False opts into the adjust-driven drain instead: the transport
+    is polled with a non-blocking recv from drain_request_queue on each adjust
+    tick, and the reply is sent on the adjust thread too. That removes every
+    cross-thread handoff from the round trip -- measured on the live terminal,
+    each time a background thread acquires the GIL costs ~1 adjust tick
+    (~100ms), which is where the round trip actually goes (#104).
+
+    Only zmq/mysql implement drain_request_queue, so only they honor the
+    override; anything else keeps the receiver thread it needs to be polled by.
+    Redis honors either value (blocking brpop path AND an adjust lpop drain).
     """
     normalized = str(transport_name or "redis").lower()
     if _is_redis_transport(normalized):
+        return bool(configured)
+    if configured is None:
+        return True
+    if normalized in ("zmq", "mysql"):
         return bool(configured)
     return True
 
@@ -712,6 +742,8 @@ def _build_rpc_service(context_info, app, config):
     _store_redis = response_redis_client or redis_client or _exec_event_redis(config)
     handlers.download_job_redis_client = _store_redis
     handlers.order_identity_redis_client = _store_redis
+    # Settlement reads the callback-fed watch table first (issue #164).
+    handlers.order_watch_table = _order_watch_table
     # Whether _pump_download_jobs will actually run queued jobs. The submit RPC
     # needs it: with the redis client now wired on every transport, a submit
     # would otherwise be accepted into a queue that nothing drains.
@@ -726,7 +758,11 @@ def _build_rpc_service(context_info, app, config):
     handlers.download_job_ttl_seconds = int((config.get("download_jobs") or {}).get("job_ttl_seconds") or 3600)
     process_in_listener = _config_bool(rpc_config.get("process_in_listener"), True)
     listener_methods = rpc_config.get("listener_methods") or ("*",)
-    configured_bg = _config_bool(rpc_config.get("background_threads"), False)
+    # None when the runtime did not forward the key (local config never set
+    # rpc_background_threads): the resolver then keeps the historical default.
+    configured_bg = rpc_config.get("background_threads")
+    if configured_bg is not None:
+        configured_bg = _config_bool(configured_bg, False)
     background_threads = _resolve_background_threads(transport_name, configured_bg)
     if background_threads and not configured_bg:
         print("[bigqmt_rpc] transport=%s -> background_threads auto-enabled" % transport_name)
@@ -748,7 +784,7 @@ def _build_rpc_service(context_info, app, config):
         "[bigqmt_rpc] transport=%s mode process_in_listener=%s listener_methods=%s allow_order_methods=%s background_threads=%s"
         % (transport_name, process_in_listener, listener_methods, allow_order_methods, background_threads)
     )
-    return RedisPubSubRpcService(
+    service = RedisPubSubRpcService(
         redis_client=redis_client,
         response_redis_client=response_redis_client,
         handlers=handlers,
@@ -764,6 +800,23 @@ def _build_rpc_service(context_info, app, config):
         debug_log_limit=int(rpc_config.get("debug_log_limit", 5)),
         transport=transport,
     )
+    # Multi-account: when BIGQMT_ACCOUNT_TYPE_MAP has multiple entries,
+    # build one RPC service per account sharing the same handlers.
+    try:
+        from bigqmt_signal_trader.multi_account import build_multi_account_rpc_service
+        multi_service = build_multi_account_rpc_service(
+            context_info, app, config,
+            # The single-service builder: reuse everything we just built
+            # as the primary, and let build_multi_account_rpc_service
+            # create secondary services if the map has more entries.
+            lambda ctx, app, cfg: service if ctx is context_info else None,
+        )
+        if multi_service is not service:
+            # Multi-account mode: wrapped in MultiAccountRpcServiceManager
+            return multi_service
+    except Exception as _ma_err:
+        print("[bigqmt_rpc] multi_account check failed (single-account fallback): %s" % _ma_err)
+    return service
 
 
 def _start_rpc_service(context_info, app, config):
@@ -1641,6 +1694,77 @@ def _exec_event_redis(config):
     return _exec_event_redis_client
 
 
+def _local_identity_strategy_name(account_id, event):
+    """strategy_name from the in-process submit journal, or "".
+
+    The journal (#156) is written by the RPC handlers at submit time and is
+    all a deployment has when redis is absent -- or, the reported case in
+    #174, configured but not reachable, which fails silently.
+    """
+    service = _rpc_service
+    handlers = getattr(service, "handlers", None) if service is not None else None
+    journal = getattr(handlers, "_order_identity_local", None)
+    if not journal:
+        return ""
+    remark = str(event.get("user_order_id") or event.get("remark") or "").strip()
+    if not remark:
+        return ""
+    try:
+        entry = journal.get((str(account_id or ""), remark))
+        if not entry:
+            return ""
+        stamped, name = entry
+        ttl = getattr(handlers, "_ORDER_IDENTITY_LOCAL_TTL_SECONDS", 86400.0)
+        if name and (time.time() - float(stamped)) <= float(ttl):
+            return str(name)
+    except Exception:
+        return ""
+    return ""
+
+
+def _enrich_event_identity(exec_events, config, account_id, event):
+    """Put the strategy name back on an event QMT could not name (#174).
+
+    Most events no longer get here: normalize_*_event reads the name off
+    报单来源 (m_strSource), which is passorder's own strategyName argument
+    coming back, so an order this bridge placed names itself and returns at the
+    first line below. m_strStrategyName really is absent (120 and 47 attributes
+    on a live terminal, in neither) -- concluding from that alone that the name
+    was absent too is what made this function the only way back.
+
+    It stays as the fallback for what the row cannot answer: a terminal that
+    blanks the source, and orders whose name only the bridge ever knew.
+
+    The in-process journal is consulted FIRST, and deliberately so. This runs
+    on QMT's C++ callback thread, and for an order this process submitted the
+    journal already holds the same string that was written to redis -- so
+    asking redis first would buy nothing and cost a round trip per event. It
+    costs a lot when redis is configured and not reachable: redis-py does not
+    dial until the first command, so every callback would pay the full
+    timeout (#145's shape). That is precisely the deployment #174 was reported
+    from.
+
+    Redis is the fallback rather than the primary because its extra reach --
+    naming an order some OTHER process submitted -- is the rarer case.
+
+    Both branches call this. Enriching only orders is what left
+    on_stock_trade's strategy_name permanently empty.
+    """
+    if str(event.get("strategy_name") or "").strip():
+        return event
+    name = _local_identity_strategy_name(account_id, event)
+    if name:
+        event["strategy_name"] = name
+        return event
+    redis_client = _exec_event_redis(config)
+    if redis_client is not None:
+        try:
+            event = exec_events.enrich_order_identity(redis_client, account_id, event)
+        except Exception:
+            pass
+    return event
+
+
 def _publish_exec_event(kind, obj, context_info=None):
     """Push a normalized order/trade event to Redis for real-time client callbacks."""
     config = _build_config()
@@ -1670,6 +1794,7 @@ def _publish_exec_event(kind, obj, context_info=None):
     try:
         if kind == "trade":
             event = exec_events.normalize_trade_event(obj, account_id)
+            event = _enrich_event_identity(exec_events, config, account_id, event)
             if not event.get("instrument_name"):
                 event["instrument_name"] = _event_instrument_name(
                     context_info, event.get("stock_code"))
@@ -1679,12 +1804,10 @@ def _publish_exec_event(kind, obj, context_info=None):
         else:
             event = exec_events.normalize_order_event(obj, account_id)
             # Identity enrichment reads the remark->identity map that
-            # remember_order_identity wrote, which only exists in Redis. On a
-            # push channel the event goes out un-enriched rather than not at
-            # all; order_sys_id and remark are already on it.
-            redis_client = _exec_event_redis(config)
-            if redis_client is not None:
-                event = exec_events.enrich_order_identity(redis_client, account_id, event)
+            # remember_order_identity wrote. On a push channel the event goes
+            # out un-enriched rather than not at all; order_sys_id and remark
+            # are already on it.
+            event = _enrich_event_identity(exec_events, config, account_id, event)
             if not event.get("instrument_name"):
                 event["instrument_name"] = _event_instrument_name(
                     context_info, event.get("stock_code"))
@@ -1724,6 +1847,8 @@ def _publish_exec_event(kind, obj, context_info=None):
 
 def order_callback(ContextInfo, orderInfo):
     """Standard Big QMT order callback."""
+    # Settlement feeds on this even when client push is off (issue #164).
+    _note_order_watch(orderInfo)
     _publish_exec_event("order", orderInfo, ContextInfo)
     return forward_order_event(BigQmtRuntimeAdapter.to_order_event(orderInfo))
 

@@ -123,6 +123,7 @@ RPC_LISTENER_METHODS = ("*",)
 RPC_TRANSPORT = "redis"
 RPC_ZMQ_CONFIG = {}
 RPC_MYSQL_CONFIG = {}
+QUOTE_PUSH_CONFIG = {}
 SCHEDULE_ADJUST_ENABLED = True
 # How often the strategy thread drains the RPC queue (via adjust). Lower = less
 # queue wait for read RPCs. Verify on the live box that run_time honors sub-3s
@@ -257,7 +258,12 @@ RPC_PROCESS_IN_LISTENER = bool(
     BIGQMT_REDIS_CONFIG.get("rpc_process_in_listener", RPC_PROCESS_IN_LISTENER and not RPC_ALLOW_ORDER_METHODS)
 )
 RPC_BACKGROUND_THREADS = bool(BIGQMT_REDIS_CONFIG.get("rpc_background_threads", RPC_BACKGROUND_THREADS))
+# The strategy side only honors an EXPLICIT rpc_background_threads on non-redis
+# transports (absent = historical default, receiver threads on). Remember
+# whether the local config named it so _apply_config can forward accordingly.
+RPC_BACKGROUND_THREADS_EXPLICIT = "rpc_background_threads" in BIGQMT_REDIS_CONFIG
 RPC_LISTENER_METHODS = tuple(BIGQMT_REDIS_CONFIG.get("rpc_listener_methods", RPC_LISTENER_METHODS))
+QUOTE_PUSH_CONFIG = dict(BIGQMT_REDIS_CONFIG.get("quote_push", QUOTE_PUSH_CONFIG))
 SCHEDULE_ADJUST_ENABLED = bool(BIGQMT_REDIS_CONFIG.get("schedule_adjust", SCHEDULE_ADJUST_ENABLED))
 if not RPC_BACKGROUND_THREADS:
     SCHEDULE_ADJUST_ENABLED = True
@@ -324,6 +330,30 @@ def _apply_config(account_id):
     account_id = str(account_id or "")
     if account_id:
         set_account_id(account_id)
+    rpc_block = {
+        "enabled": True,
+        "account_id": account_id,
+        "allow_order_methods": RPC_ALLOW_ORDER_METHODS,
+        "default_strategy_name": RPC_DEFAULT_STRATEGY_NAME,
+        "request_channel_template": "bigqmt:rpc:req:{account_id}",
+        "response_channel_template": "bigqmt:rpc:resp:{account_id}:{request_id}",
+        "response_key_template": "bigqmt:rpc:resp:{account_id}:{request_id}",
+        "response_ttl_seconds": 60,
+        "drain_max_items": 20,
+        "process_in_listener": RPC_PROCESS_IN_LISTENER,
+        "listener_methods": RPC_LISTENER_METHODS,
+        # Transport selection (default redis). Forwarded from the local
+        # config so the factory can pick zmq/mysql/shm.
+        "transport": RPC_TRANSPORT,
+        "zmq": RPC_ZMQ_CONFIG,
+        "mysql": RPC_MYSQL_CONFIG,
+    }
+    # Forward background_threads ONLY when the local config named it: on
+    # non-redis transports the strategy treats an absent key as "historical
+    # default" (receiver threads on) and an explicit False as the opt-in to
+    # the adjust-driven drain (#104).
+    if RPC_BACKGROUND_THREADS_EXPLICIT:
+        rpc_block["background_threads"] = RPC_BACKGROUND_THREADS
     configure(
         mode="bigqmt",
         account_id=account_id,
@@ -333,25 +363,8 @@ def _apply_config(account_id):
         schedule_adjust=SCHEDULE_ADJUST_ENABLED,
         schedule_adjust_interval=SCHEDULE_ADJUST_INTERVAL,
         redis=_redis_block(),
-        rpc={
-            "enabled": True,
-            "account_id": account_id,
-            "allow_order_methods": RPC_ALLOW_ORDER_METHODS,
-            "default_strategy_name": RPC_DEFAULT_STRATEGY_NAME,
-            "request_channel_template": "bigqmt:rpc:req:{account_id}",
-            "response_channel_template": "bigqmt:rpc:resp:{account_id}:{request_id}",
-            "response_key_template": "bigqmt:rpc:resp:{account_id}:{request_id}",
-            "response_ttl_seconds": 60,
-            "drain_max_items": 20,
-            "process_in_listener": RPC_PROCESS_IN_LISTENER,
-            "listener_methods": RPC_LISTENER_METHODS,
-            "background_threads": RPC_BACKGROUND_THREADS,
-            # Transport selection (default redis). Forwarded from the local
-            # config so the factory can pick zmq/mysql/shm.
-            "transport": RPC_TRANSPORT,
-            "zmq": RPC_ZMQ_CONFIG,
-            "mysql": RPC_MYSQL_CONFIG,
-        },
+        rpc=rpc_block,
+        quote_push=QUOTE_PUSH_CONFIG,
         full_tick_cache={
             "enabled": FULL_TICK_CACHE_ENABLED,
             "account_id": account_id,
@@ -383,8 +396,9 @@ def configure_runtime_account(account_id):
 
 
 def configure_runtime_redis(redis_config):
-    global REDIS_ENABLED, REDIS_HOST, REDIS_PORT, REDIS_DB, REDIS_USERNAME, REDIS_PASSWORD, RPC_ALLOW_ORDER_METHODS, RPC_DEFAULT_STRATEGY_NAME, RPC_PROCESS_IN_LISTENER, RPC_BACKGROUND_THREADS, RPC_LISTENER_METHODS, SCHEDULE_ADJUST_ENABLED, SCHEDULE_ADJUST_INTERVAL, FULL_TICK_CACHE_ENABLED, FULL_TICK_DEMAND_TTL_SECONDS, FULL_TICK_CACHE_TTL_SECONDS, FULL_TICK_REFRESH_INTERVAL_SECONDS, FULL_TICK_MARKET_REFRESH_INTERVAL_SECONDS, FULL_TICK_REFRESH_MAX_WALL_SECONDS, FULL_TICK_MAX_REQUESTS, RPC_TRANSPORT, RPC_ZMQ_CONFIG, RPC_MYSQL_CONFIG, DOWNLOAD_JOBS_ENABLED, DOWNLOAD_JOB_CHUNK_SIZE, DOWNLOAD_JOB_MAX_WALL_SECONDS, DOWNLOAD_JOB_TTL_SECONDS, EXEC_EVENTS_ENABLED, EXEC_EVENTS_DEBUG_RAW_FIELDS, EXEC_EVENTS_HOLD_PRESYSID_SECONDS
+    global REDIS_ENABLED, REDIS_HOST, REDIS_PORT, REDIS_DB, REDIS_USERNAME, REDIS_PASSWORD, RPC_ALLOW_ORDER_METHODS, RPC_DEFAULT_STRATEGY_NAME, RPC_PROCESS_IN_LISTENER, RPC_BACKGROUND_THREADS, RPC_LISTENER_METHODS, SCHEDULE_ADJUST_ENABLED, SCHEDULE_ADJUST_INTERVAL, FULL_TICK_CACHE_ENABLED, FULL_TICK_DEMAND_TTL_SECONDS, FULL_TICK_CACHE_TTL_SECONDS, FULL_TICK_REFRESH_INTERVAL_SECONDS, FULL_TICK_MARKET_REFRESH_INTERVAL_SECONDS, FULL_TICK_REFRESH_MAX_WALL_SECONDS, FULL_TICK_MAX_REQUESTS, RPC_TRANSPORT, RPC_ZMQ_CONFIG, RPC_MYSQL_CONFIG, QUOTE_PUSH_CONFIG, DOWNLOAD_JOBS_ENABLED, DOWNLOAD_JOB_CHUNK_SIZE, DOWNLOAD_JOB_MAX_WALL_SECONDS, DOWNLOAD_JOB_TTL_SECONDS, EXEC_EVENTS_ENABLED, EXEC_EVENTS_DEBUG_RAW_FIELDS, EXEC_EVENTS_HOLD_PRESYSID_SECONDS, RPC_BACKGROUND_THREADS_EXPLICIT
     redis_config = dict(redis_config or {})
+    RPC_BACKGROUND_THREADS_EXPLICIT = "rpc_background_threads" in redis_config
     REDIS_ENABLED = bool(redis_config.get("redis_enabled", REDIS_ENABLED))
     REDIS_HOST = redis_config.get("host", REDIS_HOST)
     REDIS_PORT = int(redis_config.get("port", REDIS_PORT))
@@ -402,6 +416,7 @@ def configure_runtime_redis(redis_config):
     RPC_TRANSPORT = str(redis_config.get("transport", RPC_TRANSPORT)).lower()
     RPC_ZMQ_CONFIG = dict(redis_config.get("zmq", RPC_ZMQ_CONFIG))
     RPC_MYSQL_CONFIG = dict(redis_config.get("mysql", RPC_MYSQL_CONFIG))
+    QUOTE_PUSH_CONFIG = dict(redis_config.get("quote_push", QUOTE_PUSH_CONFIG))
     # schedule_adjust must stay ON for ALL transports — including zmq.
     # run_time("adjust", interval) is what THROTTLES QMT's strategy callback: with
     # it, adjust fires on the configured cadence (e.g. 500ms); WITHOUT it QMT calls

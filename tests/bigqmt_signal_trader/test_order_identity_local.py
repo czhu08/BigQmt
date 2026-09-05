@@ -135,5 +135,78 @@ class LocalIdentityJournalTest(unittest.TestCase):
         self.assertEqual(rows[0].strategy_name, "from_redis")
 
 
+class FilteredQueryNamesRowsTest(unittest.TestCase):
+    """A strategy_name-filtered order query must name the rows it returns.
+
+    #156 follow-up: @kingtsi filtered query_stock_orders by strategy_name and
+    got correctly filtered rows -- that all read strategy_name="". The trade
+    builder had the filter fallback; the order builder did not.
+    """
+
+    def _gateway(self, rows):
+        from bigqmt_signal_trader.adapters.order_bigqmt import BigQmtOrderGateway
+
+        gateway = BigQmtOrderGateway.__new__(BigQmtOrderGateway)
+        gateway._rows = rows
+        gateway._require_query_func = lambda: (
+            lambda account_id, account_type, kind, strategy_name: rows)
+        gateway._account_type_code = lambda account_id=None: 2
+        gateway.account_type = "STOCK"
+        gateway.context_info = None
+        return gateway
+
+    def _row(self):
+        attrs = dict(
+            m_strInstrumentID="601398", m_strExchangeID="SH", m_nOffsetFlag=48,
+            m_nVolumeTotalOriginal=100, m_nVolumeTraded=0, m_nOrderStatus=50,
+            m_dLimitPrice=7.9, m_strRemark="sig-1", m_strOrderSysID="S1",
+            m_dTradedPrice=0.0,
+        )
+        return type("Row", (), attrs)
+
+    def test_filtered_order_query_names_rows_with_the_filter(self):
+        gateway = self._gateway([self._row()])
+        rows = gateway.query_orders_strict("acct", "TEST")
+        self.assertEqual(rows[0].strategy_name, "TEST")
+
+    def test_unfiltered_order_query_stays_empty_for_the_journal(self):
+        gateway = self._gateway([self._row()])
+        rows = gateway.query_orders_strict("acct", "")
+        self.assertEqual(rows[0].strategy_name, "")
+
+
+class ProbeOrderIdentityTest(unittest.TestCase):
+    """The probe must answer each link of the backfill chain (#156)."""
+
+    def test_probe_reports_redis_and_local_hits(self):
+        gateway = _QueryGateway([])
+        handlers = _handlers(gateway)
+
+        class FakeRedis(object):
+            def get(self, key):
+                return b'{"strategy_name": "TEST"}' if key.endswith(":sig-1") else None
+
+        handlers.order_identity_redis_client = FakeRedis()
+        handlers._remember_order_identity_local("acct", "sig-2", "local_strat")
+
+        out = handlers._handle_probe_order_identity({"remark": "sig-1"})
+        self.assertTrue(out["identity_redis_wired"])
+        self.assertTrue(out["redis_hit"])
+        self.assertFalse(out["local_hit"])
+        self.assertEqual(out["identity_key"],
+                         "bigqmt:order_identity:acct:sig-1")
+
+        out = handlers._handle_probe_order_identity({"remark": "sig-2"})
+        self.assertFalse(out["redis_hit"])
+        self.assertTrue(out["local_hit"])
+        self.assertEqual(out["local_strategy_name"], "local_strat")
+
+    def test_probe_without_redis_says_so(self):
+        handlers = _handlers(_QueryGateway([]))
+        out = handlers._handle_probe_order_identity({"remark": "sig-x"})
+        self.assertFalse(out["identity_redis_wired"])
+        self.assertFalse(out["local_hit"])
+
+
 if __name__ == "__main__":
     unittest.main()
