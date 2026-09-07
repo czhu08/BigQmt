@@ -65,6 +65,17 @@ OFFSET_CLOSE_YESTERDAY = 52
 _BUY_DIRECTIONS = {ENTRUST_BUY, str(ENTRUST_BUY), OFFSET_OPEN, str(OFFSET_OPEN), 23, "23", "BUY", "buy", "B"}
 _SELL_DIRECTIONS = {ENTRUST_SELL, str(ENTRUST_SELL), OFFSET_CLOSE, str(OFFSET_CLOSE), OFFSET_CLOSE_TODAY, str(OFFSET_CLOSE_TODAY), OFFSET_CLOSE_YESTERDAY, str(OFFSET_CLOSE_YESTERDAY), 24, "24", "SELL", "sell", "S"}
 
+# Futures (0-15) / ETF option (50-55) opTypes never appear in _BUY/_SELL_DIRECTIONS
+# (those hold the stock opTypes 23/24 and the direction/offset enums 48/49/51/52).
+# A futures sell-to-open row arrives as direction=49 + offset=48(开仓) + op_type=3(开空):
+# without these sets the arbiter cannot decide and falls back to offset=48, which
+# reads as BUY. Sides mirror adapters.order_bigqmt._FUTURE_BUY_SIDE and friends
+# (kept local here because order_bigqmt imports from this module).
+_FUTURES_OP_BUY = frozenset({0, 4, 5, 8, 9, 12, 13, 14})
+_FUTURES_OP_SELL = frozenset({1, 2, 3, 6, 7, 10, 11, 15})
+_ETF_OPTION_OP_BUY = frozenset({50, 53, 55})
+_ETF_OPTION_OP_SELL = frozenset({51, 52, 54})
+
 
 def order_channel(account_id):
     return ORDER_CHANNEL_TEMPLATE.format(account_id=str(account_id or ""))
@@ -99,6 +110,34 @@ def _attr(obj, names, default=None):
             if value is not None:
                 return value
     return default
+
+
+# 报单来源. passorder's 8th argument (strategyName) comes back on the callback
+# under this name, not m_strStrategyName -- which is why #174 read "the row
+# does not carry the strategy name" off a dump that contained it. #154 measured
+# it on a live terminal: blank on the 13 hand-placed rows, the strategy name on
+# the 3 the bridge sent, while m_strStrategyName was blank on all 16. Last, so
+# a terminal that does populate a real strategy-name field still wins.
+_STRATEGY_NAME_FIELDS = (
+    "strategyName", "m_strStrategyName", "strategy_name", "m_strSource",
+)
+
+
+def _strategy_name_of(obj):
+    """First NON-EMPTY strategy-name candidate, or "".
+
+    Deliberately not _attr: that returns the first non-None, and "" is not
+    None. A terminal carrying m_strStrategyName as an empty string would stop
+    there and never reach m_strSource -- answering "unnamed" while the name is
+    on the object. An empty source is a real answer (a hand-placed order), so
+    it has to fall through rather than short-circuit.
+    """
+    for name in _STRATEGY_NAME_FIELDS:
+        value = _attr(obj, [name], "")
+        text = str(value or "").strip()
+        if text:
+            return text
+    return ""
 
 
 def _with_exchange_suffix(raw_code, obj):
@@ -178,6 +217,14 @@ def _conflict_resolve(d_val, o_val, obj):
       - Futures sell+open: direction=49(sell), offset=48(open), op_type=24(sell) → sell
       - Futures buy+close: direction=48(buy), offset=49(close), op_type=23(buy) → buy
 
+    Some terminals report futures callbacks with the stock opType domain
+    (23/24, as above); others report the futures/ETF-option opType table
+    (futures 0-15, ETF options 50-55), which _BUY/_SELL_DIRECTIONS do not
+    hold. Those opTypes arbitrate through _FUTURES_OP_BUY/_SELL and
+    _ETF_OPTION_OP_BUY/_SELL instead -- without them the arbiter falls back
+    to offset, and offset is open/close on those accounts, so a futures
+    sell-to-open (offset=48) resolved as BUY.
+
     Returns a resolved value, or None if no arbiter can decide.
     """
     op = _attr(obj, ["m_nOpType", "op_type", "order_type"])
@@ -187,6 +234,12 @@ def _conflict_resolve(d_val, o_val, obj):
             if op_int in _BUY_DIRECTIONS:
                 return d_val if _is_buy(d_val) else o_val if _is_buy(o_val) else op
             if op_int in _SELL_DIRECTIONS:
+                return d_val if _is_sell(d_val) else o_val if _is_sell(o_val) else op
+            # Futures (0-15) / ETF option (50-55) opTypes: m_nDirection reliably
+            # reflects the side for futures (48=买, 49=卖), so prefer d_val.
+            if op_int in _FUTURES_OP_BUY or op_int in _ETF_OPTION_OP_BUY:
+                return d_val if _is_buy(d_val) else o_val if _is_buy(o_val) else op
+            if op_int in _FUTURES_OP_SELL or op_int in _ETF_OPTION_OP_SELL:
                 return d_val if _is_sell(d_val) else o_val if _is_sell(o_val) else op
         except (TypeError, ValueError):
             if op in _BUY_DIRECTIONS:
@@ -382,13 +435,21 @@ def normalize_order_event(order, account_id=""):
         "traded_price": _attr(
             order, ["m_dTradedPrice", "traded_price", "avg_traded_price"]
         ),
+        # 成交金额。查询路径 (query_orders) 和推送路径要给出同一个
+        # 字段，否则走回调的调用方拿不到 cost (issue #173)。
+        "trade_amount": _attr(
+            order, ["m_dTradeAmount", "trade_amount"]
+        ),
         "status": _attr(order, ["m_nOrderStatus", "order_status", "status"]),
         "direction": direction,
         "action": _action_from_direction(direction),
         "offset_flag": _attr(order, ["m_nOffsetFlag", "offset_flag"]),
-        "strategy_name": str(_attr(order, ["strategyName", "m_strStrategyName", "strategy_name"], "") or ""),
-        # QMT sometimes puts the name right on the object; usually absent and
-        # the publisher fills it from ContextInfo (issue #161).
+        # 报单来源 (m_strSource) is where passorder's strategyName lands, so an
+        # order this bridge sent names itself here -- no identity store, no
+        # remark matching, and it still works for one submitted before this
+        # process started (issue #174). The publisher enriches from the journal
+        # / redis only when this comes back empty.
+        "strategy_name": _strategy_name_of(order),
         "instrument_name": str(
             _attr(order, ["m_strInstrumentName", "instrument_name"], "") or ""),
         "remark": str(_attr(order, ["m_strRemark", "order_remark", "remark", "user_order_id"], "") or ""),
@@ -438,11 +499,16 @@ def remember_order_identity(redis_client, account_id, user_order_id, strategy_na
 def order_identity_map(redis_client, account_id, user_order_ids, limit=500):
     """user_order_id -> remembered identity, for a whole result set at once.
 
-    QMT does not put the strategy name on the rows get_trade_detail_data
-    returns -- neither ORDER nor DEAL rows have m_strStrategyName (verified by
-    listing every attribute on a live terminal: 120 and 47 of them
-    respectively, and it is in neither). It filters BY strategy internally, but
-    it will not tell you what the name was.
+    Neither ORDER nor DEAL rows have m_strStrategyName (verified by listing
+    every attribute on a live terminal: 120 and 47 of them respectively, and it
+    is in neither).
+
+    That was read as "QMT will not tell you the name", which was wrong -- it
+    tells you under another name, 报单来源 / m_strSource, and
+    _strategy_name_of reads it now (issue #174). This map still earns its keep
+    for the case the row cannot cover: an order placed through some OTHER
+    channel that the bridge nonetheless remembered, and rows from a terminal
+    that blanks the source.
 
     For orders this bridge submitted, it is remembered here at submit time
     (remember_order_identity), keyed by the user_order_id that goes out as the
@@ -509,7 +575,14 @@ def enrich_order_identity(redis_client, account_id, event):
         identity = json.loads(raw.decode("utf-8") if isinstance(raw, (bytes, bytearray)) else str(raw))
     except Exception:
         return event
-    if not event.get("strategy_name") and identity.get("strategy_name"):
+    if identity.get("strategy_name"):
+        # The row's strategy-name field carries the QMT-side strategy's
+        # registered name (the bridge process, e.g. BIGQMT_REDIS_DRYRUN), not
+        # the strategy_name the caller passed at order time (#216: an order
+        # placed with strategy_name='DaBanStrategy' reported back
+        # '大QMT桥接器'). The identity was written at submit time from the
+        # caller's own value, so it wins whenever it has a name. Rows with no
+        # identity record (hand orders, other processes) keep the row's value.
         event["strategy_name"] = str(identity.get("strategy_name") or "")
     if not event.get("stock_code") and identity.get("stock_code"):
         event["stock_code"] = str(identity.get("stock_code") or "")
@@ -551,6 +624,16 @@ def normalize_trade_event(trade, account_id=""):
         # order_sys_id 关联。
         "remark": str(_attr(trade, ["m_strRemark", "order_remark", "remark", "user_order_id"], "") or ""),
         "user_order_id": str(_attr(trade, ["m_strRemark", "user_order_id", "order_remark", "remark"], "") or ""),
+        # 成交事件此前**根本没有这个键** (issue #174) -- 不是空字符串, 是不存在,
+        # 所以客户端 item.get("strategy_name") or "" 只可能答 ""。委托事件一直
+        # 有, 成交没有, 于是 on_stock_trade 拿不到策略名。
+        #
+        # m_strStrategyName 确实两边都没有 (实盘列全部属性: ORDER 120 个、
+        # DEAL 47 个)。但当时据此下的结论 ——「大 QMT 不给策略名」—— 是错的:
+        # 名字在 m_strSource (报单来源) 里, 就是 passorder 的第 8 个参数
+        # strategyName 原样回来。#174 报告人的 dump 里委托和成交都带着它。
+        # 所以桥接器自己下的单在这里就能自报家门, 补全只是兜底。
+        "strategy_name": _strategy_name_of(trade),
         # 官方 Deal 字段 m_strTradeDate+m_strTradeTime -> 真实成交 Unix 秒。
         # 0 = 未携带, 客户端会退回 created_at_ts。
         "traded_time": date_time_seconds(
@@ -603,11 +686,21 @@ def publish_exec_event(sink, account_id, event):
 
 
 def _publish(redis_client, channel, event, maxlen=2000):
+    from .adapters.redis_common import (
+        note_stream_failure, streams_dead, touch_stream_ttl,
+    )
+
     raw = json.dumps(event, ensure_ascii=False, default=str)
-    try:
-        redis_client.xadd(channel, {"payload": raw}, maxlen=maxlen, approximate=True)
-    except Exception:
-        pass
+    if not streams_dead():
+        try:
+            redis_client.xadd(channel, {"payload": raw}, maxlen=maxlen, approximate=True)
+            # maxlen 只挡单键膨胀，挡不住键永远不消失：换个账号、停用一个部署，
+            # 键就一直留着。续期一次，停写的流自然过期（#213）。
+            touch_stream_ttl(redis_client, channel)
+        except Exception as exc:
+            # redis < 5.0 has no streams: log once, then skip xadd for good.
+            # Anything else stays silent and retried, as before (issue #163).
+            note_stream_failure(exc)
     redis_client.publish(channel, raw)
     return event
 

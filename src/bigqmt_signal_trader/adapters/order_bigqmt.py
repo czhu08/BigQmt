@@ -36,6 +36,7 @@ except ImportError:
     # 完整 QMT 的模型运行时会注入 passorder 等 API，但部分券商终端不提供可 import 的 xtquant package。
     _xtconstant = _QmtFallbackXtConstant()
 
+from ..account_type_map import account_type_for
 from ..code_utils import normalize_stock_code
 from ..exec_events import date_time_seconds
 from ..models import CancelResult, OrderSnapshot, OrderSubmitResult, SignalAction, TradeSnapshot
@@ -125,6 +126,34 @@ def _first_nonzero(row, names, default=0.0):
         if number:
             return number
     return default
+
+
+# 报单来源 last -- see exec_events._STRATEGY_NAME_FIELDS for why it belongs
+# here at all. Kept character-for-character the same as that table, so a row
+# and the event for the same order cannot disagree about who placed it; a
+# literal copy rather than an import, because order_bigqmt is on the sandbox's
+# single-file import graph. tests/.../test_order_source_strategy_name.py pins
+# the two together. "strategyName" cannot appear on a native ORDER/DEAL row
+# (and _attr here reads attributes only, never dict keys), so carrying it
+# costs a miss on a name no row has -- cheaper than two tables drifting apart.
+_STRATEGY_NAME_FIELDS = (
+    "strategyName", "m_strStrategyName", "strategy_name", "m_strSource",
+)
+
+
+def _row_strategy_name(row):
+    """First NON-EMPTY strategy-name candidate on a QMT row, or "".
+
+    _attr stops at the first non-None and "" is not None, so m_strStrategyName
+    present-but-blank -- which is what this terminal reports for every row --
+    would shadow m_strSource and answer "unnamed" for an order that names
+    itself.
+    """
+    for name in _STRATEGY_NAME_FIELDS:
+        text = str(_attr(row, (name,), "") or "").strip()
+        if text:
+            return text
+    return ""
 
 
 def _data_attribute_names(row):
@@ -278,7 +307,22 @@ def credit_optype_of(order_type):
         return None
 
 
-def _action_from_offset_flag(offset_flag):
+def _action_from_offset_flag(offset_flag, op_type=None, account_type=None):
+    """BUY/SELL for a normalized query row, from m_nOffsetFlag or m_nOpType.
+
+    For stocks, m_nOffsetFlag IS the side (48=buy, 49=sell). For futures and
+    ETF options, offset means open/close instead (48=open, 49=close): a
+    sell-to-open row carries offset=48 and reads as BUY under the stock
+    mapping, and a buy-to-close row reads as SELL. When the row belongs to a
+    passthrough account (FUTURE / STOCK_OPTION), prefer the side of m_nOpType
+    via passthrough_action_of() (futures 0-15, ETF options 50-55); offset
+    stays as the fallback for rows without a usable opType (e.g. 56/57
+    exercise rows, which have no side at all).
+    """
+    if account_type and str(account_type).upper() in PASSTHROUGH_ACCOUNT_TYPES:
+        action = passthrough_action_of(op_type)
+        if action is not None:
+            return action
     return SignalAction.BUY.value if int(offset_flag or 0) == 48 else SignalAction.SELL.value
 
 
@@ -399,6 +443,16 @@ class BigQmtOrderGateway:
         self.price_type = price_type
         self.quick_trade = quick_trade
 
+    def _resolve_account_type(self, account_id):
+        """Per-request account_type: map lookup if configured, else default.
+
+        When BIGQMT_ACCOUNT_TYPE_MAP is configured (multi-account deployment),
+        the same gateway serves multiple accounts and must use the correct
+        account_type for each request. When no map is configured (the common
+        single-account case), this returns self.account_type unchanged.
+        """
+        return account_type_for(account_id, self.account_type)
+
     def _require_passorder(self):
         if self.passorder is None:
             raise RuntimeError("passorder is not available in Big QMT runtime")
@@ -409,7 +463,7 @@ class BigQmtOrderGateway:
             raise RuntimeError("cancel is not available in Big QMT runtime")
         return self.cancel_func
 
-    def _account_type_code(self):
+    def _account_type_code(self, account_id=None):
         """The account type as MiniQMT reports it: an xtconstant int.
 
         xttype.XtOrder/XtTrade both carry account_type, and real MiniQMT fills
@@ -418,8 +472,15 @@ class BigQmtOrderGateway:
         showed what silence costs: a credit account read as STOCK returns an
         all-zero asset row with no error. So report the configured type and
         fall back to SECURITY_ACCOUNT only when there is nothing to report.
+
+        When account_id is given and BIGQMT_ACCOUNT_TYPE_MAP is configured,
+        the per-request type is used instead of self.account_type (same #92
+        class of bug for multi-account deployments).
         """
-        text = str(self.account_type or "").strip().upper()
+        if account_id is not None and hasattr(self, "_resolve_account_type"):
+            text = str(self._resolve_account_type(account_id) or "").strip().upper()
+        else:
+            text = str(self.account_type or "").strip().upper()
         if text in ACCOUNT_TYPE_CODES:
             return ACCOUNT_TYPE_CODES[text]
         try:
@@ -482,7 +543,7 @@ class BigQmtOrderGateway:
             # them. Letting a futures opType fall through to 23/24 on a STOCK
             # account is the #103 failure mode again: 平今多 (a close) would go
             # out as an ordinary stock buy.
-            account_type = str(self.account_type or "").upper()
+            account_type = str(self._resolve_account_type(request.account_id or self.account_id) or "").upper()
             if account_type not in PASSTHROUGH_ACCOUNT_TYPES:
                 raise ValueError(
                     # ASCII only: this goes to QMT's own log, which drops
@@ -490,7 +551,7 @@ class BigQmtOrderGateway:
                     "order_type %s is a futures/option opType but account_type "
                     "is %r. Set account_type to one of %s, or use 23/24 for "
                     "stock orders." % (
-                        passthrough_optype, self.account_type,
+                        passthrough_optype, account_type,
                         "/".join(sorted(PASSTHROUGH_ACCOUNT_TYPES))))
             op_type = passthrough_optype
         elif action == SignalAction.BUY.value:
@@ -522,9 +583,75 @@ class BigQmtOrderGateway:
             message="passorder submitted",
         )
 
-    def cancel(self, order_ref):
+    def passorder_passthrough(
+        self,
+        op_type,
+        order_type,
+        account_id,
+        order_code,
+        price_type,
+        price,
+        volume,
+        strategy_name,
+        quick_trade,
+        user_order_id,
+        dry_run=False,
+    ):
+        """Call QMT's native passorder with the 11-arg signature untouched.
+
+        The deliberate escape hatch (route 2): the caller controls every
+        argument, including orderType (股/手 vs 金额 vs 比例 vs 组合) and
+        quickTrade, which submit()/order_stock do not expose. NONE of submit()'s
+        safety nets run here -- no opType validation (a credit or futures opType
+        that submit() would guard becomes the caller's responsibility, see
+        #103), no code case-normalization (#95), no settlement read-back. The
+        caller asked for the native API, so they own its contract.
+
+        ContextInfo is supplied here, not by the caller: passorder reads
+        internals off the raw QMT ContextInfo (e.g. .request_id) and it only
+        exists inside QMT, so it can never travel over RPC.
+
+        ``dry_run`` resolves everything and returns the exact 11-tuple that
+        WOULD be sent, without calling passorder. It is how this path is
+        verified against the live terminal without placing an order, and it
+        lets a caller confirm their own argument mapping the same way.
+
+        passorder itself is async and returns None (QMT assigns the 合同编号
+        later, on the order_callback push), so there is no order id to return
+        synchronously -- exactly as with order_stock_async.
+        """
+        passorder = self._require_passorder()
+        args = [
+            int(op_type),
+            int(order_type),
+            str(account_id or self.account_id),
+            str(order_code),                 # RAW: no normalization (#95)
+            int(price_type),
+            float(price),
+            int(volume),
+            str(strategy_name or ""),
+            int(quick_trade),
+            str(user_order_id or ""),
+        ]
+        if dry_run:
+            return {
+                "dry_run": True,
+                "would_call": "passorder",
+                "args": list(args),
+                "context_info_supplied": self.context_info is not None,
+            }
+        passorder(*(args + [self.context_info]))
+        return {
+            "dry_run": False,
+            "submitted": True,
+            "user_order_id": args[9],
+        }
+
+    def cancel(self, order_ref, account_id=None):
         cancel_func = self._require_cancel()
-        ok = cancel_func(order_ref.order_sys_id, self.account_id, self.account_type, self.context_info)
+        aid = account_id or self.account_id
+        account_type = self._resolve_account_type(aid)
+        ok = cancel_func(order_ref.order_sys_id, aid, account_type, self.context_info)
         return CancelResult(success=bool(ok), message="" if ok else "cancel returned false")
 
     def query_orders(self, account_id, strategy_name):
@@ -535,9 +662,10 @@ class BigQmtOrderGateway:
 
     def query_orders_strict(self, account_id, strategy_name):
         query = self._require_query_func()
-        rows = query(account_id, self.account_type, "ORDER", strategy_name) or []
+        account_type = self._resolve_account_type(account_id)
+        rows = query(account_id, account_type, "ORDER", strategy_name) or []
         result = []
-        account_type_code = self._account_type_code()
+        account_type_code = self._account_type_code(account_id)
         name_cache = {}
         for row in rows:
             try:
@@ -553,18 +681,48 @@ class BigQmtOrderGateway:
                     order_sys_id=str(_attr(row, ("m_strOrderSysID", "order_sys_id"), "") or ""),
                     user_order_id=str(_attr(row, ("m_strRemark", "user_order_id", "remark"), "") or ""),
                     stock_code=stock_code,
-                    action=_action_from_offset_flag(_attr(row, ("m_nOffsetFlag", "offset_flag"), 0)),
+                    action=_action_from_offset_flag(
+                        _attr(row, ("m_nOffsetFlag", "offset_flag"), 0),
+                        _attr(row, ("m_nOpType", "op_type"), None),
+                        self._resolve_account_type(account_id),
+                    ),
                     volume=int(_attr(row, ("m_nVolumeTotalOriginal", "volume"), 0) or 0),
                     traded_volume=int(_attr(row, ("m_nVolumeTraded", "traded_volume"), 0) or 0),
                     status=str(_attr(row, ("m_nOrderStatus", "status"), "") or ""),
+                    # The trade builder has this fallback and orders did not:
+                    # a query filtered by strategy_name returned rows that all
+                    # passed the filter yet reported strategy_name="" (issue
+                    # #156 follow-up). When a filter is given, every row
+                    # belongs to it by construction.
+                    #
+                    # The row's own 报单来源 now counts as "the row said so"
+                    # (issue #174), so an unfiltered query names bridge-placed
+                    # orders instead of leaning on the identity store.
+                    strategy_name=_row_strategy_name(row) or strategy_name or "",
                     price=float(_attr(row, ("m_dLimitPrice", "m_dPrice", "price"), 0.0) or 0.0),
-                    strategy_name=str(_attr(row, ("m_strOptName", "strategy_name"), "") or ""),
                     remark=str(_attr(row, ("m_strRemark", "remark"), "") or ""),
                     order_time=_order_time_seconds(row),
                     status_msg=_status_message(row),
                     price_type=_attr(row, ("m_nOrderPriceType", "price_type")),
                     traded_price=float(
                         _attr(row, ("m_dTradedPrice", "traded_price", "avg_traded_price"), 0.0) or 0.0
+                    ),
+                    # 柜台自己给的成交金额 (issue #173). ccxt 的 order["cost"]
+                    # 要的就是它。以前只有 DEAL 行透出 amount, 所以拿委托的
+                    # cost 得按 order_sysid 聚合成交 (多一次 RPC), 或者自己
+                    # 拿 traded_price * traded_volume 去算。
+                    #
+                    # 实盘验过 (0.3.19, 当日 14 笔委托): trade_amount 与按
+                    # order_sysid 聚合的 DEAL 金额 14/14 逐笔相等。
+                    #
+                    # 注意 issue 里"分笔成交时成交均价舍入会差几分"这条,
+                    # 在这台终端上**没有复现**: m_dTradedPrice 不是两位小数,
+                    # 它带完整精度 (唯一一笔分价成交 55.14/55.13 报的是
+                    # 55.13666666666666), 所以估算值当天一分不差。取这个
+                    # 字段的理由是它是柜台的原值 -- 不依赖某台终端的
+                    # m_dTradedPrice 精度, 也不用多发一次 RPC。
+                    trade_amount=float(
+                        _attr(row, ("m_dTradeAmount", "trade_amount", "amount"), 0.0) or 0.0
                     ),
                     # MiniQMT XtOrder carries these and this bridge never sent
                     # them, so every client saw AttributeError (issue #133).
@@ -591,14 +749,15 @@ class BigQmtOrderGateway:
 
     def query_trades_strict(self, account_id, strategy_name):
         query = self._require_query_func()
+        account_type = self._resolve_account_type(account_id)
         rows = []
         last_error = None
         for detail_type in ("DEAL", "TRADE"):
             try:
                 if str(strategy_name or "").strip():
-                    rows = query(account_id, self.account_type, detail_type, strategy_name) or []
+                    rows = query(account_id, account_type, detail_type, strategy_name) or []
                 else:
-                    rows = query(account_id, self.account_type, detail_type) or []
+                    rows = query(account_id, account_type, detail_type) or []
                 if rows:
                     break
             except Exception as exc:
@@ -606,7 +765,7 @@ class BigQmtOrderGateway:
         if not rows and last_error is not None:
             raise last_error
         result = []
-        account_type_code = self._account_type_code()
+        account_type_code = self._account_type_code(account_id)
         name_cache = {}
         for row in rows:
             traded_at_raw = _attr(row, ("m_strTradeTime", "trade_time", "traded_at"), "")
@@ -623,7 +782,11 @@ class BigQmtOrderGateway:
                     trade_id=str(_attr(row, ("m_strTradeID", "trade_id"), "") or ""),
                     order_sys_id=str(_attr(row, ("m_strOrderSysID", "order_sys_id"), "") or ""),
                     stock_code=stock_code,
-                    action=_action_from_offset_flag(_attr(row, ("m_nOffsetFlag", "offset_flag"), 0)),
+                    action=_action_from_offset_flag(
+                        _attr(row, ("m_nOffsetFlag", "offset_flag"), 0),
+                        _attr(row, ("m_nOpType", "op_type"), None),
+                        self._resolve_account_type(account_id),
+                    ),
                     volume=int(_attr(row, ("m_nVolume", "volume"), 0) or 0),
                     price=float(_attr(row, ("m_dPrice", "m_dTradePrice", "price"), 0.0) or 0.0),
                     commission=float(_attr(row, ["m_dCommission", "m_dComission", "commission"])),
@@ -632,18 +795,18 @@ class BigQmtOrderGateway:
                     # 官方 Deal 字段: m_dTradeAmount 成交额; m_strTradeDate+
                     # m_strTradeTime 合成 Unix 秒; 策略名来自查询过滤参数。
                     amount=float(_attr(row, ("m_dTradeAmount", "amount"), 0.0) or 0.0),
-                    # The row's own strategy name first -- though on this
-                    # terminal there is none: neither ORDER nor DEAL rows carry
-                    # m_strStrategyName. QMT filters by strategy without ever
-                    # reporting it, which is why the field read "" for
-                    # everything (issue #133). The filter is the fallback: when
-                    # one IS given every row belongs to it by construction. For
-                    # orders this bridge submitted, the RPC layer puts the real
-                    # name back from the identity store.
-                    strategy_name=str(
-                        _attr(row, ("m_strStrategyName", "strategy_name"), "")
-                        or strategy_name or ""
-                    ),
+                    # The row's own strategy name first. m_strStrategyName is
+                    # genuinely absent here -- but the name is not: it comes
+                    # back in 报单来源 (m_strSource), which is passorder's
+                    # strategyName argument (issue #174, and #154 measured it).
+                    # Reading only m_strStrategyName is why this field answered
+                    # "" for everything (issue #133).
+                    #
+                    # The filter is the fallback: when one IS given every row
+                    # belongs to it by construction. For orders this bridge
+                    # submitted with no filter, the RPC layer still backstops
+                    # from the identity store.
+                    strategy_name=_row_strategy_name(row) or strategy_name or "",
                     traded_time=date_time_seconds(
                         _attr(row, ("m_strTradeDate", "trade_date", "m_strDealDate")),
                         traded_at_raw,
@@ -719,7 +882,7 @@ class BigQmtOrderGateway:
         for detail_type in (detail_types or ("ORDER", "DEAL")):
             entry = {"rows": 0, "attributes": [], "error": ""}
             try:
-                rows = query(account_id, self.account_type, str(detail_type)) or []
+                rows = query(account_id, self._resolve_account_type(account_id), str(detail_type)) or []
                 entry["rows"] = len(rows)
                 if rows:
                     entry["attributes"] = _data_attribute_names(rows[0])

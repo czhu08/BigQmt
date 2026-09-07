@@ -785,20 +785,33 @@ class ExecEventsClientDispatchTest(unittest.TestCase):
         self.assertEqual(err.stock_code, "600654.SH")
 
     def test_async_orders_keep_submission_order(self):
-        """One worker, so responses arrive in the order the calls were made."""
+        """One worker, so responses arrive in the order the calls were made --
+        whether the backlog went out as single submits or one batch (#181)."""
         trader, cb = self._trader()
         original = trader.order_stock_result
+        original_batch = trader.order_stock_batch
 
         def fake(*args, **kwargs):
             return {"order_sys_id": "sys-%s" % args[1]}
 
+        def fake_batch(account, orders, batch_id="", idempotent=True):
+            # Same per-item answer as fake, via the batch seam the worker
+            # picks for a backlog of >=2.
+            return [{
+                "index": index, "success": True,
+                "order_sys_id": "sys-%s" % item.get("stock_code"),
+                "user_order_id": "", "code": 0, "error": "",
+            } for index, item in enumerate(orders)]
+
         trader.order_stock_result = fake
+        trader.order_stock_batch = fake_batch
         try:
             for code in ("A.SH", "B.SH", "C.SH"):
                 trader.order_stock_async("acct", code, 23, 100, 11, 10.0, "s", "r")
             self.assertTrue(trader.wait_async_orders(timeout=5.0))
         finally:
             trader.order_stock_result = original
+            trader.order_stock_batch = original_batch
 
         self.assertEqual([str(r.order_id) for r in cb.async_responses],
                          ["sys-A.SH", "sys-B.SH", "sys-C.SH"])
@@ -807,18 +820,16 @@ class ExecEventsClientDispatchTest(unittest.TestCase):
 
     def test_cancel_order_stock_async_fires_response(self):
         trader, cb = self._trader()
-        original = trader.cancel_order_stock_sysid
+        trader.client.account_id = "acct"
 
-        def fake_cancel(account, market, sysid):
-            return 0        # MiniQMT: 0 == success (issue #113)
+        def fake_call(method, params=None, account_id=None, timeout_seconds=None):
+            return {"success": True}
 
-        trader.cancel_order_stock_sysid = fake_cancel
-        try:
-            seq = trader.cancel_order_stock_sysid_async("acct", "SH", "sys-1")
-        finally:
-            trader.cancel_order_stock_sysid = original
+        trader.client.call = fake_call
+        seq = trader.cancel_order_stock_sysid_async("acct", "SH", "sys-1")
 
         self.assertGreater(seq, 0)
+        self.assertTrue(trader.wait_async_orders(timeout=5.0))
         self.assertEqual(len(cb.cancel_async_responses), 1)
         resp = cb.cancel_async_responses[0]
         self.assertTrue(resp.success)
