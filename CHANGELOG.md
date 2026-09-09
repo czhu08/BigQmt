@@ -3,6 +3,152 @@
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/) 和 [语义化版本](https://semver.org/)。
 
 
+## [0.3.31] - 2026-09-09
+
+行情推送的自愈。由 @shengyy 报告并提交修复（#256 / #257），本仓收尾（#258）。
+
+### 修复
+
+- **Redis 行情接收器出错后永久停掉，而外部看着一切健康**（#256）。pubsub 连接
+  抛异常时 `_sub_loop` 直接返回，线程结束，**从不重连**；与此同时
+  `WholeQuoteClientSession` 的 keepalive 和补订阅还在成功、`_subscriber_active`
+  仍报 `True`。也就是说行情静默停止，而所有健康指标都是绿的 —— 和 #240（zmq
+  ROUTER 线程静默死掉）是同一个形状，也是这个仓库反复吃亏的那种：失败看起来
+  像没发生。维护者在 main 上跑报告人的复现脚本 10/10 复现，修复后 0/10。
+
+  接收器现在自己负责重连：关掉失败的 pubsub、可中断地等待、用同一组频道重建
+  订阅。每个接收器捕获**自己的** stop 事件，所以停机或换 topic 都不会复活一个
+  已被阻塞的旧接收器；`stop()` 也不再自 join（从回调里调用会死锁）。
+
+- **部分补订阅会让某个订阅永远静默**（#231 残留）。A 恢复推送会清掉全局的
+  「静默」条件，于是 B 的未完成补订阅再也不会重试。现在整批补订阅**全部尝试完**
+  才报第一个错误，未完成的批次由 `_replay_pending` 记住并逐轮重试，直到每个
+  订阅都成功；中间某个持续失败也不会饿死后面的。
+
+- **重连每秒重试，日志也每秒一行**（#258）。实测 Redis 持续不可用是 60 行/分钟、
+  3600 行/小时。本仓为日志量吃过亏（#139 同一行写 16 次；#144 轮转永远失败导致
+  日志无上限增长），#240 给 zmq 的重建加过退避，这里漏了。**重连速度不变**
+  （1 秒，行情要尽快回来），退避的是**报告**：第 1、2、4、8… 次各报一次，之后
+  最多每分钟一次，并带上尝试次数。改后 10 秒内 ≤5 行。
+
+### 测试
+
+- 修掉 `test_zmq_router_self_heal` 的偶发：两条退避用例替换的是**全局**
+  `time.sleep`，套件里任何并发线程在那个窗口调一次就会污染断言，加新文件后
+  全量偶发红过一次。改成只记录本线程的 sleep。门禁里的偶发红比没有断言更糟。
+
+### 升级
+
+改动全部在**客户端**（行情订阅侧）。服务端无需重新部署。
+
+```
+pip install -U xtquant-big-convert==0.3.31
+```
+
+## [0.3.30] - 2026-09-09
+
+### 修复
+
+- **`rpc_listener_methods` 写成别名时，账户/持仓查询仍被派发到后台线程**（#252，
+  由 @shengyy 带隔离复现报告）。`_expand_listener_methods` 把调用方写的原始别名
+  和它的 canonical 名一起放进结果，再减掉 `LISTENER_DEFERRED_METHODS` —— 减的是
+  canonical 名，于是 `get_positions` 被拿掉、`query_stock_positions` 原地留下；
+  `_should_process_in_listener` 又是先按原始方法名直接匹配，别名一命中就 inline。
+  `rpc_background_threads=True` 时这条路把 `get_trade_detail_data` 带离主策略线程，
+  它返回的不是异常而是**行数对、字段全 None** 的空壳，客户端读成「这账户没钱」。
+  `("get_positions",)` 和 `("*",)` 两种写法一直是对的（`READ_METHODS` 里只有
+  canonical 名），所以现象看起来像「配置写法不同结果不同」。
+
+  现在减法按 canonical 名做，另外在 `_should_process_in_listener` 里加了第二道闸：
+  展开是构造期的一次性动作，派发是每个请求都走的路径，把不变量钉在派发处，
+  任何没想到的拼法都绕不过去。#244/#248 修的是同一处的显式点名分支，这次是它
+  的别名残留。
+
+- **批量订阅几千只股票会把 QMT 卡死**（#247，由 @shihaibi 报告并提交修复）。
+  `subscribe_whole_quote` 的首帧 prime 用 `get_full_tick(code_list)`，而它在 QMT
+  的 adjust 线程上逐只处理，耗时随列表增长：实测中位 100 只 ~170ms、200 只
+  ~500ms、500 只 ~2.5s、1000 只 ~9.5s，3000 只直接 `TimeoutError` —— 这段时间
+  adjust 线程被占住，drain 停摆，后续所有 RPC 排在后面一起超时。交易所整体
+  token 是稳定的 ~330ms，与列表规模无关，所以超过阈值改走 token 再按原列表过滤。
+  实测 3000 只从超时变成 341ms 拿全 3000 条。
+
+  收尾两处（本仓跟进）：**期货不再静默丢失首帧** —— 实测 `SF`/`DF`/`ZF`/`IF`/
+  `INE`/`GF` 这些期货 token 的整体查询**全部返回 0 条**（只有 `SH`/`SZ`/`BJ` 有
+  数），原实现把后缀一律当 token 用，于是期货列表 prime 出空结果、回调根本不
+  触发，订阅看着是活的而首帧没了（#95 的形状）。现在按交易所是否支持整体快照
+  拆分，不支持的那部分走直连；代码仍**原样**传给 QMT，只有后缀和比较用的副本
+  转大写（大 QMT 有 `cu2610.SF`、没有 `CU2610.SF`，#58/#95）。
+
+  以及 **`subscribe()` 里的 `time.sleep(1)` 换成有界的就绪等待**。竞态是真的：
+  `_start_event_listener` 起 daemon 线程就返回，`pubsub.subscribe()` 之前发布的
+  事件会丢，紧接着下单的调用方可能收不到自己的成交回调。现在监听器真正订阅上
+  之后置位，`subscribe()` 等这个信号、上界仍是 1s（最坏不比原来差），实测正常
+  情况从固定 1000ms 变成 0.0ms。`BIGQMT_EVENT_READY_TIMEOUT=0` 可关闭。
+
+
+## [0.3.29] - 2026-09-08
+
+三个由 @shengyy 报告的问题，都带隔离复现，逐条核实后修复。
+
+### 修复
+
+- **下单请求可能被重复派发**（#245）。客户端的 redis-py 连接默认带透明重试，
+  而 `Redis._execute_command` 里 `conn.retry.call_with_retry(...)` 包的是
+  **send + parse** —— 服务端已经接受的 RPUSH，若应答阶段出错会重发整条命令。
+  RPUSH 不幂等，于是一次 `call('passorder', ...)` 可能派发两次原生下单。
+  暴露面比报告更大：`order_stock` / `order_stock_async` 都别名到
+  `submit_order`，而 `_handle_submit_order` 没有去重（幂等日志只在
+  `submit_orders_batch` 里），主流下单口全都没有保护。
+
+  服务端按 `(account_id, request_id)` 对 `ORDER_METHODS` 记账：重复到达不再
+  派发，改为重发第一份的答案 —— 重试用的是同一个 request_id、同一个应答键，
+  所以答案正好落在客户端等待的位置，客户端拿到成功而不是错误。表按 512 条 /
+  600s 双重封顶。只读方法不去重（重发只读无害，去重反而会返回陈旧数据）。
+  未改客户端重试行为。
+
+- **账户查询失败会伪装成成功**（#243）。`query_stock_positions` /
+  `query_stock_asset` / `query_stock_position` 在 RPC 抛异常后会去读
+  `bigqmt:positions:<account>`，只要非空就当查询结果返回 —— #229/#230 让原生
+  查询异常上抛，在 redis 客户端这条路上又被吞回去，**同一个输入 zmq 抛错、
+  redis 返回旧持仓**。缓存也不校 `updated_at`。
+
+  新增 `account_cache_fallback`，**默认 False**：失败就是失败，和 zmq/pipe
+  一致。打开后仍要求快照带 `updated_at` 且在
+  `account_cache_max_age_seconds`（默认 30s）以内，日期认不出来当「不知道
+  多旧」拒绝采信；真的用缓存作答时打 WARNING。判定不再借用
+  `local_cache_enabled` —— 那个键是**客户端行情缓存**的开关，两回事。
+
+- **`rpc_background_threads` 的建议是反的，且没有配置能保证安全**（#244）。
+  `qmt-trader/SKILL.md` 教人切 zmq 时改 `True`，而实测 zmq+后台线程 592.9ms、
+  zmq+drain 15.8ms —— 照着装慢 37 倍；延迟数字还停在被推翻的
+  「redis ~13ms / zmq ~0.7ms」。
+
+  根因是 `_expand_listener_methods` 只在 `"*"` 分支里减掉
+  `LISTENER_DEFERRED_METHODS`，**显式点名的方法绕过减法**，所以
+  `rpc_listener_methods=("get_asset",)` 会把 trade-context 方法放回收包线程
+  （离开主线程后它返回行数对、字段全 None 的对象，客户端读成「这账户没钱」）。
+  安全性依赖两个不相干的配置键碰巧一致，这才是那条「一刀切 False」的由来。
+
+  减法改为作用于整个展开结果，任何配置都无法把 trade-context 方法排到后台
+  线程；`"*"` 的展开结果一字未变，现有配置零影响。此后开关纯按延迟选：
+  `init_config` 新增 `_background_threads_for(transport)`，向导按所选传输生成
+  （redis `True` / 其余 `False`）。示例配置、README、SKILL.md 同步到实测口径。
+
+### 文档
+
+- `docs/LATENCY_REPORT.md` 用 0.3.28 实测数据重写，并纠正三处沿用旧反表的
+  说法（zmq 尖峰不是 GIL 固有代价，换 drain 就从 592.9ms 到 15.8ms）。
+- README 第 65 行原写 `rpc_background_threads` 「恒为 False……不是可选项」，
+  与同文件的实测结论直接打架，一并修掉。
+
+### 升级说明
+
+**这是行为变更**：升级后原本被静默掩盖的账户查询故障会开始抛错。这正是意图，
+需要旧行为的显式设 `account_cache_fallback=True`。
+
+修复分布在服务端（#245、#244）和客户端（#243），**两侧都要升**。服务端升级后
+需 `sync_deployment()` + `reload_deployment()`。
+
 ## [0.3.28] - 2026-09-08
 
 ### 文档
