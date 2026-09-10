@@ -766,8 +766,14 @@ class BigQmtRpcHandlers:
     # 官方文档把 create_sector(parent_node, sector_name, overwrite) 记为 QMT
     # 全局函数，本仓库却按 ContextInfo.create_sector(sectorname, stocklist) 调。
     # 只探测存在性，不调用：create_sector 是写操作。
+    #
+    # get_market_data_ex_ori 是 #237 补进来的：适配层「有原始接口就只走它」，
+    # 所以两台终端跑的可能是两条完全不同的代码路径 —— 而名单里没有这个名字时，
+    # probe 永远不报它，报告人和维护者都拿它当「两边一样」的证据，白白多走了两
+    # 轮。名单本身就是判据，缺一个名字等于把这条差异藏起来。
     _PROBE_CONTEXT_METHODS = (
-        "get_full_tick", "get_market_data_ex", "get_market_data", "get_local_data",
+        "get_full_tick", "get_market_data_ex", "get_market_data_ex_ori",
+        "get_market_data", "get_local_data",
         "subscribe_quote", "subscribe_whole_quote", "unsubscribe_quote",
         "get_trading_dates", "get_financial_data", "get_stock_list_in_sector",
         "do_back_test", "get_trade_detail_data",
@@ -2307,6 +2313,19 @@ class BigQmtRpcHandlers:
     # 旧名保留：外部调用方和既有测试还在用
     _credit_order_type_from_params = _forwarded_order_type
 
+    def _resolve_strategy_name(self, *candidates):
+        """First supplied candidate wins; "" is a real answer, not "unset".
+
+        ``or`` chains used to swallow an explicit empty string back into
+        ``default_strategy_name``. Blank is exactly how a caller asks for an
+        empty 报单来源 column, the way a hand-placed order looks (#154), so
+        only a missing value (``None``) may fall through to the default.
+        """
+        for candidate in candidates:
+            if candidate is not None:
+                return str(candidate)
+        return str(self.default_strategy_name)
+
     def _handle_submit_order(self, params):
         if self.order_gateway is None:
             raise RuntimeError("order_gateway is not configured")
@@ -2323,8 +2342,8 @@ class BigQmtRpcHandlers:
             volume=int(params.get("volume") or params.get("order_volume") or 0),
             price=float(price if price not in (None, "") else 0),
             price_type=params.get("price_type") or "LIMIT",
-            strategy_name=str(params.get("strategy_name")
-                              or self.default_strategy_name),
+            strategy_name=self._resolve_strategy_name(
+                params.get("strategy_name")),
             remark=order_tag,
             order_type=self._forwarded_order_type(params),
         )
@@ -2502,10 +2521,9 @@ class BigQmtRpcHandlers:
         batch_started = time.time()
         batch_id = str(params.get("batch_id") or uuid.uuid4().hex)
         account_id = self._request_account_id(params)
-        strategy_name = str(
-            params.get("strategy_name")
-            or (orders[0] or {}).get("strategy_name")
-            or self.default_strategy_name
+        strategy_name = self._resolve_strategy_name(
+            params.get("strategy_name"),
+            (orders[0] or {}).get("strategy_name"),
         )
         # order_stock_async routes a queued backlog through here (#181), but it
         # never promised order_stock_batch's idempotency contract, and
