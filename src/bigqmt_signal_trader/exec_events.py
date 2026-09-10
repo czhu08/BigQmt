@@ -17,9 +17,6 @@ The normalized field names match ``BigQmtXtTrader._order_from_dict`` /
 import json
 import time
 
-from .adapters.order_bigqmt import _action_from_offset_flag
-from .adapters.position_bigqmt import _full_code
-
 ORDER_CHANNEL_TEMPLATE = "bigqmt:order_events:{account_id}"
 TRADE_CHANNEL_TEMPLATE = "bigqmt:trade_events:{account_id}"
 ORDER_ERROR_CHANNEL_TEMPLATE = "bigqmt:order_error_events:{account_id}"
