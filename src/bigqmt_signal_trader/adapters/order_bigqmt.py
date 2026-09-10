@@ -755,7 +755,6 @@ class BigQmtOrderGateway:
                     ),
                     volume=int(_attr(row, ("m_nVolume", "volume"), 0) or 0),
                     price=float(_attr(row, ("m_dPrice", "m_dTradePrice", "price"), 0.0) or 0.0),
-                    commission=float(_attr(row, ["m_dCommission", "m_dComission", "commission"])),
                     traded_at=str(traded_at_raw or ""),
                     user_order_id=str(_attr(row, ("m_strRemark", "user_order_id", "remark"), "") or ""),
                     # 官方 Deal 字段: m_dTradeAmount 成交额; m_strTradeDate+
