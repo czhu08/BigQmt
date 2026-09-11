@@ -572,6 +572,75 @@ def _restore_jsonable(value):
     return value
 
 
+_KNOWN_BAR_FIELDS = {
+    "time", "open", "high", "low", "close", "volume", "amount",
+    "settle", "openInterest", "preClose", "suspendFlag",
+}
+
+
+def _to_documented_market_data_shape(data, field_list, stock_list, period):
+    """MiniQMT's documented get_market_data contract for bar periods:
+    ``dict[field] -> pd.DataFrame(index=stock_list, columns=time_list)``.
+
+    Big QMT hands back a bare long DataFrame for one stock and
+    ``dict[stock] -> long DataFrame`` for many -- both off-contract (the
+    reporter's printout, 2026-09-10). Pivot here, client-side: the server
+    keeps the long shape, so raw-RPC callers and the all-zero heal path are
+    untouched, and no QMT-side deploy is needed.
+
+    Already-documented answers (keys are field names) and anything not a
+    per-stock long frame (tick period, empty, scalars) pass through.
+    """
+    if str(period or "").lower() == "tick":
+        return data
+    try:
+        import pandas as pd
+    except Exception:
+        return data
+
+    if hasattr(data, "columns"):
+        # Bare frame: one stock, no dict wrapper.
+        code = str((_as_list(stock_list) or [""])[0])
+        per_stock = {code: data}
+    elif isinstance(data, dict) and data:
+        keys = [str(k) for k in data.keys()]
+        if all(k in _KNOWN_BAR_FIELDS for k in keys):
+            return data  # already the documented {field: wide frame}
+        per_stock = data
+    else:
+        return data
+
+    fields = [str(f) for f in (field_list or []) if str(f) != "time"]
+    wide = {}
+    for code, frame in per_stock.items():
+        # pandas Index raises on truthiness -- no `or []` here.
+        _cols = getattr(frame, "columns", None)
+        columns = list(_cols) if _cols is not None else []
+        if not columns:
+            continue
+        # RPC path long frames carry 'index'; FormulaServer-built frames carry
+        # 'stime'. Both are the time axis.
+        time_col = next(
+            (c for c in ("time", "index", "stime") if c in columns), None)
+        if time_col is None:
+            return data  # not a long bar frame -- pass through untouched
+        wanted = fields or [c for c in columns if c != time_col]
+        for field in wanted:
+            if field not in columns:
+                continue
+            wide.setdefault(field, {})[code] = frame.set_index(time_col)[field]
+    if not wide:
+        return data
+    out = {field: pd.DataFrame(series).T for field, series in wide.items()}
+    # MiniQMT's time_list is STRINGS ('20260901', dtype='str' -- verified by
+    # printing data['open'].columns on a live miniQMT, not by the bare
+    # printout, which shows no quotes either way). Normalize every label to
+    # str so the frame matches miniQMT's dtype.
+    for frame in out.values():
+        frame.columns = [str(c) for c in frame.columns]
+    return out
+
+
 def _digits_only(value):
     return "".join(ch for ch in str(value or "") if ch.isdigit())
 
@@ -1125,7 +1194,7 @@ class BigQmtRpcClient:
         # 其他方法是静态参考数据，不受时间序列滞后影响，照常走快速路径。
         skip_formula = (
             router is not None
-            and method == "get_market_data_ex"
+            and method in ("get_market_data_ex", "get_market_data")
             and _formula_stale_active()
         )
         if router is not None and router.supports(method) and not skip_formula:
@@ -1133,7 +1202,7 @@ class BigQmtRpcClient:
 
             try:
                 result = _restore_jsonable(router.call(method, params or {}))
-                if method == "get_market_data_ex":
+                if method in ("get_market_data_ex", "get_market_data"):
                     # 直连快照可能滞后（实测冻结数小时）——滞后即告警、
                     # 本次调用自动回落 RPC 桥拿实时数据，并进入冷却期
                     # 让后续调用直接跳过直连（到期重新探测，自愈）。
@@ -1938,7 +2007,11 @@ class BigQmtXtData:
         )
         data = self._call("get_market_data", **params)
         # Self-heal adjusted reads (all-zero bars -> server raw download + retry).
-        return self._heal_adjusted("get_market_data", params, data)
+        data = self._heal_adjusted("get_market_data", params, data)
+        # The documented MiniQMT shape is dict[field] -> DataFrame indexed by
+        # stock with time columns; Big QMT sends long frames. Convert after
+        # the heal so the heal sees the shape it knows.
+        return _to_documented_market_data_shape(data, field_list, stock_list, period)
 
     def _get_market_data_ex_batch(self, params, timeout_seconds=None, use_formula=True):
         """One RPC's worth of bars, healed and normalized. No caching."""
