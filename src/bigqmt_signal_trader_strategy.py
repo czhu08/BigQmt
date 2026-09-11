@@ -998,10 +998,10 @@ def _record_adjust_source(source):
         stats["window_start"] = now
     stats[source] = stats.get(source, 0) + 1
     if now - stats["window_start"] >= 10.0:
-        print(
-            "[adjust_source] handlebar=%d timer=%d over %.0fs"
-            % (stats["handlebar"], stats["timer"], now - stats["window_start"])
-        )
+        # print(
+        #     "[adjust_source] handlebar=%d timer=%d over %.0fs"
+        #     % (stats["handlebar"], stats["timer"], now - stats["window_start"])
+        # )
         stats.update({"handlebar": 0, "timer": 0, "window_start": now})
 
 
@@ -1048,14 +1048,14 @@ def _record_adjust_tick():
     stats["min"] = delta if stats["min"] <= 0 else min(stats["min"], delta)
     stats["max"] = max(stats["max"], delta)
     if now - stats["window_start"] >= 10.0 and stats["count"] > 0:
-        avg = stats["sum"] / stats["count"]
-        print(
-            "[bigqmt_signal_trader] adjust cadence: ticks=%d avg=%.3fs min=%.3fs max=%.3fs over %.0fs"
-            % (stats["count"], avg, stats["min"], stats["max"], now - stats["window_start"])
-        )
-        if sum(_tick_app_hist) > 0:
-            print("[tick_app_hist] %s max=%.0fms"
-                  % (_format_tick_app_hist(), _tick_app_max_ms[0]))
+        # avg = stats["sum"] / stats["count"]
+        # print(
+        #     "[bigqmt_signal_trader] adjust cadence: ticks=%d avg=%.3fs min=%.3fs max=%.3fs over %.0fs"
+        #     % (stats["count"], avg, stats["min"], stats["max"], now - stats["window_start"])
+        # )
+        # if sum(_tick_app_hist) > 0:
+        #     print("[tick_app_hist] %s max=%.0fms"
+        #           % (_format_tick_app_hist(), _tick_app_max_ms[0]))
         stats.update({"count": 0, "sum": 0.0, "min": 0.0, "max": 0.0, "window_start": now})
 
 
