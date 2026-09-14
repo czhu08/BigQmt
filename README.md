@@ -38,37 +38,41 @@
 
 ### 配置向导：`bigqmt-init`
 
-不想手动抄两份 `.example.py`、也不想搞清楚三十来个键里哪些真的要改，直接跑：
+部署流程见 [docs/DEPLOY_QUICKSTART.md](docs/DEPLOY_QUICKSTART.md)，向导是它的**第 2 步**：替代手抄两份 `.example.py`。在能写到 QMT 的 python 目录的机器上跑：
 
 ```bash
 bigqmt-init
 ```
 
-或者从源码检出运行：
+`bigqmt-init` 找不到、或者用的是源码检出，等价写法：
 
 ```bash
 python -m bigqmt_signal_trader.init_config
 ```
 
-问几个问题——资金账号、账号类型、传输方式（redis / zmq）、地址端口、Redis 用户名密码、是否允许远程下单、部署方式——然后把配置写出来：
+只能在终端里交互着答，不能用管道喂——密码那一问走 `getpass` 读终端。
 
-| 文件 | 位置 | 作用 |
+问资金账号、账号类型、传输方式（redis / zmq）、地址端口、Redis 用户名密码、是否允许远程下单、部署方式、两个目录，然后把服务端和客户端两份配置由**同一组答案**写出来，连接参数不会对不上：
+
+| 文件 | 写到哪 | 谁用 |
 |---|---|---|
-| `bigqmt_signal_trader_local_config.py` | QMT 的 python 目录 | 服务端（QMT 内） |
-| `bigqmt_signal_trader_client_config.py` | 你指定的目录 | 客户端（外部程序） |
-| `BIGQMT_*_ALL_IN_ONE.py` | QMT 的 python 目录 | 选了单文件部署时，配置已烘焙进去 |
+| `bigqmt_signal_trader_local_config.py` | QMT 的 python 目录 | 服务端 |
+| `bigqmt_signal_trader_client_config.py` | 你指定的目录 | 客户端 |
+| `BIGQMT_*_ALL_IN_ONE.py` | QMT 的 python 目录 | 只有选了单文件部署才生成，配置已烘焙进去 |
 
-服务端和客户端两份配置由同一组答案生成，**连接参数不会对不上**。
+**它不做的事，也是最容易误解的地方：** 默认的 `package` 部署方式下它**只写配置，不拷包**。跑完打印的「把 src/ 下的包同步到 QMT 的 python 目录」是对源码检出说的；pip 装的没有 `src/`，按快速开始第 3 步找到包的位置再拷 4 项。单文件模式则已经生成到位。
 
-几个不问、直接定死的选项：
+**最容易答错的一问：**「QMT 的 python 目录（回车则写到当前目录）」。这里填 QMT 安装目录下的 `python`，直接回车会写到你当前所在的目录，服务端启动时找不到配置。
 
-- **`rpc_background_threads` 按传输选**（redis `True`、zmq/pipe `False`）—— 选反了差 4~37 倍，向导按你选的传输定，不问
-- **`rpc_allow_order_methods` 默认 `False`** —— 打开前会明确提示：任何能连上这条通道的程序都可以下单
+几个不问、直接定死的：
+
+- **`rpc_background_threads` 按传输选**（redis `True`、zmq/pipe `False`）——选反了差 4~37 倍
+- **`rpc_allow_order_methods` 默认 `False`**——打开前会明确提示：任何能连上这条通道的程序都可以下单
 - 选了**无 redis 单文件**会自动把传输改成 zmq，不会留下一份声称用 redis 的配置
 
 已存在的文件会先问再覆盖（`--force` 跳过询问）。
 
-> **密码分两类。** Redis 密码是服务凭据，写进配置文件（`.example.py` 本来就是这么记的），输入时不回显。**QMT 登录密码不落盘**——`qmt_launcher` 从环境变量 `BIGQMT_LOGIN_PASSWORD` 读，这样它不会出现在 `argv` 或磁盘文件里，`bigqmt-init` 沿用这个约定。
+> **密码分两类。** Redis 密码是服务凭据，写进配置文件，输入时不回显。**QMT 登录密码不落盘**——`qmt_launcher` 从环境变量 `BIGQMT_LOGIN_PASSWORD` 读，这样它不会出现在 `argv` 或磁盘文件里。
 >
 > 生成的文件带账号和凭据，**不要提交到版本库**。
 
@@ -856,7 +860,11 @@ xtdata.get_local_data(["close"], ["600654.SH"], period="1d",
 
 注意：QMT 服务端下载是**异步落盘**的，自愈路径内置了等待 + 一次重试；极端大区间若一次重试仍全 0，可稍后重读或先显式 `download_history_data2`。
 
-> **批量下载请用 `download_history_data2` 整批传，不要循环单票**（issue #275）：QMT 的下载全局是「提交任务即返回」，桥在下载后要轮询确认数据可见（冷票/大区间最坏等 60 秒）。循环 `download_history_data(code)` 是**每票各付一次**这个等待；`download_history_data2(codes)` 是**全部票共用一次**服务端下载 + 一次等待。实测（国金 2.1.19.0，10 票）：整批 **2.2s**，而逐票循环最坏每票 60s。阻塞是刻意的——「下载」的语义是把数据落进本地库，返回前必须确认可见，否则后续读到的是旧数据（#66 的教训）。
+> **下载是阻塞的，这是刻意的**：QMT 的下载全局「提交任务即返回」，数据异步落盘，桥在下载后轮询确认数据可见才返回——否则你下一行读到的就是旧数据（#66 的教训）。这个等待本身是亚秒级的。
+>
+> **0.3.37 之前单票下载要等满 60 秒，那是 bug，不是等待本身慢**（issue #275，由 @pujfei 定位）：轮询里的读经过了自愈，自愈看到「还没落地」就把刚提交的那笔下载**原样再提交一遍**、睡 2 秒、再读，每轮如此，等待目标被反复推后，只能打满 60 秒。修复后同一台终端单票 1d 冷宽窗 **0.06 秒**。批量形态之前之所以快（10 票 2.2s），是因为多码时自愈的多数判据不易触发，它绕开了这个 bug 而不是没有这个 bug。
+>
+> 批量下载仍建议 `download_history_data2(codes)` 整批传：一次服务端下载、一次等待，比逐票循环少付固定开销。但这是效率差异，不再是 60 秒对 2 秒的差异。
 
 ### 实盘卖出方向误判修复（exec_events）
 
@@ -872,28 +880,72 @@ xtdata.get_local_data(["close"], ["600654.SH"], period="1d",
 
 ### 多账号使用（股票+期货 / 普通+信用）
 
-当前架构是**单账号单实例**——一个 QMT 策略进程绑定一个账号，RPC channel 按 `account_id` 隔离（`bigqmt:rpc:req:{account_id}`）。多账号场景（如股票+期货、普通+信用账户同时交易）的推荐方案是**在 QMT 里跑多个策略实例**，每个实例绑一个账号。
+两种方式。**同一个 QMT 客户端里登录了多个资金账号**（比如股票户加期货户）用方式一，一个策略实例同时服务它们；账号分属**不同客户端**（不同券商、不同机器）只能用方式二。
 
-#### 方案：多策略实例（推荐，不改代码）
+RPC channel 都按 `account_id` 隔离（`bigqmt:rpc:req:{account_id}`），客户端连哪个账号就填哪个 `account_id`，两种方式对客户端代码没有区别。
 
-**服务端（QMT 内）**：为每个账号创建一个独立的配置文件和 DRYRUN 入口。
+#### 方式一：单实例双账号（`BIGQMT_ACCOUNT_TYPE_MAP`）
+
+一个策略实例、每个账号一条 channel、共用同一套 QMT 句柄。服务端配置在单账号的基础上**多一张路由表**，其余不变：
+
+```python
+# bigqmt_signal_trader_local_config.py —— 单终端双账号：STOCK + FUTURE
+
+# 主账号：策略在 QMT 里以哪个账号加载运行，这里就填哪个。
+# 它的 channel 跑在 adjust 主线程上，所有账号的交易类请求最终都在这里执行。
+BIGQMT_ACCOUNT_ID = "你的股票账号"
+BIGQMT_ACCOUNT_TYPE = "STOCK"
+
+# 路由表：key=account_id，value=account_type（STOCK / CREDIT / FUTURE / STOCK_OPTION）。
+# 主账号也要在表里。表里除主账号外的每个 key 各起一个 secondary service，
+# 各有自己的 channel（bigqmt:rpc:req:{那个账号}）。
+# 每次请求按其 account_id 查这张表决定 account_type，再传给 QMT API。
+BIGQMT_ACCOUNT_TYPE_MAP = {
+    "你的股票账号": "STOCK",
+    "你的期货账号": "FUTURE",
+}
+
+BIGQMT_REDIS_CONFIG = {
+    "transport": "redis",
+    "host": "...", "port": 6379, "db": 5, "password": "...",
+    "account_id": BIGQMT_ACCOUNT_ID,
+    "rpc_allow_order_methods": True,      # 对这个实例上的所有账号一起生效
+    "rpc_process_in_listener": True,
+    "rpc_listener_methods": ("*",),
+    "schedule_adjust": True,
+    "schedule_adjust_interval": "500nMilliSecond",
+}
+```
+
+几点说明：
+
+- **只有 `BIGQMT_ACCOUNT_TYPE_MAP` 是桥读的键**。副账号不需要单独的变量，表里有它就够了；表为空或只有一条时，`build_multi_account_rpc_service` 原样返回单账号 service，行为零变化。
+- **`bigqmt-init` 只问一个账号**，生成的是单账号配置。双账号要在生成的文件里手工加 `BIGQMT_ACCOUNT_TYPE_MAP`。
+- **主账号 = 策略在 QMT 里绑定的那个**。QMT 的模型交易一个实例只绑一个账号（界面选定），`BIGQMT_ACCOUNT_ID` 必须是它，否则 `passorder` 走的账号和策略绑定的对不上。
+- **交易类请求不并发**。secondary 在后台线程收请求，但 `submit` / `cancel` / 持仓委托查询都 defer 到主账号的 adjust 线程排队执行——`get_trade_detail_data` 离开主线程返回空，这是 QMT 的约束，不是桥的。
+- **撤单按 `account_id` 路由**（#171 起）。此前 `cancel` 一律用网关自己的账号，双账号里撤期货委托会用股票账号发出去。
+- **已实盘验证**：上面这份配置的形状就是一套实际跑着的 STOCK + FUTURE 部署，dual-channel 收发、副账号的 `account_id` 注入、副账号交易请求被主线程 drain 三条路都在实盘走通了。#171 合并时 CHANGELOG 写的"本仓库从未实跑过"已经不再成立。换券商或换账号类型组合时，仍建议先用小单验一遍副账号的下单、撤单、持仓。
+
+#### 方式二：多策略实例（不改代码，账号在不同客户端时的唯一选择）
+
+为每个账号创建一个独立的配置文件和 DRYRUN 入口。
 
 ```python
 # bigqmt_signal_trader_local_config_stock.py  — 股票账号
 BIGQMT_ACCOUNT_ID = "你的股票账号"
+BIGQMT_ACCOUNT_TYPE = "STOCK"
 BIGQMT_REDIS_CONFIG = {
     "host": "...", "port": 6379, "db": 5, "password": "...",
     "transport": "redis",          # 或 "zmq"
-    "account_type": "STOCK",       # 股票
     # ...
 }
 
 # bigqmt_signal_trader_local_config_credit.py  — 信用账号
 BIGQMT_ACCOUNT_ID = "你的信用账号"
+BIGQMT_ACCOUNT_TYPE = "CREDIT"
 BIGQMT_REDIS_CONFIG = {
     "host": "...", "port": 6379, "db": 5, "password": "...",
     "transport": "redis",
-    "account_type": "CREDIT",      # 信用（两融）
     # ...
 }
 ```
