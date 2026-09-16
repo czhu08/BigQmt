@@ -35,15 +35,41 @@ import tokenize
 
 import build_single_file as bsf
 
-# This script lives in tools/; everything it reads is relative to the repo root.
+# This script lives in tools/ in a source checkout; a byte-identical copy ships
+# inside the wheel as package data so bigqmt-init works from a pip install too.
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-SRC_DIR = ROOT
-NO_REDIS_DIR = os.path.join(ROOT, "bigqmt_no_redis")
 OUT_PATH = os.environ.get(
     "BIGQMT_BUILD_OUT", os.path.join(ROOT, "src", "BIGQMT_DRYRUN_NO_REDIS_FLAT_ALL_IN_ONE.py"))
-NO_REDIS_ZMQ_TRANSPORT = os.path.join(NO_REDIS_DIR, "zmq_transport.py")
 
 INDENT = "    "
+
+
+def no_redis_override_path(root=ROOT):
+    """Path to the self-contained zmq transport that replaces the redis one.
+
+    Repository checkout first (bigqmt_no_redis/zmq_transport.py); a pip
+    install ships the same file as package data, materialized to a temp dir.
+    """
+    repo_path = os.path.join(root, "bigqmt_no_redis", "zmq_transport.py")
+    if os.path.isfile(repo_path):
+        return repo_path
+    try:
+        import pkgutil
+        import tempfile
+        data = pkgutil.get_data(
+            "bigqmt_signal_trader", "_singlefile/zmq_transport.py.txt")
+    except Exception:
+        data = None
+    if data:
+        tmpdir = tempfile.mkdtemp(prefix="bigqmt-flat-")
+        path = os.path.join(tmpdir, "zmq_transport.py")
+        with open(path, "wb") as handle:
+            handle.write(data)
+        return path
+    raise SystemExit(
+        "cannot locate bigqmt_no_redis/zmq_transport.py: neither the "
+        "repository checkout nor the packaged copy inside "
+        "bigqmt_signal_trader._singlefile was found")
 
 
 def _decode(data):
@@ -197,16 +223,17 @@ def module_funcs_block(sources, extra):
 
 
 def main():
-    sources = bsf.collect_package(bsf.PACKAGE_DIR, os.path.join(SRC_DIR, "src"))
+    top_dir, package_dir = bsf.resolve_source_dirs()
+    sources = bsf.collect_package(package_dir, top_dir)
 
-    with open(NO_REDIS_ZMQ_TRANSPORT, "rb") as f:
+    with open(no_redis_override_path(), "rb") as f:
         override = f.read()
     sources["bigqmt_signal_trader/transports/zmq_transport.py"] = override
 
     extra = {}
     for name in ("bigqmt_signal_trader_strategy.py",
                  "bigqmt_signal_trader_redis_rpc_runtime.py"):
-        full = os.path.join(SRC_DIR, "src", name)
+        full = os.path.join(top_dir, name)
         with open(full, "rb") as f:
             extra[name] = f.read()
     extra["bigqmt_no_redis/__init__.py"] = b"# coding: utf-8\n# no-redis local package marker (self-contained zmq transport lives here).\n"

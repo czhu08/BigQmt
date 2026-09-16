@@ -10,12 +10,41 @@ never imports other custom modules from disk.
 import base64
 import os
 
-# This script lives in tools/; everything it reads is relative to the repo root.
+# This script lives in tools/ in a source checkout; a byte-identical copy ships
+# inside the wheel as package data (bigqmt_signal_trader/_singlefile/) so
+# bigqmt-init's single-file options work from a plain pip install too.
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-SRC_DIR = ROOT  # alias: the flat builder joins "src" onto this.
-PACKAGE_DIR = os.path.join(ROOT, "src", "bigqmt_signal_trader")
 OUT_PATH = os.environ.get(
     "BIGQMT_BUILD_OUT", os.path.join(ROOT, "src", "BIGQMT_REDIS_DRYRUN_ALL_IN_ONE.py"))
+
+
+def resolve_source_dirs(root=ROOT):
+    """(top_dir, package_dir): top_dir holds the top-level strategy modules
+    (bigqmt_signal_trader_strategy.py, bigqmt_signal_trader_redis_rpc_runtime.py)
+    and is the root for the embedded relative paths; package_dir is the
+    bigqmt_signal_trader package.
+
+    A repository checkout (root/src/...) wins. Otherwise fall back to an
+    installed package: this is the pip-install layout, where the top-level
+    modules sit beside the package directory.
+    """
+    repo_src = os.path.join(root, "src")
+    if os.path.isdir(os.path.join(repo_src, "bigqmt_signal_trader")):
+        return repo_src, os.path.join(repo_src, "bigqmt_signal_trader")
+    try:
+        import bigqmt_signal_trader as _pkg
+        package_dir = os.path.dirname(os.path.abspath(_pkg.__file__))
+    except Exception:
+        package_dir = ""
+    top_dir = os.path.dirname(package_dir) if package_dir else ""
+    if (top_dir
+            and os.path.isfile(os.path.join(top_dir, "bigqmt_signal_trader_strategy.py"))
+            and os.path.isfile(os.path.join(top_dir, "bigqmt_signal_trader_redis_rpc_runtime.py"))):
+        return top_dir, package_dir
+    raise SystemExit(
+        "cannot locate bigqmt_signal_trader sources: neither a repository "
+        "checkout (src/bigqmt_signal_trader under the builder root) nor an "
+        "installed package with its top-level strategy modules was found")
 
 
 # Setup-time tooling, not runtime code. Keeping it out is not just about size:
@@ -76,11 +105,12 @@ def embed_block(sources, extra):
 
 
 def main():
-    sources = collect_package(PACKAGE_DIR, os.path.join(SRC_DIR, "src"))
+    top_dir, package_dir = resolve_source_dirs()
+    sources = collect_package(package_dir, top_dir)
     extra = {}
     for name in ("bigqmt_signal_trader_strategy.py",
                  "bigqmt_signal_trader_redis_rpc_runtime.py"):
-        full = os.path.join(SRC_DIR, "src", name)
+        full = os.path.join(top_dir, name)
         with open(full, "rb") as f:
             extra[name] = f.read()
 
