@@ -458,7 +458,6 @@ def normalize_order_event(order, account_id=""):
         "remark": str(_attr(order, ["m_strRemark", "order_remark", "remark", "user_order_id"], "") or ""),
         "user_order_id": str(_attr(order, ["m_strRemark", "user_order_id", "order_remark", "remark"], "") or ""),
         "opt_name": str(_attr(order, ["m_strOptName", "opt_name"], "") or ""),
-        "price_type": _attr(order, "m_nOrderPriceType", 50),
         # 委托状态描述。官方字段表: m_strCancelInfo=废单原因, m_strErrorMsg=状态信息。
         # 柜台的拒单理由 ("[COUNTER] 资金可用余额不足，尚需[...]") 只在这里,
         # 此前完全没有透传, 客户端看到的是一个没有原因的失败 (issue #60)。

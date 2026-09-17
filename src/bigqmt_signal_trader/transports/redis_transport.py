@@ -51,7 +51,7 @@ try:
 except (ImportError, LookupError):
     pass
 
-from ..adapters.redis_common import decode_text
+from ..adapters.redis_common import decode_text, redis_client_target
 from ..redis_rpc import (
     decode_rpc_request_payload,
     encode_rpc_request_payload,
@@ -144,9 +144,25 @@ class RedisTransport(RpcTransport):
         return self.request_queue_template.format(account_id=self.account_id)
 
     def _response_clients(self):
-        clients = [self.redis]
-        if self.listen_redis is not self.redis:
-            clients.append(self.listen_redis)
+        """Clients to write the reply through -- one per distinct redis server.
+
+        The listen client and the response client are separate objects pointing
+        at the same server, and writing through both put two identical copies of
+        every response in the reply list (one ping -> two replies, 2026-09-17).
+        """
+        clients = []
+        seen = set()
+        for client in (self.redis, self.listen_redis):
+            if client is None:
+                continue
+            try:
+                target = redis_client_target(client)
+            except Exception:
+                target = ("id", id(client))
+            if target in seen:
+                continue
+            seen.add(target)
+            clients.append(client)
         return clients
 
     # -- client side -------------------------------------------------------

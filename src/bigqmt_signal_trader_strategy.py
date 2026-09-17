@@ -424,6 +424,63 @@ def reset_app():
     _reset_runner_app()
 
 
+# --------------------------------------------------------------- instance guard
+# 2026-09-17 live repro: QMT exec'd the entry twice in one terminal process --
+# two copies of THIS module ran side by side, each with its own RPC service
+# (diag: one pid, two module-globals ids, two service ids). Both received the
+# account's order/deal callbacks, so every 委托/成交 was pushed to the client
+# twice: one copy named by the submitter, one carrying the row's 报单来源.
+# A terminal restart reproduced it, so this is QMT starting the file twice
+# (autorun and the panel's start racing), not a leftover from an earlier day.
+#
+# The entry's own _stop_previous_rpc_service() cannot catch that race: when the
+# second exec runs, the first module is not in sys.modules yet. So the slot lives
+# in builtins -- module replacement cannot touch it -- and the callbacks check it
+# themselves, because QMT keeps calling a retired instance's functions and there
+# is no way to unregister them.
+_INSTANCE_TOKEN = object()
+_INSTANCE_SLOT_PREFIX = "_bigqmt_strategy_instance_"
+
+
+def _instance_slot_name(account_id):
+    return _INSTANCE_SLOT_PREFIX + str(account_id or "").strip()
+
+
+def _claim_instance(account_id):
+    """Become the one live strategy instance for this account in this process."""
+    try:
+        import builtins
+
+        name = _instance_slot_name(account_id)
+        previous = getattr(builtins, name, None)
+        setattr(builtins, name, (_INSTANCE_TOKEN, reset_app))
+        if previous is not None and previous[0] is not _INSTANCE_TOKEN:
+            try:
+                previous[1]()          # stops the older instance's RPC service
+                print("[bigqmt_signal_trader] retired a previous strategy instance")
+            except Exception as exc:
+                print("[bigqmt_signal_trader] retiring previous instance failed: %s" % exc)
+    except Exception:
+        pass
+    return True
+
+
+def _is_live_instance(account_id=None):
+    """False once a newer instance took this account over in this process."""
+    try:
+        import builtins
+
+        target = account_id if account_id is not None else _account_id
+        slot = getattr(builtins, _instance_slot_name(target), None)
+        if slot is None:
+            # Never claimed (plain import, tests, or a build older than this
+            # guard): behave exactly as before.
+            return True
+        return slot[0] is _INSTANCE_TOKEN
+    except Exception:
+        return True
+
+
 def _resolve_runtime_name(name):
     if name in _qmt_api:
         return _qmt_api[name]
@@ -1167,6 +1224,10 @@ def init(ContextInfo):
     _apply_gil_tuning()
     _start_latency_probe()
     config = _build_config()
+    # QMT can run this file twice in one process (see _claim_instance): only the
+    # newest instance may answer RPC or publish callbacks. Claiming here retires
+    # whichever instance held the account before this one.
+    _claim_instance(str(config.get("account_id") or _account_id or ""))
     runtime = BigQmtRuntimeAdapter(ContextInfo)
     app = None
     try:
@@ -1181,6 +1242,12 @@ def init(ContextInfo):
         # e.g. zmq port conflict -> TransportError. Log it so the user sees why
         # the RPC service didn't start instead of QMT silently exiting.
         _log_startup_error("rpc service start failed: %s" % exc)
+    if not _is_live_instance():
+        # A newer instance claimed the account while this one was starting up
+        # (QMT double-start). Leave nothing behind: the callbacks above are
+        # already inert, and this releases the service/sockets just started.
+        reset_app()
+        return None
     try:
         _schedule_adjust_if_needed(ContextInfo, config)
     except Exception as exc:
@@ -1478,6 +1545,8 @@ def _adjust_phase(name, fn, *args):
 
 def adjust(ContextInfo, _source="timer"):
     global _adjust_logged
+    if not _is_live_instance():
+        return None
     _record_adjust_tick()
     _record_adjust_source(_source)
     config = _build_config()
@@ -1842,6 +1911,8 @@ def _enrich_event_identity(exec_events, config, account_id, event):
 
 def _publish_exec_event(kind, obj, context_info=None):
     """Push a normalized order/trade event to Redis for real-time client callbacks."""
+    if not _is_live_instance():
+        return
     config = _build_config()
     event_config = dict(config.get("exec_events") or {})
     # Raw-field diagnostics run BEFORE every other check (and before the
@@ -1922,6 +1993,10 @@ def _publish_exec_event(kind, obj, context_info=None):
 
 def order_callback(ContextInfo, orderInfo):
     """Standard Big QMT order callback."""
+    # A retired instance (QMT double-start) must stay silent: publishing from it
+    # is what made every 委托 reach the client twice (2026-09-17).
+    if not _is_live_instance():
+        return None
     # Settlement feeds on this even when client push is off (issue #164).
     _note_order_watch(orderInfo)
     _publish_exec_event("order", orderInfo, ContextInfo)
@@ -1930,6 +2005,8 @@ def order_callback(ContextInfo, orderInfo):
 
 def deal_callback(ContextInfo, dealInfo):
     """Standard Big QMT deal callback."""
+    if not _is_live_instance():
+        return None
     _publish_exec_event("trade", dealInfo, ContextInfo)
     return forward_trade_event(BigQmtRuntimeAdapter.to_trade_event(dealInfo))
 
@@ -1945,6 +2022,8 @@ def credit_account_callback(ContextInfo, seq, result):
     主线程上下文的事，也绝不让异常逃出去 —— 回调里抛异常在 QMT 那边表现为没有
     堆栈的 SystemError（issue #76）。
     """
+    if not _is_live_instance():
+        return None
     # 这里以前成功和失败都不出声，于是「QMT 根本没回调」和「回调来了但没送到
     # handlers」从外面看一模一样 —— 正是 CLAUDE.md 里那条「a failed operation
     # looks exactly like one that never ran」，栽在自己的新代码上。所以每一次

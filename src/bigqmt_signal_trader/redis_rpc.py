@@ -17,7 +17,7 @@ import time
 import traceback
 import uuid
 
-from .adapters.redis_common import decode_text
+from .adapters.redis_common import decode_text, redis_client_target
 from .code_utils import normalize_stock_code
 from .models import AccountSnapshot, OrderRef, OrderRequest
 
@@ -3946,9 +3946,25 @@ class RedisPubSubRpcService:
         self._published_count = getattr(self._transport, "_published_count", self._published_count)
 
     def _response_clients(self):
-        clients = [self.redis]
-        if self.listen_redis is not self.redis:
-            clients.append(self.listen_redis)
+        """Clients to write the reply through -- one per distinct redis server.
+
+        Same rule as RedisTransport._response_clients: two clients aimed at one
+        server must not each write the reply (2026-09-17: every RPC response was
+        stored twice in the reply list).
+        """
+        clients = []
+        seen = set()
+        for client in (self.redis, self.listen_redis):
+            if client is None:
+                continue
+            try:
+                target = redis_client_target(client)
+            except Exception:
+                target = ("id", id(client))
+            if target in seen:
+                continue
+            seen.add(target)
+            clients.append(client)
         return clients
 
     def _write_response_key(self, response_key, ttl_seconds, payload):

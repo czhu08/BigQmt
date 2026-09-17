@@ -75,6 +75,30 @@ def redis_mapping_to_text(mapping):
     return {decode_text(key): decode_text(value) for key, value in (mapping or {}).items()}
 
 
+def redis_client_target(client):
+    """Which redis server a client talks to: (host, port, db, username, path).
+
+    A deployment normally holds two clients pointed at the SAME server: the
+    listen client and the response client. The RPC reply fan-out used to write
+    through both, which put two copies of every response in the reply list and
+    published it twice on the response channel -- measured 2026-09-17, one ping
+    came back as two identical entries (doubled RPC replies, and the publish
+    leg of every reply paid twice for nothing).
+
+    Clients that genuinely point at another server (a second redis, a unix
+    socket) keep their own copy: the tuple differs, so both are returned.
+    """
+    pool = getattr(client, "connection_pool", None)
+    kwargs = dict(getattr(pool, "connection_kwargs", None) or {})
+    return (
+        kwargs.get("host"),
+        kwargs.get("port"),
+        kwargs.get("db"),
+        kwargs.get("username"),
+        kwargs.get("path"),
+    )
+
+
 # redis streams (XADD/XREAD) need redis >= 5.0. Older servers (Windows builds
 # are often 3.0.x) answer with "unknown command 'XADD'". Learn it once from the
 # failure, say it once, and let callers skip xadd from then on -- pub/sub keeps
