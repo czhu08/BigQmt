@@ -76,10 +76,33 @@ class QuotePushChannel(object):
         raise NotImplementedError
 
 
+class NullQuotePushChannel(QuotePushChannel):
+    """No-op push channel for deployments with no push wire (pipe, or redis
+    absent). Publishing is a silent no-op -- the alternative was
+    RedisQuotePushChannel(None), whose publish raised AttributeError per event.
+    """
+
+    def start_publisher(self):
+        pass
+
+    def start_subscriber(self, topics, on_msg):
+        raise NotImplementedError("no push channel on this deployment")
+
+    def publish(self, topic, data):
+        pass
+
+    def stop(self):
+        pass
+
+
 class ZmqQuotePushChannel(QuotePushChannel):
-    def __init__(self, bind_address=None, connect_address=None, context=None, print_prefix="[bigqmt_quote_push]"):
+    def __init__(self, bind_address=None, connect_address=None, context=None, print_prefix="[bigqmt_quote_push]", extra_bind_addresses=None):
         self.bind_address = bind_address
         self.connect_address = connect_address
+        # A zmq client derives the PUB address from ITS account's RPC port
+        # (+1). A multi-account bridge binds the one PUB socket to every
+        # account's address as well (#315); a zmq socket may bind several.
+        self.extra_bind_addresses = [str(a) for a in (extra_bind_addresses or []) if a and str(a) != str(bind_address)]
         self.print_prefix = print_prefix
         self._zmq = None
         self._context = context
@@ -88,6 +111,17 @@ class ZmqQuotePushChannel(QuotePushChannel):
         self._sub = None
         self._sub_thread = None
         self._running = False
+        # #403: every subscriber gets its OWN stop Event. The loop used to key
+        # on the shared self._running: stop() set it False, and the next
+        # start_subscriber() set it back True -- any thread whose join timed
+        # out (blocked inside on_msg) saw True again and lived forever, still
+        # subscribed to its OLD cumulative topic set. WholeQuoteClientSession
+        # re-subscribes on every topic-set change, so N batches left up to
+        # N-1 zombie subscribers and early chunks arrived once per zombie
+        # (measured 1.7x-7x duplication, stair-stepped by batch order).
+        self._subscriber_stop = None
+        self._stale_subscriber_threads = []
+        self.subscriber_join_seconds = 1.0
 
     def _ensure_context(self):
         if self._zmq is None:
@@ -105,6 +139,11 @@ class ZmqQuotePushChannel(QuotePushChannel):
             raise ValueError("bind_address is required to start a publisher")
         self._pub = ctx.socket(zmq.PUB)
         self._pub.bind(self.bind_address)
+        for address in self.extra_bind_addresses:
+            try:
+                self._pub.bind(address)
+            except Exception as exc:
+                print("%s zmq extra bind failed address=%s: %s" % (self.print_prefix, address, exc))
         self._running = True
 
     def publish(self, topic, data):
@@ -127,18 +166,25 @@ class ZmqQuotePushChannel(QuotePushChannel):
         zmq, ctx = self._ensure_context()
         if not self.connect_address:
             raise ValueError("connect_address is required to start a subscriber")
+        # Self-contained (#403): never rely on the caller to stop() first --
+        # and never let a previous thread's join timeout leak a zombie that a
+        # shared flag would revive. The old thread has its own Event, already
+        # set by _stop_subscriber, so it exits as soon as its callback returns.
+        self._stop_subscriber()
         sub = ctx.socket(zmq.SUB)
         sub.connect(self.connect_address)
         for topic in topics or []:
             sub.setsockopt(zmq.SUBSCRIBE, str(topic).encode("utf-8"))
         self._sub = sub
         self._running = True
+        stopped = self._subscriber_stop = threading.Event()
         self._sub_thread = threading.Thread(
-            target=self._sub_loop, args=(sub, on_msg), name="bigqmt-quote-push-sub", daemon=True
+            target=self._sub_loop, args=(sub, on_msg, stopped),
+            name="bigqmt-quote-push-sub", daemon=True
         )
         self._sub_thread.start()
 
-    def _sub_loop(self, sub, on_msg):
+    def _sub_loop(self, sub, on_msg, stopped):
         # The SUB socket is owned by THIS thread; it must be closed HERE (in a
         # finally) and never from another thread. Closing a ZMQ socket cross-
         # thread trips a Windows signaler assertion and aborts the whole QMT
@@ -146,7 +192,7 @@ class ZmqQuotePushChannel(QuotePushChannel):
         poller = self._zmq.Poller()
         poller.register(sub, self._zmq.POLLIN)
         try:
-            while self._running:
+            while not stopped.is_set():
                 try:
                     events = dict(poller.poll(200))
                 except Exception:
@@ -172,16 +218,47 @@ class ZmqQuotePushChannel(QuotePushChannel):
             except Exception:
                 pass
 
+    def _stop_subscriber(self):
+        """Signal THIS subscriber's Event and join it briefly.
+
+        A join timeout no longer leaks (#403): the thread's own Event stays
+        set, so it exits as soon as its callback returns and closes its own
+        socket in _sub_loop's finally. The stale thread is tracked (and said
+        out loud once each) instead of being silently revived by the next
+        start_subscriber.
+        """
+        event = self._subscriber_stop
+        if event is not None:
+            event.set()
+        thread = self._sub_thread
+        if thread is not None and thread.is_alive():
+            thread.join(self.subscriber_join_seconds)
+            if thread.is_alive():
+                self._stale_subscriber_threads.append(thread)
+                print("%s subscriber did not stop within %.1fs; its stop "
+                      "event is set and it will exit when its callback "
+                      "returns (#403 -- tracked, not abandoned)"
+                      % (self.print_prefix, self.subscriber_join_seconds))
+        self._sub_thread = None
+        self._sub = None
+        self._subscriber_stop = None
+
+    def active_subscribers(self):
+        """Live subscriber threads right now; healthy is 0 or 1 (#403)."""
+        alive = []
+        for thread in self._stale_subscriber_threads:
+            if thread.is_alive():
+                alive.append(thread)
+        self._stale_subscriber_threads = alive
+        current = self._sub_thread
+        return len(alive) + (1 if current is not None and current.is_alive() else 0)
+
     def stop(self):
         # Signal the sub thread to exit and let IT close its own socket (see
         # _sub_loop). Closing the SUB socket from this (foreign) thread would
         # trip the Windows ZMQ signaler abort and crash QMT.
         self._running = False
-        thread = self._sub_thread
-        if thread is not None and thread.is_alive():
-            thread.join(1.0)
-        self._sub_thread = None
-        self._sub = None
+        self._stop_subscriber()
         # The PUB socket is only touched by publisher threads under _pub_lock;
         # null it first so a racing publish() sees None and bails, then close.
         with self._pub_lock:
@@ -194,19 +271,38 @@ class ZmqQuotePushChannel(QuotePushChannel):
                 pass
 
 
+def _unique_accounts(values):
+    seen = []
+    for value in values:
+        text = str(value or "")
+        if text and text not in seen:
+            seen.append(text)
+    return seen
+
+
 class RedisQuotePushChannel(QuotePushChannel):
-    def __init__(self, redis_client, account_id="", channel_template="bigqmt:quote_push:{account_id}:{topic}", print_prefix="[bigqmt_quote_push]"):
+    def __init__(self, redis_client, account_id="", channel_template="bigqmt:quote_push:{account_id}:{topic}", print_prefix="[bigqmt_quote_push]", account_ids=None):
         self.redis = redis_client
         self.account_id = str(account_id or "")
         self.channel_template = channel_template
         self.print_prefix = print_prefix
+        # Every account this publisher speaks for (#315). The channel is
+        # keyed by account, and a single-instance multi-account bridge
+        # (BIGQMT_ACCOUNT_TYPE_MAP) serves several: a client configured with
+        # the secondary account subscribes bigqmt:quote_push:<secondary>:*,
+        # its subscribe RPC lands on the shared handlers and succeeds, and
+        # every push went to bigqmt:quote_push:<primary>:* -- "subscribed,
+        # no callbacks". Market data is not account-specific, so publish
+        # once per account. The client role uses account_id alone.
+        self.account_ids = _unique_accounts([self.account_id] + list(account_ids or []))
         self._running = False
         self._pubsub = None
         self._thread = None
         self._subscriber_stop = threading.Event()
 
-    def _channel(self, topic):
-        return self.channel_template.format(account_id=self.account_id, topic=topic)
+    def _channel(self, topic, account_id=None):
+        return self.channel_template.format(
+            account_id=self.account_id if account_id is None else account_id, topic=topic)
 
     # -- server side ---------------------------------------------------------
     def start_publisher(self):
@@ -215,10 +311,11 @@ class RedisQuotePushChannel(QuotePushChannel):
 
     def publish(self, topic, data):
         payload = encode_push_payload({"combo_key": topic, "data": data})
-        try:
-            self.redis.publish(self._channel(topic), payload)
-        except Exception as exc:
-            print("%s redis publish failed: %s" % (self.print_prefix, exc))
+        for account_id in self.account_ids or [self.account_id]:
+            try:
+                self.redis.publish(self._channel(topic, account_id), payload)
+            except Exception as exc:
+                print("%s redis publish failed: %s" % (self.print_prefix, exc))
 
     # -- client side ---------------------------------------------------------
     def start_subscriber(self, topics, on_msg):

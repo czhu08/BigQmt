@@ -223,9 +223,13 @@ class BackgroundThreadResolutionTest(unittest.TestCase):
         self.assertFalse(_transport_can_drain("shm"))
         self.assertFalse(_transport_can_drain("nonesuch"))
 
-    def test_unset_keeps_the_historical_default(self):
+    def test_unset_means_the_adjust_drain(self):
+        # #343: pipe can drain, so an absent key drains (94ms vs 189ms with
+        # the receiver thread on the 0.3.28 table). The historical default
+        # -- receiver thread on -- is only kept for transports that cannot.
         from bigqmt_signal_trader_strategy import _resolve_background_threads
-        self.assertTrue(_resolve_background_threads("pipe", None))
+        self.assertFalse(_resolve_background_threads("pipe", None))
+        self.assertTrue(_resolve_background_threads("pipe", True))
 
 
 class FactoryTest(unittest.TestCase):
@@ -345,12 +349,21 @@ class ConcurrencyTest(unittest.TestCase):
         self.assertEqual(errors[:5], [], "500 次并发里出了 %d 个错" % len(errors))
 
     def test_each_thread_gets_its_own_handle(self):
+        """「各自一条连接」必须在全部连接同时活着时比较。
+
+        #431 之后句柄随线程退出即时关闭，内核句柄值会被回收复用：先死的
+        线程留下的数值，可能被后建的连接原样拿回——那不是共用。旧写法
+        等线程全退出后才比数值，于是把回收复用误判成共享（5 != 6 偶发）。
+        用 barrier 让 6 条连接同时在线再采样，复用就不可能发生。
+        """
+        barrier = threading.Barrier(6)
         seen = []
         lock = threading.Lock()
 
         def grab():
             self.pair.client.send_request(
                 {"request_id": "h", "method": "p", "params": {}}, 5)
+            barrier.wait(timeout=30)          # 6 条连接全部就位、同时活着
             with lock:
                 seen.append(self.pair.client._client_local.handle)
 

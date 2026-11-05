@@ -39,6 +39,12 @@ from ..quote_utils import find_code_payload, is_option_code, latest_quote_row
 log = get_logger("market")
 
 
+def _ignore_tick_push(data):
+    """Callback for the #310 warm-up subscriptions: the snapshot is read back
+    with get_full_tick, so the pushes themselves are not needed."""
+    return None
+
+
 MARKET_CODES = {"SH", "SZ", "BJ", "HK"}
 
 # A market token asks QMT for every instrument the exchange lists, and stocks
@@ -70,6 +76,10 @@ SECTOR_BY_TYPE = {
     "etf": "沪深ETF",
     "index": "沪深指数",
     "convertible": "沪深转债",
+    # Aliases for the same sector: what people actually type.
+    "cbond": "沪深转债",
+    "cb": "沪深转债",
+    "convertible_bond": "沪深转债",
 }
 
 
@@ -646,11 +656,17 @@ def _load_native_xtdata():
 
 
 class BigQmtMarketDataProvider:
-    def __init__(self, context_info, native_xtdata=None, qmt_api=None):
+    def __init__(self, context_info, native_xtdata=None, qmt_api=None,
+                 native_xtdata_enabled=True):
         self.context_info = context_info
         # Allow injection for tests; otherwise resolve lazily on first use.
         self._native_xtdata = native_xtdata
         self.qmt_api = dict(qmt_api or {})
+        # pipe 这类沙箱传输的存在理由就是「禁 socket、外连即杀」的终端
+        # （2026-09-24 实盘）：原生 xtdata SDK 的调用会拨本地 58610 行情服务，
+        # 那种终端上一次 SDK 调用就死。关掉后 _native() 恒 None，所有 native
+        # 路径直接走既有回落。
+        self.native_xtdata_enabled = bool(native_xtdata_enabled)
 
     def _context_method(self, method_name):
         method = getattr(self.context_info, method_name, None)
@@ -660,6 +676,19 @@ class BigQmtMarketDataProvider:
 
     def _call_context(self, method_name, *args, **kwargs):
         return self._context_method(method_name)(*args, **kwargs)
+
+    def _call_global_first(self, method_name, *args, **kwargs):
+        """Prefer the QMT-injected runtime global; fall back to ContextInfo.
+
+        call_formula 一族的官方入口是注入策略命名空间的**全局函数**，完整
+        大 QMT 的 ContextInfo 上没有它们——只查 ContextInfo 就是
+        「ContextInfo.call_formula is not available」（#374）。和下载全局
+        同一个模式：注入了用注入的，没注入才看 ContextInfo。
+        """
+        func = self.qmt_api.get(method_name)
+        if callable(func):
+            return func(*args, **kwargs)
+        return self._call_context(method_name, *args, **kwargs)
 
     def _native(self):
         """Return the native xtdata SDK, resolving it lazily on first use.
@@ -671,6 +700,8 @@ class BigQmtMarketDataProvider:
         the SDK call itself to raise "无法连接行情服务" and fall back.
         """
         if self._native_xtdata is None:
+            if not self.native_xtdata_enabled:
+                return None
             self._native_xtdata = _load_native_xtdata()
         return self._native_xtdata
 
@@ -815,7 +846,18 @@ class BigQmtMarketDataProvider:
         big_kwargs_filled = dict(big_kwargs, fill_data=fill_data)
         positional_tail_filled = dict(positional_tail_kwargs, fill_data=fill_data)
 
-        return [
+        # subscribe 是 QMT 签名的最后一个参数（fill_data 之后）：True（大 QMT
+        # 默认）把查过的标的塞进常驻内存订阅池，批量拉分钟线时终端内存单调涨到
+        # 崩溃（#361）；False 只读本地已下载数据。和 fill_data 一样单独成
+        # shape、只在调用方给了才传——签名没有 subscribe 的终端 TypeError 后
+        # 仍落到下面的裸 shape。
+        subscribe = params.get("subscribe")
+        shapes = []
+        if subscribe is not None:
+            shapes.append(
+                (method_name, (), dict(big_kwargs_filled, subscribe=bool(subscribe))))
+
+        shapes.extend([
             (method_name, (), big_kwargs_filled),
             (method_name, (), big_kwargs),
             (method_name, (), mini_kwargs),
@@ -851,7 +893,8 @@ class BigQmtMarketDataProvider:
                     "fill_data": fill_data,
                 },
             ),
-        ]
+        ])
+        return shapes
 
     def _sector_codes(self, sector):
         """Cached sector listing. Membership does not change intraday and the
@@ -934,6 +977,11 @@ class BigQmtMarketDataProvider:
         """
         requested = list(codes or [])
         normalized_codes = [normalize_market_or_stock_code(code) for code in requested]
+        # What the caller asked for, tokens still tokens: this is what gets
+        # subscribed if the terminal answers only subscribed codes (#310). The
+        # expanded stock listing below is the wrong unit for that -- one
+        # whole-quote subscription on "SH" covers it.
+        subscribe_targets = list(normalized_codes)
         # Default to stocks. A market token lists every instrument the exchange
         # carries and stocks are 8.7% of it, so the old default made everyone pay
         # 7.5s for a 0.9s answer. types=["all"] restores the full listing.
@@ -956,6 +1004,7 @@ class BigQmtMarketDataProvider:
         data = self.context_info.get_full_tick(normalized_codes) or {}
         if not isinstance(data, dict):
             return data or {}
+        data = self._recover_unsubscribed_ticks(subscribe_targets, normalized_codes, data)
 
         # Full Big-QMT 2.1.19.0 can return no entry from get_full_tick for an
         # explicitly requested .SHO/.SZO contract even while its tick stream is
@@ -1011,9 +1060,166 @@ class BigQmtMarketDataProvider:
             for key, value in data.items()
         )
 
+    # Issue #310: on Jianghai big-QMT 2.1.19.0, ContextInfo.get_full_tick
+    # answers only codes that hold a live quote subscription. An unsubscribed
+    # code yields no entry -- not an error -- so a ticking terminal returned {}
+    # for every explicit code and for whole-market tokens alike, while ping,
+    # positions and get_market_data_ex were all fine. subscribe_whole_quote on
+    # the code and asking again a few seconds later produced the full
+    # five-level book. Guojin's build answers unsubscribed codes, so this path
+    # only runs when the native call left a requested code unanswered: a
+    # terminal that never does that never subscribes anything here.
+    #
+    # Subscriptions are held per request batch and dropped after
+    # TICK_SUBSCRIBE_IDLE_SECONDS without a get_full_tick that touched them;
+    # pruning happens on the next get_ticks call and, when the strategy loop
+    # wires it, from prune_tick_subscriptions on every adjust tick.
+    TICK_SUBSCRIBE_WAIT_SECONDS = 2.0
+    TICK_SUBSCRIBE_POLL_SECONDS = 0.1
+    TICK_SUBSCRIBE_IDLE_SECONDS = 300.0
+
+    def _tick_subscription_state(self):
+        state = getattr(self, "_tick_subscription_state_dict", None)
+        if state is None:
+            import threading
+            state = self._tick_subscription_state_dict = {
+                "lock": threading.RLock(),
+                "groups": [],        # [handle, set(codes), last_used]
+                "by_code": {},       # code -> group
+            }
+        return state
+
+    @staticmethod
+    def _tick_unanswered(targets, data):
+        """Requested codes the snapshot has no entry for. A market token counts
+        as answered when any key carries its suffix."""
+        answered = {str(key).upper() for key in (data or {})}
+        missing = []
+        for code in targets:
+            text = str(code)
+            if text in EXCHANGE_TOKENS:
+                suffix = "." + text
+                if not any(key.endswith(suffix) for key in answered):
+                    missing.append(text)
+            elif text.upper() not in answered:
+                missing.append(text)
+        return missing
+
+    def tick_subscription_status(self):
+        """Read-only view of the #310 warm-up subscriptions, for diagnostics."""
+        state = self._tick_subscription_state()
+        now = time.monotonic()
+        with state["lock"]:
+            return [
+                {"handle": handle, "codes": sorted(codes),
+                 "idle_seconds": round(now - last_used, 1)}
+                for handle, codes, last_used in state["groups"]
+            ]
+
+    def prune_tick_subscriptions(self, now=None):
+        """Unsubscribe warm-up groups idle longer than TICK_SUBSCRIBE_IDLE_SECONDS.
+        Returns the number of groups closed. Safe to call from the adjust loop."""
+        state = getattr(self, "_tick_subscription_state_dict", None)
+        if state is None:
+            return 0
+        now = time.monotonic() if now is None else now
+        idle = float(self.TICK_SUBSCRIBE_IDLE_SECONDS)
+        expired = []
+        with state["lock"]:
+            keep = []
+            for group in state["groups"]:
+                if now - group[2] > idle:
+                    expired.append(group)
+                    for code in group[1]:
+                        state["by_code"].pop(code, None)
+                else:
+                    keep.append(group)
+            state["groups"] = keep
+        unsubscribe = getattr(self.context_info, "unsubscribe_quote", None)
+        for handle, codes, _last_used in expired:
+            try:
+                if callable(unsubscribe):
+                    unsubscribe(handle)
+            except Exception as exc:
+                log.warning("full tick warm-up unsubscribe(%s) failed for %s: %s",
+                            handle, sorted(codes), exc)
+        return len(expired)
+
+    def _recover_unsubscribed_ticks(self, targets, query_codes, data):
+        """Subscribe the requested codes the snapshot left unanswered, then
+        re-read until they appear or TICK_SUBSCRIBE_WAIT_SECONDS elapses.
+
+        Only codes with no warm-up subscription yet are subscribed and waited
+        for. A code that is already subscribed and still unanswered is QMT's
+        answer (halted, delisted, pre-open) and is returned as such without
+        another wait, so a warm terminal pays nothing per call.
+        """
+        subscribe = getattr(self.context_info, "subscribe_whole_quote", None)
+        if not callable(subscribe):
+            return data
+        missing = self._tick_unanswered(targets, data)
+        state = self._tick_subscription_state()
+        now = time.monotonic()
+        self.prune_tick_subscriptions(now)
+        with state["lock"]:
+            by_code = state["by_code"]
+            for code in targets:
+                group = by_code.get(str(code))
+                if group is not None:
+                    group[2] = now
+            fresh = [code for code in missing if code not in by_code]
+        if not fresh:
+            return data
+        try:
+            handle = subscribe(list(fresh), callback=_ignore_tick_push)
+            value = int(handle)
+        except Exception as exc:
+            value = -1
+            handle = exc
+        if value <= 0:
+            if not getattr(self, "_tick_subscribe_warned", False):
+                self._tick_subscribe_warned = True
+                log.warning("full tick warm-up subscribe_whole_quote(%s) failed: %r",
+                            fresh, handle)
+            return data
+        with state["lock"]:
+            group = [value, set(fresh), now]
+            state["groups"].append(group)
+            for code in fresh:
+                state["by_code"][code] = group
+        deadline = now + float(self.TICK_SUBSCRIBE_WAIT_SECONDS)
+        poll = float(self.TICK_SUBSCRIBE_POLL_SECONDS)
+        while True:
+            time.sleep(poll)
+            retry = self.context_info.get_full_tick(query_codes) or {}
+            if isinstance(retry, dict) and retry:
+                merged = dict(data)
+                merged.update(retry)
+                data = merged
+                if not self._tick_unanswered(fresh, data):
+                    break
+            if time.monotonic() >= deadline:
+                break
+        still_missing = self._tick_unanswered(fresh, data)
+        log.info("full tick warm-up: subscribed %s (handle %s), %s after %.1fs",
+                 fresh, value,
+                 "all answered" if not still_missing else "still empty: %s" % still_missing,
+                 time.monotonic() - now)
+        return data
+
     def get_instrument(self, code):
         normalized = normalize_stock_code(code)
-        data = self.context_info.get_instrumentdetail(normalized)
+        # Prefer the native SDK (miniQMT parity): the terminal-side ContextInfo
+        # store can itself serve a poisoned contract table -- OpenDate=0 or
+        # renamed-on dates that persist across terminal restarts (#405) --
+        # while the machine's miniQMT quote service answers the correct rows.
+        # Falls back to ContextInfo when no quote service is reachable; the
+        # #160 dead-mark window absorbs the per-process dial-failure cost.
+        data = self._native_or_context(
+            "get_instrument_detail",
+            lambda: self.context_info.get_instrumentdetail(normalized),
+            normalized,
+        )
         return data or {}
 
     def get_instrument_type(self, code, variety_list=None):
@@ -1233,7 +1439,19 @@ class BigQmtMarketDataProvider:
             # short of it was never padded, so trimming its head would drop
             # real bars. Verified live -- 1y count=10 comes back as exactly 10
             # rows, 7 of them pad.
-            if count > 0 and len(pairs) >= count:
+            #
+            # A date window (count=-1 with a start_time) is padded the same
+            # way when the window starts before the terminal's local coverage
+            # (#335: 601318.SH 1mon from 20250901 with 1d data anchored at
+            # 2025-12-10 -- three head rows flat at 68.40, the first real
+            # close, zero turnover; MiniQMT returns no rows for those months).
+            # There is no count to fall short of, so every leading flat
+            # zero-turnover row at the head of a window is pad. The servant
+            # is called with its default skip_paused=True, so a genuinely
+            # suspended period does not come back as a row here in the first
+            # place -- the only flat zero-turnover rows it produces are pad.
+            window_request = count <= 0 and bool(str(kwargs.get("start_time") or "").strip())
+            if (count > 0 and len(pairs) >= count) or window_request:
                 pad = _leading_synthetic_bars([row for _label, row in pairs])
                 if pad:
                     trimmed += pad
@@ -1557,9 +1775,55 @@ class BigQmtMarketDataProvider:
             context_stock = {"SH": "000001.SH", "SZ": "399001.SZ"}.get(str(market).upper(), market)
             return self._call_context("get_trading_dates", context_stock, start_time, end_time, count)
 
-        return self._native_or_context(
+        dates = self._native_or_context(
             "get_trading_dates", _via_context, market, start_time, end_time, count
         )
+        if dates:
+            self._note_calendar_path(market, "native/sdk", len(dates))
+            return dates
+        # An empty native answer is ambiguous (#391): on a holiday it is the
+        # truth, but it is also what a not-yet-loaded SDK calendar answers on
+        # a trading day -- that morning SH came back with the date while SZ
+        # stayed empty. Cross-check the ContextInfo (index-calendar) path
+        # before reporting "closed": it is empty on the same holidays, so an
+        # empty second answer costs nothing, and a non-empty one is the
+        # difference between 休市 and 数据未就绪 for the caller.
+        try:
+            via_context = _via_context()
+        except Exception:
+            via_context = None
+        if via_context:
+            self._note_calendar_path(
+                market, "context(empty-native)", len(via_context))
+            return via_context
+        return dates
+
+    def _note_calendar_path(self, market, path, rows):
+        """Record which path answered the calendar (#391's diagnostic ask).
+
+        The last answer stays readable on the provider for probes. When the
+        ContextInfo cross-check had to substitute for an empty SDK calendar,
+        say so once per (market, path) per process -- a print costs ~an
+        adjust tick of GIL on the QMT panel, so it does not fire on the
+        common native path.
+        """
+        self._last_trading_dates_answer = {
+            "market": str(market), "path": path, "rows": rows,
+            "at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        if path == "native/sdk":
+            return
+        seen = getattr(self, "_calendar_path_notes", None)
+        if seen is None:
+            seen = self._calendar_path_notes = set()
+        marker = (str(market), path)
+        if marker in seen:
+            return
+        seen.add(marker)
+        print("[bigqmt_rpc] get_trading_dates(%s): SDK calendar empty, "
+              "ContextInfo index calendar answered %d rows -- treating the "
+              "empty as 'calendar not loaded', not 'closed' (#391)"
+              % (market, rows))
 
     def get_holidays(self):
         """Return the holiday (non-trading) date list.
@@ -1903,7 +2167,7 @@ class BigQmtMarketDataProvider:
             return None
 
     def call_formula(self, formula_name, stock_code, period, start_time="", end_time="", count=-1, dividend_type=None, extend_param=None):
-        return self._call_context(
+        return self._call_global_first(
             "call_formula",
             formula_name,
             stock_code,
@@ -1916,7 +2180,7 @@ class BigQmtMarketDataProvider:
         )
 
     def subscribe_formula(self, formula_name, stock_code, period, start_time="", end_time="", count=-1, dividend_type=None, extend_param=None):
-        return self._call_context(
+        return self._call_global_first(
             "subscribe_formula",
             formula_name,
             stock_code,
@@ -1929,13 +2193,13 @@ class BigQmtMarketDataProvider:
         )
 
     def unsubscribe_formula(self, request_id):
-        return self._call_context("unsubscribe_formula", request_id)
+        return self._call_global_first("unsubscribe_formula", request_id)
 
     def get_formula_result(self, request_id, start_time="", end_time="", count=-1, timeout_second=-1):
-        return self._call_context("get_formula_result", request_id, start_time, end_time, count, timeout_second)
+        return self._call_global_first("get_formula_result", request_id, start_time, end_time, count, timeout_second)
 
     def gen_factor_index(self, data_name, formula_name, vars, sector_list, start_time="", end_time="", period="1d", dividend_type="none"):
-        return self._call_context(
+        return self._call_global_first(
             "gen_factor_index",
             data_name,
             formula_name,

@@ -152,6 +152,14 @@ class ContextInfoQuoteSource(QuoteSourceAdapter):
             except Exception:
                 pass
 
+    def unsubscribe_strict(self, handle):
+        """Same unsubscribe, but native errors propagate (#418): the batch
+        path must be able to say 'the terminal refused' rather than counting
+        a swallowed exception as a released subscription."""
+        handles = handle if isinstance(handle, (list, tuple, set)) else [handle]
+        for sub_id in handles:
+            self._context.unsubscribe_quote(sub_id)
+
 
 class _Combo(object):
     __slots__ = ("key", "codes", "handle", "topic", "clients")
@@ -217,6 +225,43 @@ class QuoteSubscriptionManager(object):
                 return
             handle_to_close = self._remove_subscription_locked(key, client_id, sub_id)
         self._close_source(handle_to_close)
+
+    def unsubscribe_batch(self, client_id, sub_ids):
+        """Drop many (client_id, sub_id) pairs in one lock pass (#418).
+
+        Per-item unsubscribe costs one RPC plus a push-subscriber rebuild on
+        the client; a caller exiting with N handles paid N of each. The batch
+        releases every named reference, then closes each orphaned combo source
+        once. The report names what happened -- unknown sub_ids and native
+        unsubscribe errors are diagnostic, never swallowed-as-success.
+        """
+        client_id = str(client_id or "")
+        sub_ids = [str(s or "") for s in (sub_ids or [])]
+        released = []
+        unknown = []
+        handles = []
+        with self._lock:
+            for sub_id in sub_ids:
+                key = self._sub_index.pop((client_id, sub_id), None)
+                if key is None:
+                    unknown.append(sub_id)
+                    continue
+                released.append(sub_id)
+                handle = self._remove_subscription_locked(key, client_id, sub_id)
+                if handle is not None:
+                    handles.append(handle)
+        native_errors = []
+        for handle in handles:
+            try:
+                strict = getattr(self._source, "unsubscribe_strict", None)
+                if callable(strict):
+                    strict(handle)
+                else:
+                    self._source.unsubscribe(handle)
+            except Exception as exc:
+                native_errors.append("%s: %s" % (type(exc).__name__, exc))
+        return {"released": released, "unknown": unknown,
+                "native_errors": native_errors}
 
     def keepalive(self, client_id, sub_id):
         """Refresh last_seen for (client_id, sub_id). Unknown sub_ids are a no-op."""
@@ -351,24 +396,51 @@ def build_quote_subscription_service(
     enabled=True,
     heartbeat_timeout_seconds=30.0,
     time_func=None,
+    account_ids=None,
+    pipe_name=None,
 ):
     """Assemble the server-side whole-quote service: a ContextInfo-backed source,
     a push channel matching the RPC transport, and a QuoteSubscriptionManager
     wired so big-QMT pushes publish to the channel. Returns ``(manager, channel)``
     or ``None`` when disabled. The caller starts the channel publisher and feeds
-    ``manager.reap_expired`` from the scheduler loop."""
+    ``manager.reap_expired`` from the scheduler loop.
+
+    ``account_ids``: every account this bridge serves. None reads
+    ``BIGQMT_ACCOUNT_TYPE_MAP`` (the single-instance multi-account table,
+    #315), so a secondary account's client gets the push on ITS channel."""
     if not enabled:
         return None
-    from .quote_push_channel import RedisQuotePushChannel, ZmqQuotePushChannel
+    from .quote_push_channel import (
+        NullQuotePushChannel, RedisQuotePushChannel, ZmqQuotePushChannel,
+    )
 
     source = ContextInfoQuoteSource(context_info)
     transport_name = str(transport_name or "redis").lower()
+    served = _served_account_ids(account_id, account_ids)
     if transport_name == "zmq":
         bind_address = zmq_bind_address or _default_quote_push_zmq_bind(account_id)
-        channel = ZmqQuotePushChannel(bind_address=bind_address)
+        extra = [_default_quote_push_zmq_bind(other) for other in served if other != str(account_id or "")]
+        channel = ZmqQuotePushChannel(bind_address=bind_address, extra_bind_addresses=extra)
         push_endpoint = bind_address
+    elif transport_name == "pipe":
+        # #408: pipe deployments get a real push wire -- a dedicated events
+        # pipe (server writes, clients read), not the RPC request/response
+        # pipe. The exec-event sink falls through to _push_channel_sink, so
+        # order/trade callbacks ride the same channel for free.
+        from .transports.pipe_push_channel import (
+            PipeQuotePushChannel, pipe_events_path,
+        )
+
+        events_address = pipe_events_path(pipe_name, account_id)
+        channel = PipeQuotePushChannel(bind_address=events_address)
+        push_endpoint = events_address
+    elif redis_client is None:
+        # pipe（或 redis 被关掉的部署）没有推送线——静默空通道，而不是
+        # RedisQuotePushChannel(None) 每条事件一行 AttributeError。
+        channel = NullQuotePushChannel()
+        push_endpoint = ""
     else:
-        channel = RedisQuotePushChannel(redis_client, account_id=account_id)
+        channel = RedisQuotePushChannel(redis_client, account_id=account_id, account_ids=served)
         push_endpoint = ""
     manager = QuoteSubscriptionManager(
         source,
@@ -378,6 +450,24 @@ def build_quote_subscription_service(
         push_endpoint=push_endpoint,
     )
     return manager, channel
+
+
+def _served_account_ids(primary_account_id, account_ids=None):
+    """The accounts a push must reach: the primary plus, by default, every
+    key of BIGQMT_ACCOUNT_TYPE_MAP. Order: primary first, then the map's."""
+    if account_ids is None:
+        try:
+            from .account_type_map import get_account_type_map
+
+            account_ids = list(get_account_type_map() or {})
+        except Exception:
+            account_ids = []
+    served = []
+    for value in [primary_account_id] + list(account_ids):
+        text = str(value or "")
+        if text and text not in served:
+            served.append(text)
+    return served
 
 
 def _default_quote_push_zmq_bind(account_id):

@@ -2,6 +2,798 @@
 
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/) 和 [语义化版本](https://semver.org/)。
 
+## [0.3.78] - 2026-10-27
+
+### 修复
+
+- **同机零依赖传输：drain 模式延迟应答不再可能串到别的连接（#436）**：延迟应答
+  原先按裸句柄值写回——等待方超时断开后，该值可能被回收给一条新连接，旧应答会
+  落到新客户端手里。现在每条连接登记身份 token，应答凭 token 认连接（token 不符
+  即连接已亡：丢弃并记日志）；客户端另加 request_id 核对兜底，串线的应答响亮报错
+  而不是被当成结果。
+- **同机零依赖传输：stop 与 accept 线程的竞态（#436）**：stop 现在先解除
+  ConnectNamedPipe 阻塞、等待 accept 线程退出（限时 5s）、再做二次清扫——快照之后
+  竞态新建的实例不再残留；重跑时同名旧服务实例会被新实例先行停止，客户端不会再
+  连上死实例。注：实现中途把服务注册表锁改为可重入——start 内调 previous.stop 与
+  stop 自注销在同一把锁上同线程重入，非重入锁直接死锁。
+## [0.3.77] - 2026-10-27
+
+### 修复
+
+- **NoopPositionSyncSink 快照无界增长（#441，内存泄漏）**：非 redis 传输回落到
+  Noop sink，publish() 每次追加、永不清理——app.tick() 每个 adjust 拍发布一次
+  （约 10 次/秒），报告者终端实测约 1MB/s 私有内存增长，直到页面文件吃满 C 盘。
+  改为原地保留最新一条（外部引用不变，src 内无历史读取方）。redis 传输用真
+  sink（带 TTL 发布）不受影响。
+## [0.3.76] - 2026-10-27
+
+### 修复
+
+- **信用账户 23/24 提交时翻译为担保品 opType 33/34**：MiniQMT 语义里 CREDIT_BUY/SELL
+  就是 23/24（担保品买卖），但 passorder 的 23/24 是普通买卖、33/34 才是担保品。
+  2.0.8 终端对信用账户的 23/24 宽容地按担保品成交；2.1.33 走普通买卖路径，订单
+  静默不进系统——passorder 返回但无委托行，结算终点报 submitted but order not
+  found（2026-10-27 实测：同参数 opType 改 34 即正常落委托列表带合同号）。现在
+  submit() 对 CREDIT 账户的 23/24 送 33/34，普通账户保持 23/24，两融 27-32 与
+  专项 70-75 翻译不变；客户端读回侧本就把 33/34 译回 23/24，往返对称。
+- **单文件外壳改用 capture_qmt_injected_funcs 捕获 QMT 全局函数**：手抄名单自
+  0.2.12 起停在 get_hkt_exchange_rate，download_history_data /
+  download_history_data2 / down_history_data、query_credit_account 与公式族在
+  所有单文件构建里都没绑定——download RPC 报 no download channel，终端已有
+  数据时被读到的行盖住像下载成功。两个构建器（b64 与 flat）同步改为从策略模块
+  的唯一名单捕获，_singlefile 打包副本同步；反手抄测试覆盖单文件模板。
+
+## [0.3.75] - 2026-10-26
+
+### 修复
+
+- **Python 3.12 终端多股票财务/十大股东返回形状兼容**：3.12 运行时（pandas 3）下
+  ContextInfo 的 get_financial_data / get_top10_share_holder / get_market_data 多股票
+  场景由 pandas.Panel 改为 MultiIndex DataFrame（Panel 自 pandas 1.0 起移除）。旧
+  序列化分支对 MultiIndex 走 reset_index，元组列名被拍平成字符串——客户端拿到
+  "('000002.SZ', 'close')" 这样的列，无法按代码取子表（2.1.33 实盘实测）。现在识别
+  MultiIndex 列后按第一级拆分、复用既有 Panel 信封，客户端零改动重建为
+  {代码: DataFrame}——与新旧两代 pandas 都服务的 df[代码] 子表形状一致。单股票
+  路径不受影响（原本就是普通 DataFrame）。
+
+## [0.3.74] - 2026-10-26
+
+### 修复
+
+- **get_local_data 盘中补回缺失的当日形成日线**（#226/#307 家族的 1d 情形）：
+  客户端缓存在当日开盘前写下的帧整天原样返回，最后一根停在上一个交易日——
+  download_history_data2 只更新服务端数据，从不刷新客户端缓存。现在读取时若
+  最后一根早于当日且请求窗口覆盖今天（交易日 09:15..15:05），当日形成 bar 从
+  实时日线读取补回到返回帧（不回写缓存）。守卫与降级与多日周期补救一致：实时
+  读取失败或为空时保留原答案并告警一次；历史窗口（end_time 早于今天）不追加。
+  2.1.33 终端实测：旧版 54 根止于上一交易日，修复版 55 根含当日盘中部分量。
+
+## [0.3.73] - 2026-10-24
+
+### 文档与测试
+
+- 更新日志与传输文档按既有口径隐去同机传输名（仅措辞，不改变任何运行时行为）。
+- **每线程连接归属断言改为全部连接同时在线采样**（#431 后续）：句柄随线程退出即时
+  关闭后，内核句柄值会被后建连接回收复用，旧的跨时间裸值比较把复用误判成共享
+  （全量复跑偶发 `5 != 6`）。改为 barrier 等 6 条连接同时活着再采样，共享句柄的实现
+  仍会露出 6 个相同值，测试牙齿不变。修正后连跑 20 次稳定，全量 2642 绿。
+
+## [0.3.72] - 2026-10-23
+
+### 修复
+
+- **按线程建的传输连接随线程退出释放**（#431，@erlou96 报告）。客户端每条线程第一次
+  RPC 时自建一条连接，但连接句柄只随进程退出回收：客户端每死一条线程，服务端白留一条连接
+  （background 模式还搭一个工作线程），churn 场景一路积到实例上限后新连接永远建不成——
+  报告里的「内存溢出」实际是服务端的线程/句柄耗尽。现在每条连接按 `(ident, token)` 注册，
+  线程退出时由 thread-local finalizer 即时关闭，新建连接前再兜底清扫死线程残留；ident 与
+  句柄值都会被系统回收复用，释放必须 token 全等，不会错杀复用位上的活连接。
+- **`trader.stop()` 关闭底层 RPC transport**（#431 同案）。原来只排干异步单、停事件线程，
+  transport 实例活到进程退出，守规矩的单线程客户端一样泄漏一条连接。新增
+  `BigQmtRpcClient.close()`（幂等，再使用时惰性重建），`BigQmtXtTrader.stop()` 调用它。
+  实盘（lemo 同机零依赖部署，0.3.71 桥）：6 线程 churn 后注册表零残留，`stop()` 后连接全关。
+
+## [0.3.71] - 2026-10-20
+
+### 修复
+
+- **批量退订回包缺失不再伪造空报告**（#427，@shengyy 审出）。已发出 `unsubscribe_whole_quote_batch`
+  RPC 但回包为 None/非 dict 时，原来补成三项空列表——与"无需退订"完全同形，调用方无法区分
+  服务端是否完成释放。现在抛 RuntimeError 点名"无释放报告、句柄服务端状态未知"，并指向
+  `quote_subscription_status` 核对；无句柄的空调用仍返回空报告不变。
+- **replay 与退订交错不再把已释放句柄订回服务端**（#428，@shengyy 审出）。重放的成员检查与
+  订阅 RPC 刻意不共享锁（RPC 持锁会让所有退订排队），窗口仍在。现在订阅 RPC 返回后复查成员，
+  窗口内被释放的句柄立即补发退订——自愈，不再等心跳超时被 reaper 回收。
+
+## [0.3.70] - 2026-10-19
+
+### 新增
+
+- **按 sub_ids 批量退订全推订阅**（#418，@shengyy 报告并给出完整设计约束）。退出时逐项
+  退订的累计成本是 N 次 RPC + N-1 次推送订阅者重建（26 项实测约 5 秒未完）。新公开入口
+  `xtdata.unsubscribe_quotes(seqs)`：本地表一次移除、一次 RPC、一次 topic 重同步；服务端
+  只释放本客户端的命名引用（共享组合的同机其它订阅者不受影响，`quote_unsubscribe_all`
+  维持最后手段语义不变），报告 `{released, unknown, native_errors}`——未知 id 与原生
+  退订异常点名上报不再吞掉；replay 快照后已释放的句柄不再被订回。实盘（同机零依赖部署）：
+  5 订阅批量退订 282ms 完成、服务端组合清零。
+
+## [0.3.69] - 2026-10-19
+
+### 修复
+
+- **同机零依赖传输在缺 `ctypes.wintypes.HANDLE`/`BOOL` 的券商内置 Python 上直接可用**（#419，
+  @vx0532 报告）：部分 QMT 内置 3.6 裁掉了这两个类型，启用即 AttributeError。
+  以 c_void_p / c_int32 兜底（与原生同类同宽），完整 build 零变化。
+- **FileIO 禁令沙箱里 loader 的真实错误不再被 UnboundLocalError 掩盖**（#420，
+  @yuchiwang 报告）：`open()` 被拒时 `source` 从未赋值，token 检查反手抛
+  UnboundLocalError；现在先打印真实错误（含模块名与路径）再原样抛出。
+
+- **QMT Redis 响应检查的非数字串回溯变慢**（#423）：仅在 Lua 回复中给安全编码每
+  32 个字母插入孤立 `0`，限制连续非数字段且不命中股票模式；备注缺失/冲突回复改为
+  整数 `0`/`-1`，仍保持未知、拒绝恢复并告警。身份批读用只读 EVAL 给旧全字母值的
+  回复分段，错误类型键按缺失，任意异常回退原 MGET/GET/迁移流程和诊断。
+  Redis 存储编码、所有写入、单读与迁移触发规则保持 v0.3.68 不变；无 SETRANGE 权限
+  时不强制迁移可读 JSON，同备注重提仍保留原策略。原生备注优先、整批原子观察后恢复、
+  TTL 及 250ms 不重试池不变。券商 QMT Python 3.6.8 原版检查实测：63/200 行备注由
+  1.88/19.16 秒降至 11.03/35.10ms，126 条旧身份由 40.77 秒降至 50.65ms，800 条
+  缺失/冲突为 0.45/0.73ms，均无 DataError。禁用/失败的 EVAL 回退路径及单读仍可能慢。
+  升级同步完整包并 reload（单文件部署重新生成）；无需迁移，完整回滚仍可读取新写入
+  的身份记录。Lua/Python 内部回复须同步更新，避免手工混搭；回滚旧版会恢复性能问题。
+- **无 socket 部署的 RPC handlers 仍会拨 58610，QMT 弹 `非法IP:127.0.0.1:58610` 并冻结策略线程**：
+  `_build_rpc_service` 为 handlers 单独构造了一个 `BigQmtMarketDataProvider`，没有像
+  `adapter_factory.build_app` 那样按 `transport` 传入 `native_xtdata_enabled`，于是构造器默认的
+  `True` 生效。`get_instrument_detail` 走原生优先的 `get_instrument`，加载 QMT 自带 xtdata SDK 后
+  `get_client()` 拨 SDK `xtdata.ini` 里的 `127.0.0.1:58610`；终端把这次外连判为非法，弹模态警告并
+  卡住 QMT 主线程，后续 K 线/行情/资产/持仓/委托请求全部超时（客户端显示 `rpc failed` 空错误）。
+  现在 handlers 与下载补种的 provider 都按 `rpc.native_xtdata_enabled` 显式覆盖、否则跟随
+  `transport` 非该模式，与 `adapter_factory` 同一规则；补 `test_socket_gates` 覆盖 helper 规则、
+  默认关闭和显式覆盖。已在 QMT（Wine）终端用弹窗、终端日志与 12:18 那次 RPC 时间线定位；
+  修复后的终端复验待做。
+
+## [0.3.68] - 2026-10-15
+
+### 修复
+
+- **QMT 内 Redis 响应过滤导致重启后备注仍无法恢复**：`order_remarks` 的 Lua 返回值
+  复用 v0.3.67 身份记录的无数字编码，避免原始 JSON 在 Python 收到前被拒绝。只编码返回值，
+  新旧关联的存储内容和剩余 TTL 不变，无需迁移；原生非空备注优先、冲突拒绝、整批失败保留
+  原生值及 250ms 不重试池不变。升级需同步完整包（含共用编码模块）并 reload 或重启策略；
+  未观察、已过期或 Redis 丢失的备注仍不能恢复。已通过响应过滤替身、隔离 Redis Lua 和
+  Python 3.6 编译预检，实际 QMT 响应过滤与自然重启恢复仍待终端验收。
+
+## [0.3.67] - 2026-10-15
+
+### 修复
+
+- **重启后 strategy_name 回落为 QMT 策略名**（#393）：身份记录改为无数字安全编码，
+  避免 QMT 内置 Redis 响应过滤器拒绝读取含股票代码的 JSON。查询、执行回调、重复 remark
+  检查及 `probe_order_identity` 统一读取；被拦截的旧 JSON 在 Redis 内原子迁移，保留内容和
+  剩余 TTL。Redis 禁用 EVAL 时保留原记录并报告诊断错误。
+- **无 Redis 部署的重启恢复**：下单前同步追加本地身份 journal，启动时按账户和
+  账户类型恢复七天内的策略归属；remark 与委托参数保持原值。写入失败通过日志和
+  `probe_order_identity.local_persistence_error` 报告。默认保存在 QMT `python/state/order_identity`
+  下，可用 `BIGQMT_ORDER_IDENTITY_DIR` 指定稳定目录。部署包含策略文件，须重启策略一次；
+  已过期或从未持久化的历史映射无法凭空恢复。已通过隔离 Redis、进程重启及沙箱兼容测试。
+  2026-10-15 已在国金 QMT 的无 Redis 模式用真实委托验证：策略重启后策略名和
+  备注保持原值，持久化无错误（测试单已撤、成交 0）。QMT 内 Redis 旧值迁移路径尚待实测。
+
+## [0.3.66] - 2026-10-13
+
+### 升级注意
+
+- #413 的服务端改动含策略文件（回调链路在每个回调上先记录委托号↔备注关联再发布），
+  **策略重启一次**才全部生效；reload 只激活包内改动。Redis 缺席时关联记录自动跳过、
+  回调按原生直发（250ms 独立池、不重试，不会让回调等 redis）。
+
+### 修复
+
+- **QMT 重启后委托备注恢复原值**（#413，@shengyy 贡献 PR #414）。大 QMT 重启后可能对
+  此前已观察过的 ORDER/DEAL 行返回空 `m_strRemark`，raw passorder 调用方随之丢失与提交
+  意图的关联。现在查询与原生回调都会往既有 Redis identity 存储记录"系统委托号↔备注"
+  的精确关联（按账户、账户类型、源交易日、交易所、完整委托号隔离，证券与方向须一致）；
+  原生非空备注恒优先，只补空备注，冲突关联在有效期内拒绝恢复。沿用 7 天 TTL。未观察过
+  的关联、Redis 丢失/不可用、过期映射仍返回原生空备注——不做猜配、不重发委托。
+
+- 客户端行情缓存按时间保留窄字段查询未提供的列，显式空值仍按新数据覆盖；同一缓存键的读、合并、写入与格式迁移通过跨进程锁串行完成，防止并发丢行与临时文件冲突。既有文件读取或合并失败时保留原文件，不用局部新数据覆盖历史；自动写入失败记录 warning。
+- 下载后的缓存轮询显式使用 `subscribe=False`；周/月等周期的日线补查透传调用者的 `subscribe`，避免只读查询在内部恢复默认订阅。
+
+## [0.3.65] - 2026-10-13
+
+### 升级注意
+
+- #397 的返回值变化：`download_history_data2` 在追加盲区（窗口终点早于终端本地末根、
+  终端零写入）时不再报 `finished == total`，盲区代码计入新增的 `skipped` 键——
+  依赖 `finished == total` 判完成的调用方请改用 `not result.get('skipped')`。
+
+### 修复
+
+- **shim 补 `query_secu_account`**（#406，@TsqGit 报告，光大 2.1.29）。终端在下单校验与
+  账户会话探测链上按属性名回调 trader 对象的 `query_secu_account`（桥与 xtquant 代码中
+  零命中的运行时探测），缺属性时 AttributeError 中断操作（实盘一只标的下单被迫人工兜底、
+  清算后每 5 分钟一条报错）。实现为 `query_stock_asset` 别名（含 async 变体）。
+- **下载追加盲区不再冒充完成**（#397，@yucejade 报告并附 DAT 级证据）。终端注入下载只会
+  从本地末根向后追加：早于末根的窗口静默零写入但任务报"已受理"，轮询的停牌/退市容忍
+  分支又把空窗口计入 finished——`{'finished': N, 'total': N}` 配零写入。现在空窗口代码
+  经一次合批尾部读甄别：有更新数据 = 追加盲区，计入 `result['skipped']`（不计 finished）
+  并告警；真无数据代码维持原容忍。miniQMT 全窗口语义依赖终端引擎能力，#397 保持开启。
+
+## [0.3.64] - 2026-10-10
+
+### 修复
+
+- **`get_instrument` 在终端合约库被污染的机器上对齐 miniQMT 的正确值**（#405 的条件性缓解，
+  @yucejade 报告并贡献 PR #407）。终端侧 `ContextInfo.get_instrumentdetail` 的合约库在个别机器上
+  被污染且重启不自愈（`OpenDate` 返回 0 或借壳/更名日），而同机常驻登录的 miniQMT 行情服务对同批
+  代码全部正确。`get_instrument` 改走既有 `_native_or_context` 模式：native SDK 优先、ContextInfo
+  回落、#160 死标记窗口吸收拨号成本，开关沿用 `native_xtdata_enabled`（redis 传输默认开）。
+  **局限（重要）**：只有同机常驻登录 miniQMT 的部署才受益；没有 miniQMT 的部署行为不变（native
+  拨号失败即回落，每 600 秒窗口付一次拨号成本）。#405 的根治（终端合约库为何被污染、如何刷新）
+  仍开着。
+
+## [0.3.63] - 2026-10-10
+
+### 修复
+
+- **ZMQ 推送通道订阅者泄漏（重订阅阶梯式重复推送）**（#403，@simonfantasy 报告并给出根因与修法）。
+  `ZmqQuotePushChannel._sub_loop` 此前 keyed 在共享实例属性 `_running` 上：`stop()` 置 False，
+  下一次 `start_subscriber()` 置回 True——join 超时（线程卡在 on_msg 回调里）的旧线程看到 True
+  又复活，且挂着它创建时的旧 topic 集合。客户端每次 topic 集合变化都 stop+start，订阅 N 批就
+  留下最多 N-1 个僵尸订阅者，靠前的批被每个僵尸各收一份（实测 1.7×–7× 阶梯复制）。Redis 通道
+  早已是"每个订阅者私有 Event"，ZMQ 这路没跟上。现在对齐：订阅者捕获自己的 Event，join 超时
+  不再泄漏（Event 已置位，回调返回即退出并自闭 socket）；`start_subscriber` 自洽地先停旧的；
+  新增 `active_subscribers()` 诊断（健康值 0 或 1）。
+
+## [0.3.62] - 2026-10-09
+
+### 升级注意
+
+- 本次含**策略文件**（`bigqmt_signal_trader_strategy.py`：#389 合成事件的发布钩子装配）与
+  **runtime 顶层模块**（`bigqmt_signal_trader_redis_rpc_runtime.py`：#396 配置链）改动，
+  两者都不在 `reload_deployment` 的 purge 范围内——**策略重启一次才能全部生效**；
+  `sync + reload` 只激活包内改动。lemo 实盘已在重启后的 zmq 部署上验证全部生效。
+- #389 的 cancel_error 推送覆盖同步撤单路径；批量撤单（cancel_orders_batch）本就跳过结算、
+  靠原生状态推送确认，不在本次范围。
+
+### 修复
+
+- **pipeline 发布失败的异常消息不再内嵌完整响应载荷**（#398，@yucejade 报告并贡献 PR #399）。
+  redis-py 对失败的 pipeline 批量命令把完整命令参数（=响应 JSON 本身）渲染进异常消息：redis
+  maxmemory 触顶时单行日志实测 20MB、单文件累计 542MB，桥进程 IO 持续劣化直至停止消费请求队列。
+  新增 `_slim_pipeline_error`：消息超 500 字符时保留异常类型与错误头（如 "OOM command not
+  allowed"）、尾部替换为省略标记；短消息原样透传。
+
+- **撤单失败现在会推送 `on_cancel_error`**（#389，@tokens-lin 报告）。已成交的委托再撤，QMT 只在
+  自己日志里记"当前委托状态[已成]不可撤"，**对策略没有任何回调**——此前桥也不推，策略只能对着
+  死单反复撤。客户端订阅与 `on_cancel_error` 分发、事件 normalize/发布通道本来就是通的，缺的
+  是服务端调用点：撤单结算路径（#148 的读回确认）是唯一能结论"撤单没成"的地方，五类失败结局
+  （终态不可撤/超时未找到/查询失败等）现在统一经 `_fail_cancel_settlement` 合成 cancel_error
+  事件，由策略装配的钩子走与原生事件相同的通道与兜底发布。
+
+- **`get_history_trade_detail_data` 保住分组并如实报错**（#395，@shengyy 报告并附离线复现）。
+  ① 官方返回 `[(timetag, [deal, ...]), ...]` 分组形态，此前被 `_normalize_detail_rows` 当平铺
+  行处理，返回 `[{}]`——分组和成交记录全丢；现在分组序列化为 `{timetag, details[]}`（平铺形态
+  仍兼容）。② 函数未绑定/原生抛错/真空历史三者此前都返回 `ok=True, data=[]`，调用方无法区分
+  "没有成交"与"没有函数"；现在未绑定明确报错、原生异常传播、只有真空才返回空。
+
+- **`order_settle_timeout_seconds` 配置真正生效**（#396 附带发现，@TsqGit 报告）。此前
+  `configure_runtime_redis` 不读该键、`_apply_config` 不透传，strategy 侧永远拿默认 3.0——
+  用户在 local_config 里配了不生效。链路照 `drain_budget_seconds` 模式补齐（None 默认不透传，
+  显式配置才进 rpc block）。
+
+## [0.3.61] - 2026-10-01
+
+### 升级注意
+
+- 本次含**策略文件**（`bigqmt_signal_trader_strategy.py`）改动：#393 的 reload 身份 journal 移交
+  只有策略重启后才生效——`reload_deployment` 刷不了策略入口文件本身。常规 `sync + reload` 会让
+  除该移交外的全部修复立即生效；建议安排一次策略重启拿全。
+- #386 的分段慢日志（`slow response ... to_jsonable=... publish=...`）只在总时长超
+  `slow_request_seconds` 且 handler 段未超时时出现；看到它说明瓶颈在回复转换/发送，
+  应用侧用 `chunk_size` 分批或收窄窗口即可。
+
+### 修复
+
+- **自愈补数不再被空表骗过**（#387，@shengyy 报告并附离线复现）。服务端 `_raw_market_data_payload`
+  会为每个被请求的代码补空 envelope，原生读取失败的代码（如分钟订阅超限 ErrorID 210000）返回的是
+  空 DataFrame 而不是缺失键；客户端 `_served_codes` 此前按字典键计数，空表也算"已服务"，
+  `_heal_adjusted` 算出 missing=0，原始下载+重读从不触发——实盘 17 只里 14 只分钟线持续缺失而
+  自愈沉默。现在按真实行数计数；占位帧（#339，有行、量为 0）仍算已服务，多数缺失阈值规则不变，
+  少数停牌股不会变成每次调用都下载。
+
+- **`get_instrument_detail` 撤出 FormulaServer 直连**（#392，@sumo225270 报告并附 300 只双通道
+  对照）。国金 build 上 FormulaServer 的 `getInstrumentDetail` 对日频参考字段回答不可信：
+  `TotalVolume` 43% 返回 0、`OpenDate` 32% 返回 0、22% 非零但陈旧（最大偏差 87.7%），而走桥的
+  `ContextInfo.get_instrument_detail` 300/300 全对。结构完整但值错误的答案比没有答案更糟，
+  适配层无法区分陈旧与正确，三个 `get_instrument*` 方法移出 METHOD_MAP，一律回落 RPC。
+  代价是全市场逐只约 57–60ms；合约元数据属一次性读取，调用方通常有缓存。报告附带的
+  `subscribe=False` 透传诉求在 #361 已实现，无需再改。
+
+- **订单身份不再"突然"变成 QMT 进程名**（#393，@kingtsi 报告）。三条桥侧路径都会造成跳名：
+  （1）两处身份存储（redis + 进程内 journal）此前无条件覆盖——同 remark 复用时，后一笔带空
+  `strategy_name` 的提交会抹掉已记名字，行回落到 `m_strSource`（QMT 侧注册名）；（2）同 remark
+  换策略名提交会 retroactive 改掉已报告行的名字；（3）TTL 只有 24h，次日重读全部翻名；reload
+  会重建 handlers 清空进程内 journal，无 redis 部署瞬间全翻。现在两处存储都是"首个命名记录优先"
+  （空名提交永不覆盖，未命名记录让位给后来的命名提交，冲突改名记警告并忽略），TTL 延长到 7 天，
+  `_perform_reload` 会把 journal 移交新 handlers（该移交在策略文件里，需重启一次后生效）。
+
+- **慢请求日志覆盖回复转换与发送段**（#386，@shengyy 报告并附 `_t_recv`/`_t_reply` 证据）。
+  此前 `_note_slow_request` 只计 `handlers.handle` 段：60 只 × 40 交易日 5m 的回读在服务端
+  `_t_recv`→`_t_reply` 花了约 11.5s 而零慢日志——时间烧在 `to_jsonable`（约 12.7MB 响应的转换）
+  和发布上。现在每个请求都分段计时（handle / to_jsonable / publish），总时长超过
+  `slow_request_seconds` 而 handler 段未超时（即盲区情形）时记一条分段 `slow response` 日志，
+  并在消息里提示可用 `chunk_size` 或收窄窗口。
+
+- **`get_trading_dates` 原生空结果会交叉核对 ContextInfo 指数日历**（#391，@2092330995 报告）。
+  盘前单日查询 SH 有数据、SZ 返回空：SDK 侧某市场日历未加载时回答空列表，而
+  `_native_or_context` 把"原生成功"原样返回，空列表被下游读成"休市"并在交易时段误拦深市任务。
+  现在原生返回空时会再走一遍 ContextInfo 代表指数日历：节假日两条路径同为空（行为不变），
+  数据未就绪时指数日历能给出正确答案。provider 上新增 `_last_trading_dates_answer`
+  （选用路径 + 行数 + 时刻）供诊断探针读取；替代路径命中时每市场每进程打印一次说明。
+
+## [0.3.60] - 2026-09-24
+
+### 修复
+
+- **pipe/沙箱部署的最后两处 socket 漏网**（0.3.58 后实盘逐行核对）。（1）客户端事件线程的 redis
+  探测：非 redis 传输且没有显式 redis 配置时，`_exec_events_redis_or_none` 每轮开头仍建 client 并
+  ping 默认的 127.0.0.1:6379——外连即杀的沙箱里一次探测就死；现在整步跳过（不建不 ping）。新增
+  客户端 `_redis_explicit` 判定（合并配置或环境变量给了 host/username/password 任一才算显式）；
+  显式给了的 zmq/pipe + redis 组合探测照旧。全推推送通道同闸：pipe/mysql 且无显式 redis 时明确
+  报错指路（`get_full_tick` 轮询或显式 redis 块），不再默拨。（2）服务端 native xtdata：SDK 调用
+  会拨本地 58610 行情服务，新增 `native_xtdata_enabled` 门——pipe 默认 False（`_native()` 恒 None，
+  `probe_capabilities` 的 native 探测也跳过并写明），显式 True 才开；redis/zmq 默认 True 不变。
+  pipe 部署从本版起不再需要在配置里写 `redis_enabled=False`（0.3.58 起已是默认），库补丁也可以撤了。
+
+## [0.3.59] - 2026-09-24
+
+### 修复
+
+- **公式族进入注入捕获名单与 probe 名单**（#374 收尾）。0.3.57 的「全局优先」漏了前提：
+  `capture_qmt_injected_funcs` 的名单里没有 `call_formula` / `subscribe_formula` /
+  `unsubscribe_formula` / `get_formula_result` / `gen_factor_index`，实盘 `qmt_api` 永远拿不到——
+  0.3.58 实盘复验暴露。补上后：注入了这些全局的终端 RPC 真正走通；没注入的终端
+  `probe_capabilities` 的 `qmt_globals` 直接回答能力问题（本机终端实测五个全 False，
+  call_formula 不可用是终端真实能力，不是路由问题）。
+
+## [0.3.58] - 2026-09-24
+
+### 修复
+
+- **pipe 模式不再向外拨号**（实盘报告：券商沙箱禁 socket，EDR 抓到 `connect()` 杀进程）。审计定位
+  三处：（1）redis 块默认仍在时 exec 事件链路的懒 client 首个命令就拨号——`transport="pipe"` 现在
+  默认不下发 redis 块，显式 `redis_enabled=True` 才保留（zmq/mysql 默认行为不变）；（2）runtime 模块级
+  直挂读取此前不读 `transport` 键，「配了 pipe 实际还在跑 redis」——已补齐并与 `configure_runtime_redis`
+  对齐，同时补读 `pipe` 子配置、`_apply_config` 转发；（3）pipe 下全推推送不再刷 AttributeError 噪音
+  （新增 `NullQuotePushChannel` 静默空通道）。
+
+### 新增
+
+- **独立命名管道单文件打包器** `tools/build_pipe_single_file_flat.py`：flat 真实代码内嵌机制（源码可
+  搜索/阅读/直改），强制 `transport=pipe` + 关 redis/全推推送/下载队列/快照缓存——给禁 socket、禁 pip、
+  外连即杀的券商沙箱一个零外连的单一策略文件。执行回调由客户端轮询合成（#372，0.3.57 起）；全推行情
+  用 `get_full_tick` 轮询。用法：`python tools/build_pipe_single_file_flat.py`，产物
+  `src/BIGQMT_DRYRUN_PIPE_FLAT_ALL_IN_ONE.py`（gitignored，用时重新生成）。
+
+### 验证与未验证
+
+全量单测 2389 passed / 1 skipped（含 pipe 默认丢 redis 块/显式保留/模块级直挂 reload/打包器钉/Null 通道
+等 10 条新回归）；管道单文件构建产物静态验证通过（强制项齐全、gbk 编译通过）。**未在禁 socket 的真沙箱
+里跑过**——本机终端不杀连接；真机部署后启动日志不应再出现任何 redis 连接报错，EDR 应无告警。
+
+## [0.3.57] - 2026-09-24
+
+### 修复
+
+- **`call_formula` 一族在完整大 QMT 上误走 ContextInfo**（#374）。官方入口是注入策略命名空间的
+  全局函数，适配器只查 ContextInfo 就报 `ContextInfo.call_formula is not available`，根本没进公式
+  计算。`call_formula` / `subscribe_formula` / `unsubscribe_formula` / `get_formula_result` /
+  `gen_factor_index` 五个方法改为「注入了全局用全局，没注入才落 ContextInfo」。
+- **`get_full_tick` 大名单 fallback 覆盖显式超时**（#373）。新增 `market_fallback=False`：接受
+  部分行情的调用方可以关掉交易所扩读（部分结果照实返回、原异常原样抛出；默认 `True` 行为不变）；
+  显式 `timeout_seconds` 不再被硬抬到 60s；直读已拿到的行与扩读结果合并（直读优先），不再被空的
+  市场回包整体顶掉。
+- **pipe / mysql 没有推送通道时的执行回调**（#372，轻路）。客户端新增查询轮询器：redis 不可达
+  且非 zmq 时按 `sysid+status` diff 委托、按 `trade_id` diff 成交，合成与推送同形的
+  `on_stock_order` / `on_stock_trade` / `on_order_error`（首轮打底不补发；回调延迟 = 轮询间隔，
+  `BIGQMT_EXEC_POLL_SECONDS` 默认 1s；查询连续失败自动退回外层重选通道）。不改 pipe 协议，
+  mysql 部署同样受益。
+
+### 验证与未验证
+
+全量单测 2379 passed / 1 skipped，三个修复各有针对性回归（含 reporter 给的复现形状）。**未上
+实盘终端**:#374 依赖终端确实提供 call_formula 全局（reporter 已做路由层验证）;#372 的轮询器
+没在禁 socket/文件 io 的真沙箱里跑过——两处都是路由/合成逻辑单测 + reporter 证据，不是终端实测。
+
+## [0.3.56] - 2026-09-24
+
+### 修复
+
+- **信用委托的 `order_type` 改用 `m_eEntrustType` 判据**（#330 跟修）。0.3.52 按 `m_nOpType` 的
+  映射在 reporter 的终端上被实盘数据证伪：融资买入与担保品买入的 `m_nOpType` 没有区别，而
+  `m_eEntrustType` 分得清（54 融资委托 / 57 信用普通委托，与迅投知识库枚举一致）。`query_stock_orders`
+  和 `query_stock_trades` 的快照新增 `entrust_type` / `opt_name` 字段；客户端新判据：融资委托买=
+  融资买入（27)、卖=卖券还款（31)，融券委托卖=融券卖出（28)、买=买券还券（29)，信用普通委托买/卖=
+  担保品买/卖（23/24)；`m_strOptName` 含「专项」升级到专项族（40–45）；该字段缺失（老服务端/老
+  终端）时退回 0.3.52 的 `m_nOpType` 映射，再不行退回方向推的 23/24。判据直接来自 reporter 在
+  同一终端两行实测，维护机无信用账户未复验。
+
+### 文档
+
+- **README 精简为简介 + 免责声明**（请在法律法规允许范围内使用；修改、二次开发与再分发与原作者
+  无关；不构成投资建议；使用风险自负；远程下单默认关闭，显式开启即视为接受条款）。详细功能文档
+  整体迁入 `docs/USER_GUIDE.md`（含安装、配置、部署、排错），README 只留安装与文档指针。
+- **pipe / shm 两种传输撤出公开文档**（代码保留、功能不变；shm 未实盘验证）。CHANGELOG 0.3.27
+  段的 pipe 条目同步撤下。
+- 文档中的券商名、个人二维码等敏感信息已脱敏；`docs/assets/appreciation-qr.png` 删除。
+- 顺带修正一处过期文档：`chr()` 硬编码路径一节——源码早已改为 `sys.path` 探测。
+
+## [0.3.55] - 2026-09-23
+
+### 修复
+
+- **委托实际成功却报「order not found in system」**（#360）。判决原来钉在「提交后固定窗口内查到
+  ORDER 行」上，而实盘柜台→终端→回调的延迟可以超过任何固定窗口（实盘实测回调 +4.1s 才到，窗口
+  1s 就已报失败，委托随后正常成交）。现在首个窗口到期查不到只判 **UNCONFIRMED**：应答
+  `ok=True`、不带 `server_error`、写明「不要重提」，结算搬进影子队列延长监视（窗口
+  `max(4×order_settle_timeout_seconds, 10s)`）——迟到回调到了就静默了结；延长窗口也查不到才推
+  `order_error`，文案保留 #122 的运行模式指引并补上「回调迟到」这第三个原因。`order_stock`
+  对该应答返回 -1 不抛异常（与 #330 直接还款同款）。inline 模式（无 adjust drain 的运行时）
+  没有续看队列，维持原即时判决。
+- **程序化历史回补失败不再报假进度**（#339 服务端那一半）。（1）三个下载全局一个都没绑定时，
+  裸 RPC 原来吞掉 `NotImplementedError` 恒回 `False`——现在抛错并指向 `probe_capabilities` 的
+  `qmt_globals`；（2）原生返回 falsy（终端没受理）原来被 `bool()` 强转成成功/失败不明的
+  返回值——现在判失败并点名具体代码，逐码循环也不再只留最后一个的结果；（3）客户端
+  `download_history_data2` 原来把 False 应答整个丢掉，空拉按停牌容忍掉、报出
+  `finished==total`——现在 False 应答就是服务端宣告失败，走 #47 的抛错路径。下载任务队列
+  （`submit_download_history_data2`）同规矩：falsy 返回 Job 置 FAILED 而不是盲报 DONE。
+- **zmq + 无 redis 部署收不到任何执行回报**（#366）。`_build_quote_push_channel` 只定义在
+  `BigQmtXtData` 上，而执行回报监听在 `BigQmtXtTrader` 上——`self._build_quote_push_channel()`
+  每轮抛 `AttributeError`，被静默 `except: sleep` 吞掉死循环（自 #76 起就没真正工作过；测试
+  全绿是因为每个用例都把方法猴补到实例上，从没走过真实解析路径）。构建函数提到模块级，两个
+  类共用；监听循环的裸 except 补上日志。回归测试改为不打猴补丁直跑监听循环。
+- **`on_order_error` / `on_cancel_error` 的 `order_id` 是原始字符串**（#363）。柜台拒单（如
+  可用资金不足）时回调里的 `order_id` 是 `'xt1082186097'` 这样的原始编号字符串，与下单返回值
+  和 `on_stock_order` 的 `OrderId`（int 子类）对不上，也没法拿它撤单。现在经同一个
+  `_order_object_id` 包装：int 语义对齐，且能与下单返回值相等关联。
+- **`get_market_data_ex` 支持透传 `subscribe=False`**（#361）。大 QMT 原生默认
+  `subscribe=True` 会把查过的标的塞进常驻内存订阅池，批量拉 1m 历史时终端内存单调上涨直至
+  崩溃。客户端新增 `subscribe` 参数（缺省不传、维持原生默认），服务端和 `fill_data` 一样单独
+  成 shape 下发；签名没有 `subscribe` 的老终端 TypeError 后落回原 shape。批量回补历史请显式
+  传 `subscribe=False`。
+- **CHANGELOG 补回 0.3.54 段**：#359 提交把 0.3.54 的内容吞进了「未发布」段头，版本钉测试
+  （`test_version_stamp`）在 main 上因此是红的；0.3.54 段已还原。
+
+- **订阅 >100 只时，可转债 / 基金 / ETF / 指数没有首帧**（#358）。`subscribe_whole_quote`
+  的打底走两条路：≤100 只逐码取数并明确传 `types=["all"]`，>100 只按交易所 token 取数
+  却**什么都没传**——服务端于是回落到 `DEFAULT_TICK_TYPES=("stock",)`，把 `SH` 展开成
+  板块「上证A股」。推送侧是 ContextInfo 自己的 `subscribe_whole_quote`，压根不 narrowing，
+  于是**推的是全品种、打底的只有 A 股**：转债被静默丢掉，不报错，随后增量推送又把它推出来，
+  消费者看到的是「先缺失后突然出现」。裁到 ≤100 只同样的代码就正常，这是它难查的原因。
+  现在 token 那条路按请求的代码段推断品种再传 `types`；**判不出品种的代码不猜**，落到逐码
+  直读那条路上——猜错就是又一次静默缺失。没有改成 `types=["all"]`：那是 #247/#104 拿掉的
+  那次 26744 个标的、7.5s 占住 adjust 线程的全市场读。
+  实测（国金 0.3.54 实盘桥接，只读）：150 只沪市股票 + 5 只转债 + 5 只 ETF，修正前首帧
+  150 行、10 只静默缺失，修正后 160 行全到齐，0.31s → 0.42s。品种推断拿终端自己的板块
+  清单核过：10508 个在册标的里 10488 个判对、20 个（`980xxx.SZ` 指数段）落到直读，**0 个判错**。
+
+## [0.3.54] - 2026-09-22
+
+港股通：同一个账号几种类型，`BIGQMT_ACCOUNT_TYPE` 可写列表，客户端 `StockAccount` 的类型随请求传到服务端；延迟报告用 0.3.53 稳态重测四种组合，并修正探针的相位锁死和回放窗口两处偏差。
+
+### 文档
+
+- **延迟报告用 0.3.53 重测四种组合，并修正两处测量方法**。（1）**相位锁死**：探针每轮
+  `sleep(0.3)` 正好是 3 个 adjust 拍，同一方法的每一轮都落在拍内同一相位，中位数被钉在
+  [0, 一拍] 的任意一点——同一套代码固定 0.3s 测出 ping 中位 11ms，改成随机抖动是 42ms。
+  **drain 的真实分布是「0–1 拍均匀、中位约半拍」，不是「固定一拍 100ms」。**（2）**回放
+  窗口**：每组重启后立刻测，第一个方法有一部分落在 QMT 回放历史 K 线的窗口里（adjust 每秒
+  几千拍）。0.3.50 那张四组合表两条都占，已折叠保留并标注，数字不要再引用。
+  新表（稳态 + 抖动，20 轮）：drain 两种传输无可感知差别，只读与交易查询都是 35–85ms；
+  **redis + 后台线程的只读已被 #344 追平到 36–50ms**，差距只剩交易查询多一拍（143–157ms）
+  和重读；zmq + 后台线程仍是唯一该避开的（交易查询约 5 拍，444–456ms）。重读工作线程
+  （#351）实测：读本身短的在同一拍内答完，不额外付拍。
+
+### 新增
+
+- **港股通：同一个账号几种类型**。股票户用同一个资金账号做沪港通 / 深港通，终端把持仓、委托、成交
+  记在 `get_trade_detail_data(账号, 'HUGANGTONG' | 'SHENGANGTONG', ...)` 下；`BIGQMT_ACCOUNT_TYPE_MAP`
+  一个账号只能对一个类型，写不出来。现在 `BIGQMT_ACCOUNT_TYPE`（和表里的值）可以是**列表**，第一个
+  是默认：`["STOCK", "HUGANGTONG", "SHENGANGTONG"]`。客户端 `StockAccount(id, "HUGANGTONG")` 的类型
+  随每个交易类请求以 `account_type` 参数传到服务端，在列表里就按它查、按它结算（委托号回填去该类型的
+  委托列表找，撤单也带类型），不在列表里仍按默认答并记一次日志——部署的配置仍决定账号是什么户（#92）。
+  `ping` 多报 `account_types`，客户端的类型不一致告警只在声明的类型不在表里时才响。不用列表的部署行为
+  零变化。下单本身不用改：`passorder` 的 23/24 对 `.HK` 代码就是港股通买卖。
+
+## [0.3.53] - 2026-09-22
+
+#351 重读走工作线程、回包由 adjust 下一拍发出，drain 模式下少占策略拍；Redis 主机不通时 adjust LPOP 超时后退避，不再把策略拍拖成 1.5 s；结算扫描进 `slow request` 日志；延迟报告改正——0.3.28 的「redis + 后台线程 3.4ms」是重启后回放窗口测的。
+
+### 新增
+
+- **重读走工作线程，少占策略拍**（#351）。drain 模式（0.3.51 起默认）把所有请求放到 adjust
+  线程上跑，一次 1.8 s 的 `get_market_data_ex` 就是策略自己的 `tick_app` 停 1.8 s——这正是
+  #321 当初把 LPOP 从 adjust 上拿掉的原因，也是它顺带丢掉一拍回包的代价。现在按方法
+  （`get_financial_data` / `get_raw_financial_data`、`call_formula` / `gen_factor_index` 等 10 个）
+  或按大小（市场令牌的 `get_full_tick`、`types=`、超过 `rpc_heavy_codes_threshold`=20 个代码、
+  `period="tick"`、`count=-1` 带日期窗口）判定为重的读请求交给一条 `bigqmt-rpc-heavy` 线程，
+  回包由 adjust 线程在下一拍发出（zmq ROUTER / 管道句柄不能跨线程，redis 从工作线程发也要付
+  同一拍）。重读往返多付 1~2 拍；单只 `get_full_tick`、最近 N 根 K 线这类轻读和所有交易查询
+  （`LISTENER_DEFERRED_METHODS`）照旧一拍、照旧在 adjust 线程。过期拒绝（#303）在工作线程上
+  照常判、照常回。
+  实测（2026-09-22，100ms 拍，每种读在工作线程上连打，看终端 `adjust cadence` 的 avg / max）：
+  全市场 `get_full_tick(["SH","SZ"])` 读本身 ~200ms，拍 0.100 / 0.25–0.33s；三只 4 个月 1m 窗口
+  ~500ms，拍 0.100 / 0.27–0.29s；`get_financial_data` 10 只 3 表 ~2.1s，拍 0.100 / ~0.5s——QMT 的
+  C 接口大部分时间放 GIL，拍的均值不变、最坏从整段读缩到一段。`download_history_data2` 5 只 ~1.2s
+  整段持 GIL，拍 0.56–0.63 / 1.3–1.5s，工作线程帮不上、回包还多付一两拍，所以 `download_*` 不列入，
+  照旧 adjust 线程。
+  `rpc_heavy_offload: False` 回到 0.3.52 行为；后台线程模式下没有这条线程。`probe_capabilities`
+  的 `thread_routing` 多报 `background_threads` / `heavy_offload` / `heavy_worker_alive` /
+  `heavy_sample`。
+
+### 修复
+
+- **Redis 主机不通时，adjust 线程每拍在 LPOP 上卡满一个连接超时**。drain 模式下
+  adjust 每拍 LPOP 一次请求队列；主机宕机（不是拒绝，是没有应答）时这次 LPOP 要等满
+  `socket_connect_timeout`（1.5 s），下一拍再等一次。2026-09-17 12:53–16:25（192.168.8.13
+  不通）终端日志 `adjust cadence: ticks=7 avg=1.509s` 连续 1212 个窗口——策略自己的 `tick_app`
+  跟着从 100ms 一拍变 1.5 s 一拍，三个半小时。现在 LPOP 超时后 drain **暂停 5 s**，连续超时
+  翻倍到 30 s 封顶，第一次 LPOP 有应答就复位并记一行 `drain LPOP recovered`；暂停期间
+  `drain_request_queue` 立即返回 0，adjust 保持节奏。连接被拒绝（瞬时）仍照旧抛出。
+- **结算扫描进 `slow request` 日志**。`settle_pending_orders` 一次没命中回调快路径就扫一遍终端
+  委托列表，`drain_pending` 每拍最多三次；#345 之后每笔 `order_stock_async` 也盯 3 s，忙账户上
+  这是 adjust 线程唯一长出来的成本。超过 `slow_request_seconds` 记
+  `slow request method=settle_pending_orders[pending=N shadow=M] took X.Xs`；两个队列都空时
+  不计时、不扫描。
+
+### 文档
+
+- **延迟报告改正**（#351）。0.3.28 那张「redis + 后台线程 3.4ms / 交易查询 4ms / 195 次每秒」
+  是在**重启后的回放窗口**里测的：策略启动 QMT 先回放历史 K 线，adjust 跟着每根 K 线跑
+  （日志 `adjust cadence: ticks=51429 avg=0.000s over 10s`，每秒 5000 拍），那几十秒里任何
+  RPC 都是毫秒级；回放完 `run_time` 才是 10Hz，drain 一拍 ~100ms、后台线程每条命令一拍。
+  0.3.51 报告里「3.4ms 是 adjust 线程 LPOP 抢到的那部分、#321 关掉之后就没了」的解释是错的
+  ——9/14 起（#321 之前）后台线程回的包 `publish=` 就已经是 200–900ms。#321 真正改的是
+  0.3.46 前后台线程模式下 adjust 每拍那次 LPOP：它把后台线程等 GIL 时的请求拿到 adjust 上
+  一拍答完，体感是 ~100ms 与 500–900ms 混着来；关掉后全是 500–900ms（#351 的「变慢」），
+  drain 则全部一拍——配置里显式 `rpc_background_threads: True` 的改成 `False` 重启即可。
+  `LATENCY_REPORT.md` 方法论加「回放窗口」一条，README 撤下「10ms / 4ms / 195 次每秒」那张表
+  换成稳态四组合表，`BIG_QMT_REDIS_RPC.md` 的「100nMilliSecond 热循环 2150/s」同样是回放。
+
+## [0.3.52] - 2026-09-22
+
+#345 终端下单前拦下的单异步也有 `on_order_error`、pipe/mysql 无推送时异步单等结算；#330 直接还款无行不报错、信用委托 `order_type` 按 `m_nOpType`；#339 `download_history_data2` 的 `data_wait_seconds` 默认 60 → 10。
+
+### 修复
+
+- **`download_history_data2` 一批里有一只没数据就整批等 60 秒**（#339，@sotinyatgithub 的"每合约 12 秒"）。
+  `data_wait_seconds` 默认 60 → 10。实测（0.3.50，redis + drain）：服务端下载 0.6–1.4 s 同步返回后
+  20,726 根 1m 0.3 s 就能读到，第一次拉回为空的代码基本就是终端没有（停牌/新股/退市），等不来。
+  10 秒是几轮轮询的量。轮询里那次 `get_market_data_ex` 的 RPC 超时不再跟着这个值缩（取
+  `max(data_wait_seconds, 60)`），300 只 × 2 万根的一次回包不会被 10 秒截断。单合约 86 天 1m
+  整套 1.2–1.4 s，10 只一批 0.96 s/只——他报的 5–12 s 是 0.3.49 + `rpc_background_threads=True`
+  的账，同 #343。
+
+- **终端在下单前拦下的单（资金不足弹窗）异步下单收不到任何回调**（#345 @shyond，单文件 + 管道）。
+  这种拒绝发生在 `passorder` 之前，终端不建委托记录、不发回调；同步 `order_stock` 靠结算到期
+  查不到报 `server_error`，`order_stock_async`（`wait_settlement=False`）答完就没人管了。现在异步
+  单在回复之后仍挂一份**影子结算**，到期委托列表里没有就推 `order_error`（`source="settlement"`，
+  `error_msg` 是那条 not-found 说明），`on_order_error` 能收到；批量下单每一项各挂一份，回复不被
+  拖住。`not found in system` 的文案在运行模式之后补上「终端在建记录前拒绝：资金/仓位、价格、
+  权限，屏幕上有弹窗」。
+- **pipe / mysql 没有推送通道，回报一条都到不了**（同 #345）。之前 README 没写；这两种传输下客户端
+  `order_stock_async` 改为等服务端结算再回（worker 线程等，调用方不阻塞），`server_error` 走
+  `on_order_error`。README 传输段写明。
+- **部分归还融资成功却报 `order not found in system`**（#330 复测）。直接还款在委托列表里没有带
+  备注的行，结算到期查不到。现在 32/45 到期查不到不算失败：无编号、无 `server_error`，
+  `order_stock` 返回 -1 不抛，`message` 提示用 `query_credit_detail` 核对。
+- **`query_stock_orders` / `query_stock_trades` 把融资买入（27）报成 23**（#330）。`order_type`
+  此前从 BUY/SELL 反推。现在快照带终端的 `m_nOpType`，客户端按信用族反查 MiniQMT 常量：27-32 同号，
+  33/34 担保品买卖 → `CREDIT_BUY`/`CREDIT_SELL`（23/24），70-75 专项 → 40-45，80-83 转债透传；
+  没有 `op_type` 的旧服务端照旧。
+
+## [0.3.51] - 2026-09-22
+
+#343 / #342 的延迟：`rpc_background_threads` 默认改为 `False`（adjust drain，所有传输一律，实盘四种组合对照见 README「可插拔传输层」）；Redis 回包合成一次往返；超 1 秒的请求记 `slow request` 日志。**已有部署把配置里的 `True` 改成 `False` 后重启策略。**
+
+### 修复
+
+- **Redis 回包合成一次往返、只写一个客户端**（#343，@jiema）。`send_response` 原来对回包
+  依次做 SETEX + RPUSH + EXPIRE + PUBLISH，而且在响应客户端和监听客户端上**各做一遍**——
+  8 次往返。`rpc_background_threads=True` 时回包在后台监听线程上发，每次 Redis 命令放掉 GIL
+  再从 QMT 主线程手里抢回来约一个 adjust tick（#104），8 次就是半秒多。本机终端 0.3.50 实测：
+  `ping breakdown handle=0.0ms ... publish=500-700ms`，所有走监听线程的读请求端到端 0.5-0.8s，
+  而走 adjust 线程的 deferred 查询同一时刻 7ms。现在一条 pipeline 一次往返，第二个客户端只在
+  第一个抛错时兜底（两个客户端连的是同一个 Redis，之前的第二份写入是重复，不是冗余——回包
+  列表里还会多留一份到 TTL）。用终端自带的 redis-py 3.5.3 对着实盘 Redis 验证过 key / list /
+  channel 三处都到、列表恰好一项。**这只是把 8 次交接压成 1 次，不是回到 0.3.45 的 adjust
+  LPOP 抢队列（#321 关掉的那条路才是 3ms 那档），#343 的根因讨论在 issue 里。**
+  服务端改动，需部署 + 重启策略后实盘复测。
+- **单个请求把线程占住超过 1 秒时记一行 `slow request method=... took ...s thread=...`**（#342）。
+  `[adjust_phase] drain 2016488ms`（33 分钟）以及本机 2026-09-16 的 `drain 3540677ms`（59 分钟）
+  只记了阶段总耗时，没记是哪个请求把 adjust 线程冻住的。阈值 `slow_request_seconds` 默认 1.0，
+  在 handler 返回后才记，不给快请求加 GIL 等待。服务端改动，需部署后才生效。
+
+- **`rpc_background_threads` 默认改为 `False`（adjust drain），所有传输一律**（#343 @jiema、#342
+  @sotinyatgithub）。0.3.45 → 0.3.49 后 redis 上 RPC 从 0.1s 变 0.5–0.7s：#321 关掉了 adjust
+  线程每拍 LPOP 抢队列（它会把重读拖上策略线程），之后所有请求都走后台收包线程，而后台线程
+  每拿一次 GIL 就付一个 adjust tick，redis 回包 8 次往返就是 ~400ms。0.3.28 那张「redis +
+  后台线程 3.4ms 最快」的表测的其实是 adjust 抢到的那部分。2026-09-22 在实盘终端把四种组合各
+  重启一次、同一组探针各 20 轮（median，ms）：redis+后台 ping 407 / 持仓 197，zmq+后台
+  103 / 490，zmq+drain 87 / 88，redis+drain 102 / 103——**决定延迟的是线程模式不是传输**。
+  改动：`bigqmt-init` 对所有传输写 `False`；配置里不写这个键时，能 drain 的传输（redis /
+  zmq / pipe / mysql）默认 drain，只有没有 drain 实现的（shm）保留收包线程；显式 `True`
+  仍尊重。README「可插拔传输层」、`docs/LATENCY_REPORT.md` 换成这张四列表。**已有部署**：
+  `bigqmt_signal_trader_local_config.py` 里写着 `"rpc_background_threads": True` 的改成
+  `False` 后重启策略，这一处在顶层文件里热重载不生效。
+
+## [0.3.50] - 2026-09-21
+
+### 修复
+
+- **`connect()` 失败现在先拆掉事件监听再抛错**（@litaolemo）。`start()` 拉起的事件监听线程
+  持有 Redis pubsub 订阅（每实例 4 个 exec 事件频道），`connect()` 失败直接抛错时监听不拆、
+  实例被丢弃后订阅**永久留在服务端**——调用方重连风暴每次重试泄漏一个，实测单日 8000+ 个
+  subscribe 连接，逼近 maxclients 后整个 Redis 拒绝新连接。现在失败路径先 `stop()`（只拆线程
+  和排空异步单，不碰调用方的 redis 客户端）再抛原异常；失败后原地重试成功的话，监听由后续
+  `start()` / `subscribe()` 重新拉起。
+
+- **`download_history_data2`：服务端下载失败、客户端拉取又拉到 0 行时不再报 `{finished: total}`**（#339，@yucejade）。
+  开了本地缓存时服务端下载一直是"尽力而为"——服务端本来就有的数据，后面的拉取能救回来。但拉取
+  也拉到 0 行，就是什么都没下到，报满进度是 #47 那种假进度换了个分支。现在这种情况抛错，错误里
+  写明服务端的失败原因和哪些代码没拿到数据；下载没失败、代码本身没数据（停牌 / 退市）的轮询超时
+  照旧算完成。关本地缓存的路径（#47 起就抛）不变。#339 的另一半——服务端裸 RPC 恒 `False`、
+  历史 tick / 1m 不落盘——在本机终端复现不出来（`download_history_data` 全局按代码逐个下，
+  返回 `True`，tick / 1m 一秒内落盘），还在 issue 里追终端差异。
+- **`get_market_data_ex`：终端没有本地 K 线时用"前收盘填价"的垫行也触发自愈**（#339，@wolfeee，华泰终端 0.3.40）。
+  大 QMT 对没下过数据的窗口不返回空帧而是返回垫行，填法却因终端构建而异：国金终端填全 0
+  （既有 `_is_all_zero_any` 能认），华泰终端把前收填进 open/high/low/close——002594.SZ 1m
+  从 20260918 起要，答回来 150 根 **20260919（周六）** 的 84.3 平线、volume 0、suspendFlag 1。
+  价格非 0 就绕过了全 0 探测，自愈一直没起，调用方拿到一天假 K 线且没有任何提示。现在
+  两种构建共有的信号——**每根 volume 0 且 suspendFlag 1**——也触发服务端下载 + 重读；要求
+  *每个*代码都是垫行才算（组合里一只真停牌的票不能让整次读都付一次下载）；下载重读后仍是
+  垫行就打 warning 说明这不是成交。本机国金终端实测：001379.SZ 1m 裸 RPC 241 行全 0 →
+  客户端路径 241 根真 K 线（30 个不同收盘价，成交量 14638）；已有本地数据的票不受影响
+  （0.5s）。**华泰那种"前收填价"的形状本机复现不出来，只按报告人贴出的输出做了单元测试。**
+
+## [0.3.49] - 2026-09-18
+
+五条修复：合成回落帧补 `suspendFlag` 列（#331/#332，@yucejade）、日期窗合成回落裁头部垫行（#335，@yucejade）、方式一多账号在 zmq 下副账号起不来（#334，@simonfantasy）、同机多客户端进程订全推行情互相拆台（sub_id 折进 pid）、归还融资金额放错槽位时报错说清（#330）。
+
+### 修复
+
+- **合成回落帧缺 `suspendFlag` 列**（#331 / #332，@yucejade）。回落 servant（`ContextInfo.get_market_data`）
+  一混入 `suspendFlag` 整请求 0 行，所以那条路给不出这列；MiniQMT 全字段有它，下游 `df["suspendFlag"]`
+  KeyError、自己 concat 补出 NaN 再 `int()` 直接崩。现在只在帧缺列且调用方要了这列（`field_list` 空或点名）
+  时建列填 0，已有列不动，显式清单不多出列——边界与 #318 的 preClose 一致。0 是形状契约默认值，
+  不是合成周期的真实停牌标志。
+
+- **同机多个客户端进程订全推行情互相拆台**。`client_id` 默认是每用户一份持久化文件
+  （`~/.cache/bigqmt/quote_client_id`），两个进程共用它，`sub_id` 又各自从 1 数起——服务端按
+  `(client_id, sub_id)` 计数，把两个进程看成一个订阅者：B 退订或心跳断掉，A 的订阅一起被拆。
+  现在 `sub_id` 折进进程号（仍是 int，MiniQMT 的返回形状不变，`unsubscribe_quote` 照传），
+  同机多进程各算各的；跨机器共用同一份配置时仍建议各设 `BIGQMT_QUOTE_CLIENT_ID`。README 加
+  「多个客户端同时用一座桥」一节，说清三条通道各自的多消费者行为和吞吐共享。
+
+- **方式一多账号在 zmq 下副账号起不来**（#334，@simonfantasy）。`_build_secondary` 只有 redis 一条路：
+  zmq 部署下给副账号套了个 redis client 为 None 的 RedisTransport，监听线程死于
+  `'NoneType' object has no attribute 'pubsub'`；能 import redis 的环境则在没人跑的
+  127.0.0.1:6379 上空转。现在 zmq 部署给副账号建自己的 zmq 端点：端口按**副账号**派生——
+  和按该账号配置的 zmq 客户端派生连接地址的规则一致，客户端不用改；host 继承主账号
+  `bind_address` 的，不会退回 loopback。pipe / mysql / shm 没有按账号的寻址，副账号拒建并
+  记日志，不再建在死 client 上。#320 的副账号回报轮询在 zmq 下改走全推通道发（`exec:*`
+  topic），不再因没有 redis sink 而关掉。
+- **归还融资：金额填错槽位时报错说清楚**（#330，@fengzhizialex）。调用方把还款金额放在 `price`、
+  `order_volume` 传了可用资金——`passorder` 的直接还款金额走 **volume 槽（整数元）**，price 被
+  忽略，于是 volume 不到 1 元时报一句干巴巴的 `volume must be positive`，凑够了又按 volume
+  还款。现在 32/45 的这条错误直接写明"金额走 order_volume、price 忽略、你传的是什么"，
+  price>0 时服务端记一条日志。行为没变（一直是 volume），只是把规则说到报错里。
+- **合成回落的日期窗请求也裁头部垫行**（#335，@yucejade）。`count=-1` + `start_time` 早于终端本地
+  覆盖时，servant 把未覆盖的月份垫成"四价 = 窗口内第一根真实收盘、量额 0"的行，形态合法、
+  消费方无法分辨（601318.SH 1mon 从 20250901 起三根 68.40 垫行）；此前只有 count 请求裁。
+  现在日期窗一律裁头部连续垫行，MiniQMT 对未覆盖月份也不返回行。回落 servant 按默认
+  `skip_paused=True` 调，真停牌周期本就不出行，所以这里的平价零量行只能是垫行。
+
+## [0.3.48] - 2026-09-18
+
+可转债：`get_full_tick` 的 `types` 认 `cbond`，转股 / 回售走 passorder 80-83（`convert_bond` / `sell_back_bond`，未实盘验证，请先 1 张试）；`xtquant.xtdata` shim 的 `get_full_tick` 补转发 `types`（#327，@karlthas007）。
+
+### 新增
+
+- **可转债：`get_full_tick` 市场令牌的 `types` 认 `cbond`**（用户提议）。`convertible`（沪深转债）
+  早就有，加 `cbond` / `cb` / `convertible_bond` 三个别名指向同一板块。
+- **可转债转股 / 回售**（用户提议，MiniQMT 没有、大 QMT 有）。`xt_trader.convert_bond(account, code,
+  张数)` 和 `xt_trader.sell_back_bond(account, code, 张数)`，按 `account.account_type` 选大 QMT 的
+  passorder opType：普通户 转股 80 / 回售 81，信用户 82 / 83；返回和 `order_stock` 一样的 order_id。
+  `order_stock` 直接传 80-83 也认（原样透传，没有买卖方向，价格送 0）。MiniQMT 的
+  `OPT_CONVERT_BONDS=51` 是委托记录里的操作码、在 passorder 编号里是卖出平仓，**不**当别名收。
+  没有转债持仓可实测，且转股不可撤销——请先用 1 张验证。
+
+### 修复
+
+- **`xtquant.xtdata` shim 的 `get_full_tick` 不转发 `types`**（#327，@karlthas007）：走 shim 的旧代码
+  `xtdata.get_full_tick(["SH"], types=[...])` 报 `unexpected keyword argument 'types'`，收窄能力用不上。
+  现在原样转发。
+
+## [0.3.47] - 2026-09-17
+
+三条：方式一多账号副账号的委托/成交回调（#320/#322，按事件账号选频道 + 副账号轮询合成事件，闸门 2 在顶层策略文件要重启）、Redis 后台 BRPOP 存活时 adjust 不再抢 LPOP（#321，@wsmh）、部署脚本 redis zip 校验 + 原子下载（#323，@karlthas007，含两个分支 bug 的跟修）。
+
+### 修复
+
+- **方式一多账号下副账号的 `on_stock_order` / `on_stock_trade` 收不到**（#320 @JinHaoran、#322
+  @shihaibi——同一件事，#322 把两道闸门都点出来了）。闸门 2：事件按**配置的主账号**发到
+  `bigqmt:order_events:<主账号>`，副账号客户端订的是自己的频道，主账号客户端也当它是主账号
+  的单——现在按回报对象自带的 `m_strAccountID` 选频道，配置账号只作兜底。闸门 1：大 QMT 的
+  `order_callback` / `deal_callback` 只回绑定账号的，副账号的委托成交进程里根本看不到，也没有
+  MiniQMT 那种 `subscribe(account)`——新增 `secondary_exec_poll`：多账号管理器在 adjust 拍上
+  对每个副账号轮询 `get_trade_detail_data`（ORDER / DEAL，主线程才答得出），委托按
+  `(合同编号, 状态, 成交量)` 变化发一次、成交按成交编号发一次，经同一套 normalizer 发到该账号
+  自己的频道，废单同样补发 `on_order_error`。启动后第一次轮询只建基线不发（重启不回放当天）。
+  默认每 1 秒一次，`rpc.secondary_exec_poll_seconds` 可调、0 关；延迟一个轮询间隔，一个间隔内
+  连跳多个状态只发最后一个。单账号部署不建轮询器，行为不变。闸门 2 在顶层策略文件里，
+  **需要重启策略**；轮询器在包内。没有双账号终端可实测，请报告者部署后用副账号下一笔验证。
+
+- **Redis 后台 BRPOP 存活时，adjust 线程不要再 LPOP 同一条请求队列**。``rpc_background_threads=True`` 时 ``_queue_loop`` 已经在消费 ``bigqmt:rpc:queue:*``；adjust 上的 ``drain_request_queue`` 再用 LPOP 会把 ``get_market_data_ex`` 等读请求抢到 QMT 主线程，实测把 100ms 节拍拖到 0.6–1.8s。后台线程活着就跳过 LPOP，线程挂了才回落 LPOP。（#321，@wsmh）
+
+- **`deploy_qmt_bridge.ps1` 第 3 步 redis zip 下载：校验 + 原子改名**（#323，@karlthas007）：
+  下载中断留下的半截 zip 不再被当成好的——`Test-RedisZip` 打开归档确认含 `redis-server.exe`；
+  curl 先写到 `.download` 并带 `--retry 3 --max-time 1800`，校验通过才改名到位；新增 `-RedisUrl`
+  指定镜像源。合并后修了它的两个分支 bug（Windows PowerShell 5.1 下逐分支跑过）：
+  全新机器不传 `-RedisZip` 时默认路径不存在被当成「文件没找到」直接 throw，下载根本不会
+  执行；下载参数里的 `(if ($RedisUrl) {...} else {...})` 在 5.1 不是表达式，报
+  `The term 'if' is not recognized`。现在只有显式传的 `-RedisZip` 缺失/损坏才报错，默认路径
+  缺失或损坏一律走下载；源地址先赋变量再进参数数组。
+
+## [0.3.46] - 2026-09-17
+
+四个 issue 一起：江海 QMT `get_full_tick` 只回答已订阅代码（#310）、归还融资走 MiniQMT 写法被拒（#314）、方式一多账号副账号行情无回调（#315）、`278de3f` 的 preClose lag 兜底收窄并修回 11 个测试。
+
+### 修复
+
+- **江海证券大 QMT 2.1.19.0 上 `get_full_tick` 对任何代码都返回 `{}`**（#310）。该终端的
+  `ContextInfo.get_full_tick` 只回答**已订阅**的代码：没订阅的代码不报错，直接没有条目，
+  单代码和 `["SH"]` 整市场都一样；ping / 持仓 / `get_market_data_ex` 全部正常，看上去像
+  桥的回归。报告者实测 `subscribe_whole_quote(["600052.SH"])` 后再问就有完整五档。现在
+  `get_ticks` 在原生快照**漏掉了请求的代码**时，才对漏掉的代码（市场 token 按 token 订，
+  不按展开后的股票清单订）做一次 `subscribe_whole_quote`，然后重读直到出现或等满 2 秒
+  （`TICK_SUBSCRIBE_WAIT_SECONDS`）；同一批代码之后的调用直接读，不再等。已订阅仍然没有
+  条目的代码（停牌 / 退市 / 未开盘）按原样返回，不重复订、不重复等。订阅 300 秒没被
+  `get_full_tick` 碰过就 `unsubscribe_quote` 掉（`prune_tick_subscriptions`，adjust 循环
+  每拍调一次，包内也在下次 `get_ticks` 时懒回收）。国金的构建会回答未订阅代码，所以
+  在那里这条路径从不触发（有测试钉住）。
+
+  **未验证**：本机是国金 2.1.19.0，原生 `get_full_tick` 不需要订阅，所以订阅后到快照出现
+  的实际延迟、以及 `subscribe_whole_quote(["SH"])` 在江海构建上是否足以让整市场快照出现，
+  只能由 #310 的报告者在其终端上确认。
+
+- **归还融资走 MiniQMT 写法被拒：`order_type 32 has no implicit buy/sell side; pass action explicitly`**
+  （#314，@fengzhizialex）。#103 让 直接还款（32 / 45）必须显式传 `action`，理由是它没有证券腿、
+  猜方向不对。但 MiniQMT 的 `order_stock(acc, code, order_type, volume, price_type, price,
+  strategy, remark)` 签名里根本没有 `action`——按官方写法 `order_stock(acc, code,
+  CREDIT_DIRECT_CASH_REPAY, 金额, FIX_PRICE, 0, ...)` 归还融资，兼容层无处可传，等于这条
+  路根本走不通。行权 / 锁定 / 解锁（56-59）同样。
+
+  方向本来只用于记账：送进 `passorder` 的是原始 opType（32 → 32，45 → 75），和方向无关。
+  现在无方向类型不传 `action` 也接受，记账方向记 `SELL`；结算回找对这些类型**不按方向过滤**
+  ——终端那一行报成哪边都认，不会再因为记账方向和终端不一致而在 3 秒后报「order not found
+  in system」。显式传了 `action` 仍以传的为准；有方向的类型（融资买入 27、卖券还款 31 等）
+  行为不变。
+
+- **方式一多账号（`BIGQMT_ACCOUNT_TYPE_MAP` 单实例）下，副账号的全推行情「订阅成功但无回调」**
+  （#315，@JinHaoran）。推送通道按账号命名：服务端只往 `bigqmt:quote_push:<主账号>:<topic>`
+  发，而按副账号配置的客户端订的是 `bigqmt:quote_push:<副账号>:<topic>`。副账号的
+  `subscribe_whole_quote` 走自己的请求通道落到共用的 handlers、正常返回 seq，所以不报错——
+  推送只是发到了没人听的频道。行情不分账号，现在发布端替桥服务的每个账号各发一份
+  （redis 每账号一次 `publish`；zmq 的 PUB socket 多绑一个副账号的地址）。账号列表默认读
+  `BIGQMT_ACCOUNT_TYPE_MAP`，单账号部署形状不变。客户端不用改。
+
+- **`278de3f`（K线 preClose 行级 lag 兜底）收窄作用范围**：第一版对所有帧无条件动作，打红了
+  11 个测试，两条是真的语义倒退——(1) 显式 `field_list` 没点 `preClose` 也会多出这一列，
+  返回形状和 MiniQMT 不一致；(2) `1w` 的 preClose 终端恒为 0，#166 按日线取周首日真实前收
+  回填，lag 先把 0 盖掉后回填看不到「缺」，除权在周首日的那周就是错价。现在只在调用方要了
+  这列（`field_list` 为空或点了 `preClose`）时补列；有精确回填来源的周期（`1w`）不用 lag
+  填 0，回填关掉或没有日线时按 #166 的约定留 0。其余周期的 0 行和缺列仍按 `278de3f` 用前
+  一根 close 补。默认下载字段含 `preClose`（MiniQMT 全字段有它）这一条保留，对应测试更新。
 
 ## [0.3.45] - 2026-09-16
 
@@ -56,7 +848,6 @@
   12 笔在客户端放弃后才下出；修后 22 OK / 10 拒绝 / 0 超时，下出的每一笔都答给了它的
   调用方，首笔 0.7s 返回而不是 4.1s。
 
-
 ## [0.3.43] - 2026-09-14
 
 ### 修复
@@ -75,7 +866,6 @@
 
   修前实证：两笔同备注串行买单返回同一编号 635099484，第二笔真实编号是 635099485；
   修后同探针两笔各归各的编号。
-
 
 ## [0.3.42] - 2026-09-14
 
@@ -261,7 +1051,6 @@
   `pythonw` 没有控制台要把结果写进文件）；备份放在 `python` 目录外；清 `__pycache__`。
   常见问题表补了三条：向导回车写错目录、信用账户选了 STOCK、升级后 `SyntaxError`。
 
-
 ## [0.3.37] - 2026-09-11
 
 单票下载耗时超过 1 分钟的根因是下载轮询里的自愈把等待中的那笔下载反复重提交（#275，由 @pujfei 报告并定位机制）。修后同一终端单票 1d 冷宽窗 0.06 秒。
@@ -289,7 +1078,6 @@
 
 - README 里为 #275 补的那段把 60 秒归因于「冷票大区间的固有等待」，是错的，已按
   上面的根因改写；「用批量形态」的建议保留，但说明它快是绕开了 bug，不是本来就快。
-
 
 ## [0.3.36] - 2026-09-11
 
@@ -394,7 +1182,6 @@
 
   委托、成交、持仓、以及推送的账号状态四类对象对账下来没有缺口。
 
-
 ## [0.3.32] - 2026-09-10
 
 客户端方法补齐与合成周期回落（#262 / #237），另修两处取值 bug：上午五位 HHMMSS 成交时间被解析成 0（#266，由 @shengyy 报告并提交 #267），以及显式传空的 `strategy_name` 被替换成 `bigqmt_rpc`（#268）。
@@ -402,7 +1189,6 @@
 ### 修复
 
 - **`get_market_data` 返回形状不符合 MiniQMT 文档契约**（用户实测反馈，2026-09-10）：文档约定 bar 周期返回 `dict[field] -> DataFrame(index=stock_list, columns=time_list)`，而大 QMT 实际返回单票裸长表 / 多票 `dict[stock]->长表`，桥原样透传，按文档写的客户端代码全挂。现在在**客户端**转成文档形状（服务端不动、raw-RPC 不变、全零自愈路径不受影响、不用动 QMT 端）；时间列若是纯数字字符串会恢复成 int（`frame[20260901]` 可取）。tick 周期与非长表应答原样直通。实盘验证：`dict` 五字段齐全、`index=['510880.SH']`、`columns` 为 int 日期。
-
 
 - **README 按名字列出来的「合约/品种」方法，客户端一个都调不到**（#262，由
   @pujfei 报告）。`xtdata.get_stock_name("513100.SH")` 好用、
@@ -597,7 +1383,6 @@
   主路径全都有行，触发条件从未自然发生。2.0.8.0 的分支只有忠实复刻终端签名的
   假终端覆盖，需要报告人用上面那个参数在 2.0.8.0 上对比复验。
 
-
 ## [0.3.31] - 2026-09-09
 
 行情推送的自愈。由 @shengyy 报告并提交修复（#256 / #257），本仓收尾（#258）。
@@ -680,7 +1465,6 @@ pip install -U xtquant-big-convert==0.3.31
   之后置位，`subscribe()` 等这个信号、上界仍是 1s（最坏不比原来差），实测正常
   情况从固定 1000ms 变成 0.0ms。`BIGQMT_EVENT_READY_TIMEOUT=0` 可关闭。
 
-
 ## [0.3.29] - 2026-09-08
 
 三个由 @shengyy 报告的问题，都带隔离复现，逐条核实后修复。
@@ -755,8 +1539,6 @@ pip install -U xtquant-big-convert==0.3.31
   同时记录一条容易被误读的事实：**六种渠道返回的数据完全一致** —— 100 个方法逐项比对结构指纹（字段名 + 嵌套形状）零差异，另取 14 个方法做 sha256 全精度逐字节比对（zmq vs redis）也零差异。**选传输只影响延迟，不影响数据。**
 
 ### 新增
-
-- **Windows 命名管道传输**（`transport="pipe"`，零第三方依赖，本机同主机）：给 import 白名单拒 `socket` 且不许 `pip install` 的券商终端一条活路——`ctypes.WinDLL("kernel32")` 就够，不碰套接字。同名管道的同步句柄不容并发读写（实测写会永久阻塞或报 err=232），所以每条连接**只有它的工作线程能写**：任意线程的应答只进 outbox 并 CancelIoEx 唤醒，由工作线程自己写出；客户端超时靠看门狗取消阻塞读（而非读后查超时）；停机先 CancelIoEx 再关句柄；写失败（可证未发出）自动重连重发一次，读失败（生死未知）照旧抛给调用方。实盘验证（2026-09-08，国金终端）：ping/get_asset/get_positions/query_orders/reload_deployment/reload_status 全部正常应答，deferred 三件套 110-405ms（adjust tick 节奏）。裸管道往返 ~0.012ms；选它是为了**依赖**，不是为了速度。
 
 - **全推订阅的状态查询与一键强拆**（`quote_subscription_status` / `quote_unsubscribe_all`，客户端同名方法）：忘了 seq 也有救。状态报每个组合的标的、客户端数、距上次心跳秒数——**一直保活的组合说明有心跳在喂（有客户端进程还活着），逐渐变冷的就是收割器正在收的路上**（实盘实测：客户端死后 ~30 秒收割器自动拆订阅）。强拆不需要 seq，关掉全部组合；keepalive 对未知 sub_id 是 no-op，清掉的组合不会复活。
 
@@ -1195,7 +1977,6 @@ pip install -U xtquant-big-convert==0.3.31
 
   已验证（只读实盘，0.3.19 部署版本一致）：三个标各 23/23 根周线的 preClose 与**独立拉取**的日线 preClose 逐根相等。**未验证**：首日除权周只有构造用例，没有真实市场样本；前/后复权（`dividend_type=front/back`）只验了参数透传，没有逐值校对；期货/期权标的未测。
 
-
 ## [0.3.19] - 2026-09-04
 
 ### 新增
@@ -1276,7 +2057,6 @@ pip install -U xtquant-big-convert==0.3.31
 
   **双账号本身未在本仓库验证**：这里只有一个账号，该路径由报告人的生产环境作证。
 
-
 ### 修复
 
 - **持仓/委托/成交的原生查询失败现在报错而不是返回空**（#229，贡献者 @shengyy 的 #230）。此前 `get_positions` / `query_orders` / `query_trades` 在整次原生查询抛异常时降级为 `{}` / `[]`——和「确认空仓/无委托」无法区分，调用方无法在失败时暂停交易。**行为变化**：原生查询失败经 RPC error 传回（`ok=False, data=None, error=原因`）；原生空集合仍是成功结果（已用例钉住两侧）。成交查询的 detail type 定为文档值 `DEAL`（不再双探测 TRADE）。
@@ -1321,14 +2101,11 @@ pip install -U xtquant-big-convert==0.3.31
 
 - **结算不再盲轮询：回调把委托号/状态推给我们了**（issue #164）：下单/撤单结算原来在 adjust 主线程上一轮一轮 `query_orders`（实测一次撤单 3.6s 打了 135 轮）。新增回调喂养的 `OrderWatchTable`（remark→委托号、委托号→状态，有界 FIFO + 24h TTL，C++ 回调线程写、adjust 线程读，普通 dict+锁）：结算先查表，命中即结算、零轮询；查不到回落原有轮询（模拟模式没有回调，轮询保留为兜底）。单测 11 个（含两条快路径零查询、回退路径、表语义/TTL/有界）。**生效需重启策略**（改了顶层 strategy 文件）。
 
-
 - **按 strategy_name 过滤查委托，返回的行却 strategy_name=''**（issue #156 跟进，@kingtsi）：过滤本身有效（QMT 按策略名过滤返回 15 条），但委托行构建缺成交行早就有的「过滤兜底」——给了过滤器时，每行按构造就属于它。补上。实盘验证：`query_stock_orders(strategy_name='TEST')` 返回 2 条且 `strategy_name='TEST'`。另外新增诊断 RPC `probe_order_identity`（传 remark 返回身份链每环状态：redis 是否接线/key 名/redis 命中/进程内兜底命中），「策略名读不回」类问题以后一条调用就能定位断在哪环。
-
 
 - **`download_holiday_data` / `download_his_st_data` 在大 QMT 上抛 NotImplementedError**（issue #163，@Randall-Chan）：MiniQMT 这两个是从 xtdata 服务下载假日表/ST 历史；大 QMT 终端自己维护这些数据（登录/数据更新时刷新），没有要下载的东西。现在明确回答 no-op + 说明（之前走通用兜底报 NotImplementedError，用户只能注销那两行）。实盘验证：两个调用都返回 `ok: True, downloaded: False` + 说明。客户端补上漏掉的 `download_his_st_data` 方法。
 
 - **redis < 5.0 没有 streams，每个 tick 都在抛 `unknown command 'XADD'`**（issue #163）：事件回放流和持仓事件流都要 XADD，Windows 上常见的老 redis（3.0.x）没有这命令。现在第一次失败就学到并永久跳过 xadd（日志只说一次），pub/sub 回调不受影响（老 redis 上实时回调一直是通的）；升 redis ≥ 5.0 回放自动恢复。瞬时故障不会误触发。回归测试 6 个（修复前全失败）。
-
 
 ## [0.3.17] - 2026-09-03
 
@@ -1359,7 +2136,6 @@ pip install -U xtquant-big-convert==0.3.31
 
 - **`xt_trader.sync_deployment()` 从来是坏的**：它调 `self.get_deployment_info()`，而该方法只在 `BigQmtXtData` 上——trader 路径一调就 AttributeError（在部署 #160 时踩到）。改为直接走 `self.client.call("get_deployment_info")`。回归测试 2 个（修复前均失败）。
 
-
 ## [0.3.16] - 2026-09-03
 
 ### 修复
@@ -1373,7 +2149,6 @@ pip install -U xtquant-big-convert==0.3.31
   修复：`stop()` 和 atexit 钩子（首次 async 下单时注册）在退出前**排干队列**——等 worker 发完已排队的每一笔（有界 5s），再给在途响应 3s 宽限让 `on_order_stock_async_response` 触发。空队列零开销；全程不抛异常。修复后按报告人形态实测：立即退出也 3/3 到达且回调齐全。注意回调本身仍要求进程存活——要在脚本里看回调，得让进程活到回调到达（或显式 `wait_async_orders()`）。
 
 - **`test_all_apis.py` 在 zmq 部署下全挂**（issue #157，@simonfantasy）：脚本的 `_call` 只会 `call_redis_rpc`——zmq 配置下 ping 必超时、后面每个用例跟着挂，而桥本身是好的（报告人自己用 ZmqTransport 手动 ping 证明了）。现在脚本按配置构造统一调用器（zmq 走 `ZmqTransport`，信封与客户端 `call()` 一致），`redis` 改为懒导入（NO_REDIS_FLAT 无 redis 客户端库的部署也能跑）。实盘验证：本机 zmq 桥上全量 18 OK / 0 超时（`get_sector_list` 的 FAIL 是 #143 之后的诚实报错，`query_stock_position` 空为既有行为，均非本次引入）。
-
 
 ## [0.3.15] - 2026-09-03
 
@@ -1392,8 +2167,6 @@ pip install -U xtquant-big-convert==0.3.31
 - **`describe_trade_detail_fields` 新增 `shape_fields`**：报告字段的**形状**而不是值 —— 长度、`|` 分段、以及字符类掩码（数字变 `#`、字母变 `a`、分隔符保留）。回答「这个字段里到底是什么东西」而不用把值送出 QMT。掩码是有损的，这正是重点：它带不回一个标识符。
 
   #154 就是这么定的案：`m_strSource` 在本终端上是 `aaaaaa_aaaaa_aaaaaa` —— **只有字母和下划线，没有数字、没有 `-`、没有 `|`、没有 `{}`**，也就是策略名，不是 MAC 或设备 GUID。
-
-
 
 ### 修复
 
@@ -1423,7 +2196,6 @@ pip install -U xtquant-big-convert==0.3.31
   - **`quote-subscribe` 首帧竞态**：首帧快照可能在 `subscribe_whole_quote` 返回前就推给回调，此时 `sub_id` 尚未绑定，回调里 `unsubscribe_quote(sub_id)` 抛 `NameError`。加 None 守卫。
   - **`kline` 统计的 high/low 名不副实**：用的是收盘价的最大/最小值，不是 K 线的最高/最低价。改用 high/low 字段（无字段时回落收盘价）。
 
-
 ## [0.3.14] - 2026-09-02
 
 ### 修复
@@ -1448,7 +2220,6 @@ pip install -U xtquant-big-convert==0.3.31
   **注意**：修的是生成器，不是已生成的文件。升级后需要**重新跑一次 `bigqmt-init`** 生成单文件。
 
 - **qmt-trader CLI 的 `--dry-run` 会真下单**：`_ok()` 只打印不退出，dry-run 分支打印完预演后穿透到真实下单代码——`buy`/`sell`/`cancel` 三个命令全中招。SKILL.md 承诺「只打印不下单」，行为正好相反。2026-09-02 实盘事故：`buy 601398.SH 100 --dry-run` 真发出了一笔委托（仅因账户可用资金不足被打成废单，未造成成交）。补上两个 `return`，并加回归测试（修复前 4 个用例中 3 个失败）。
-
 
 ## [0.3.13] - 2026-09-02
 

@@ -34,11 +34,21 @@ class EmptyPositionProvider:
 
 
 class NoopPositionSyncSink:
+    """The sink non-redis transports fall back to (redis gets the real one).
+
+    Nothing in src reads ``snapshots``; it exists so the app has somewhere to
+    publish. A plain append grew without bound -- app.tick() publishes on
+    every adjust tick (~10/s), which measured as ~1MB/s of private memory on
+    a reporter's terminal until the pagefile ate the C drive (issue #441).
+    Keep only the latest snapshot, in place, so any outside reference to the
+    list stays valid.
+    """
+
     def __init__(self):
         self.snapshots = []
 
     def publish(self, snapshot):
-        self.snapshots.append(snapshot)
+        self.snapshots[:] = [snapshot]
 
 
 class NoopStateStore:
@@ -125,7 +135,15 @@ def build_app(context_info=None, config=None):
 
         qmt_api = config.get("qmt_api") or {}
         get_trade_detail_data_func = qmt_api.get("get_trade_detail_data")
-        market_data = market_data or BigQmtMarketDataProvider(context_info, qmt_api=qmt_api)
+        # native xtdata SDK 的调用会拨本地行情服务（58610）——pipe 这类
+        # 「外连即杀」的沙箱部署一次 SDK 调用就死，默认关掉（2026-09-24
+        # 实盘逐行核对发现）。
+        _rpc_cfg = dict(config.get("rpc") or {})
+        _native_enabled = _rpc_cfg.get("native_xtdata_enabled")
+        if _native_enabled is None:
+            _native_enabled = str(_rpc_cfg.get("transport") or "redis").lower() != "pipe"
+        market_data = market_data or BigQmtMarketDataProvider(
+            context_info, qmt_api=qmt_api, native_xtdata_enabled=bool(_native_enabled))
         position_provider = position_provider or BigQmtPositionProvider(
             get_trade_detail_data_func=get_trade_detail_data_func,
             account_type=config.get("account_type", "STOCK"),

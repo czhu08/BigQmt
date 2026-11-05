@@ -406,5 +406,104 @@ class MysqlTransportTest(unittest.TestCase):
             server.stop()
 
 
+class RedisAdjustDrainTest(unittest.TestCase):
+    def test_redis_adjust_lpop_skipped_when_brpop_thread_alive(self):
+        """Background BRPOP owns the list; adjust LPOP must not steal it."""
+        from bigqmt_signal_trader.transports.redis_transport import RedisTransport
+
+        class _AliveThread(object):
+            def is_alive(self):
+                return True
+
+        class _FailRedis(object):
+            def lpop(self, key):
+                raise AssertionError("adjust LPOP should not run while BRPOP owns %s" % key)
+
+        transport = RedisTransport.__new__(RedisTransport)
+        transport.print_prefix = "[test]"
+        transport.account_id = "acct"
+        transport.request_queue_template = "bigqmt:rpc:queue:{account_id}"
+        transport.listen_redis = _FailRedis()
+        transport.on_raw_payload = None
+        transport._queue_thread = _AliveThread()
+        self.assertEqual(0, transport.drain_request_queue(max_items=20))
+
+    def test_redis_adjust_lpop_runs_when_brpop_thread_dead(self):
+        """If the BRPOP thread is gone, LPOP remains the adjust fallback."""
+        from bigqmt_signal_trader.transports.redis_transport import RedisTransport
+
+        class _DeadThread(object):
+            def is_alive(self):
+                return False
+
+        class _EmptyRedis(object):
+            def lpop(self, key):
+                return None
+
+        transport = RedisTransport.__new__(RedisTransport)
+        transport.print_prefix = "[test]"
+        transport.account_id = "acct"
+        transport.request_queue_template = "bigqmt:rpc:queue:{account_id}"
+        transport.listen_redis = _EmptyRedis()
+        transport.on_raw_payload = None
+        transport._queue_thread = _DeadThread()
+        self.assertEqual(0, transport.drain_request_queue(max_items=20))
+
+
 if __name__ == "__main__":
     unittest.main()
+
+
+class RedisPipelineErrorSlimTest(unittest.TestCase):
+    """A failed response pipeline must not raise with the payload embedded.
+
+    redis-py renders a failed batch with its command arguments, and the
+    argument is the response JSON itself. An OOM refusal on a large K-line
+    reply measured 5 MB of str(exc); a handful of such lines wrote a 542 MB
+    log file and degraded the bridge until it stopped serving. See
+    _slim_pipeline_error in redis_transport.
+    """
+
+    class _FailingClient(object):
+        def __init__(self, error):
+            self._error = error
+
+        def pipeline(self, transaction=True):
+            client_error = self._error
+
+            class _Pipe(object):
+                def setex(self, *args, **kwargs):
+                    pass
+
+                def publish(self, *args, **kwargs):
+                    pass
+
+                def execute(self):
+                    raise client_error
+
+            return _Pipe()
+
+    def _transport(self, error):
+        from bigqmt_signal_trader.transports.redis_transport import RedisTransport
+        return RedisTransport(self._FailingClient(error), account_id="acct")
+
+    def test_pipeline_error_payload_is_slimmed(self):
+        big = RuntimeError(
+            "OOM command not allowed when used memory > 'maxmemory'. "
+            "x" * 5000000)
+        transport = self._transport(big)
+        with self.assertRaises(RuntimeError) as ctx:
+            transport.send_response(
+                {"request_id": "r1"}, {"request_id": "r1", "ok": True})
+        message = str(ctx.exception)
+        self.assertLessEqual(len(message), 800)
+        self.assertIn("OOM command not allowed", message)
+        self.assertIn("chars of embedded payload omitted", message)
+
+    def test_short_pipeline_error_untouched(self):
+        short = RuntimeError("connection refused")
+        transport = self._transport(short)
+        with self.assertRaises(RuntimeError) as ctx:
+            transport.send_response(
+                {"request_id": "r1"}, {"request_id": "r1", "ok": True})
+        self.assertIs(ctx.exception, short)
