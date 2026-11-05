@@ -287,36 +287,42 @@ def _secondary_zmq_config(rpc_config, account_id):
 
 
 def _build_secondary_non_redis(primary, account_id, config, transport_name):
-    """A secondary on the primary's transport kind, for zmq (#334).
+    """A secondary on the primary's transport kind, for zmq / shm (#334).
 
-    Only zmq derives a per-account endpoint the client already knows how to
-    find; pipe / mysql / shm have no per-account addressing, so a secondary
-    on them is refused with a log line rather than built on a dead redis
-    client (the pre-#334 failure: ``'NoneType' object has no attribute
-    'pubsub'`` from the secondary's listener threads).
+    zmq derives a per-account TCP endpoint; shm derives a per-account ring
+    name from the same account id. pipe / mysql have no per-account
+    addressing, so a secondary on them is refused with a log line rather than
+    built on a dead redis client (the pre-#334 failure: ``'NoneType' object
+    has no attribute 'pubsub'`` from the secondary's listener threads).
     """
     from .redis_rpc import RedisPubSubRpcService
 
     rpc_config = dict((config.get("rpc") or {}))
-    if transport_name != "zmq":
+    if transport_name not in ("zmq", "shm"):
         logger.warning("multi_account: secondary %s*** not built -- transport %r has no "
-                       "per-account endpoint (redis or zmq only)", account_id[:3], transport_name)
+                       "per-account endpoint (redis, zmq or shm only)",
+                       account_id[:3], transport_name)
         return None
     try:
         from .transports.factory import build_transport
 
         factory_config = dict(rpc_config)
         factory_config["account_id"] = account_id
-        factory_config["zmq"] = _secondary_zmq_config(rpc_config, account_id)
+        if transport_name == "zmq":
+            factory_config["zmq"] = _secondary_zmq_config(rpc_config, account_id)
+        else:
+            factory_config["shm"] = dict(rpc_config.get("shm") or {})
         transport = build_transport(
             transport_name, factory_config, account_id=account_id,
             print_prefix="[bigqmt_rpc_2nd]")
     except Exception as e:
-        logger.error("multi_account: secondary %s*** zmq transport build failed: %s",
-                     account_id[:3], e)
+        logger.error("multi_account: secondary %s*** %s transport build failed: %s",
+                     account_id[:3], transport_name, e)
         return None
-    logger.info("multi_account: secondary %s*** on zmq bound=%s",
-                account_id[:3], getattr(transport, "bind_address", "?"))
+    logger.info("multi_account: secondary %s*** on %s endpoint=%s",
+                account_id[:3], transport_name,
+                getattr(transport, "bind_address", None)
+                or getattr(transport, "request_name", "?"))
     return RedisPubSubRpcService(
         redis_client=None,
         response_redis_client=None,

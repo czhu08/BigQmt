@@ -94,9 +94,19 @@ class SecondaryOnZmqTest(unittest.TestCase):
         self.assertIsNotNone(service)
 
     def test_a_transport_without_per_account_endpoints_is_refused_not_broken(self):
-        for name in ("pipe", "mysql", "shm"):
+        for name in ("pipe", "mysql"):
             self.assertIsNone(multi_account._build_secondary(
                 _primary(), "222", {"rpc": {"transport": name}}), name)
+
+    def test_a_shm_deployment_builds_a_secondary_on_its_own_ring(self):
+        service = multi_account._build_secondary(
+            _primary(), "222",
+            {"rpc": {"transport": "shm", "shm": {"base_name": "bigqmt_test"}}})
+        self.assertIsNotNone(service, "no secondary on shm")
+        transport = service._transport
+        self.assertEqual("shm", transport.name)
+        self.assertIn("222", transport.request_name)
+        self.assertNotIn("_111_", transport.request_name)
 
     def test_redis_deployments_are_untouched(self):
         with mock.patch("bigqmt_signal_trader.adapters.redis_common.build_redis_client",

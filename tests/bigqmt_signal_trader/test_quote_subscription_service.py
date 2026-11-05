@@ -79,6 +79,25 @@ class BuildQuoteSubscriptionServiceTest(unittest.TestCase):
         self.assertTrue(channel.bind_address.endswith("_events_acct"))
         channel.stop()
 
+    def test_shm_transport_gets_one_broadcast_ring_per_served_account(self):
+        from bigqmt_signal_trader.transports.shm_transport import (
+            ShmQuotePushChannel, shm_push_name,
+        )
+
+        service = build_quote_subscription_service(
+            FakeContextInfo(), transport_name="shm", account_id="acct",
+            account_ids=["acct", "second"], shm_base_name="bigqmt_test",
+            enabled=True,
+        )
+        manager, channel = service
+        self.assertIsInstance(channel, ShmQuotePushChannel)
+        self.assertEqual(shm_push_name("bigqmt_test", "acct"),
+                         channel.bind_address)
+        self.assertEqual([shm_push_name("bigqmt_test", "second")],
+                         channel.extra_bind_addresses)
+        channel.start_publisher()
+        channel.stop()
+
     def test_no_redis_mysql_gets_the_null_channel(self):
         """mysql（或 redis 被关的部署）没有推送线：空通道静默 noop，而不是
         RedisQuotePushChannel(None) 每条事件一行 AttributeError（2026-09-24

@@ -326,6 +326,21 @@ def _build_quote_push_channel(client):
             pipe_config = dict(getattr(client, "pipe_config", {}) or {})
             address = pipe_events_path(pipe_config.get("pipe_name"), client.account_id)
             return PipeQuotePushChannel(connect_address=address)
+    if transport_name in ("shm",):
+        if not getattr(client, "_redis_explicit", False):
+            from .transports.shm_transport import (
+                ShmQuotePushChannel, shm_push_name,
+            )
+
+            shm_config = dict(getattr(client, "shm_config", {}) or {})
+            address = shm_push_name(
+                shm_config.get("base_name") or "bigqmt_shm",
+                client.account_id,
+            )
+            return ShmQuotePushChannel(
+                connect_address=address,
+                push_bytes=shm_config.get("push_bytes") or 64 * 1024 * 1024,
+            )
     if (transport_name not in ("redis", "", "default")
             and not getattr(client, "_redis_explicit", True)):
         raise RuntimeError(
@@ -1491,9 +1506,18 @@ class BigQmtRpcClient:
             or os.environ.get("BIGQMT_RPC_TRANSPORT")
             or "redis"
         ).lower()
+        if self.transport_name == "shm":
+            # SHM is a no-redis wire by design. The generated config still
+            # carries host=127.0.0.1, which must not count as "redis was
+            # explicitly configured" -- otherwise the client would leave the
+            # SHM push channel for Redis pub/sub and ping 127.0.0.1:6379.
+            self._redis_explicit = bool(
+                merged_redis_config.get("redis_enabled", False)
+            )
         self.zmq_config = dict(merged_redis_config.get("zmq") or {})
         self.mysql_config = dict(merged_redis_config.get("mysql") or {})
         self.pipe_config = dict(merged_redis_config.get("pipe") or {})
+        self.shm_config = dict(merged_redis_config.get("shm") or {})
         self._transport_instance = None  # lazily built by _transport()
         # FormulaServer read fast-path. QMT's C++ quote service (port 58600)
         # answers reference/history reads in ~0.07ms without touching the QMT
@@ -1552,6 +1576,9 @@ class BigQmtRpcClient:
                 # 「连不上」而不是「配错了」，最难查的那种。
                 "pipe": dict(config_redis.get("pipe") or {}),
             }
+            shm_config = dict(config_redis.get("shm") or {})
+            shm_config.update(self.shm_config)
+            factory_config["shm"] = shm_config
             self._transport_instance = build_transport(
                 self.transport_name,
                 factory_config,
@@ -1762,6 +1789,10 @@ class BigQmtRpcClient:
         # 显式地址且未启用 Redis discovery 的 ZMQ 是纯 ZMQ 模式，不应隐式连接 Redis。
         if self.transport_name == "zmq" and not bool(self.zmq_config.get("redis_discovery_enabled", False)):
             return event
+        # SHM 是纯同机、无 redis 部署：没有显式 redis 配置时不要为了事件
+        # 元数据去拨默认的 127.0.0.1:6379。
+        if self.transport_name == "shm" and not self._redis_explicit:
+            return event
         raw = json.dumps(event, ensure_ascii=False, default=str)
         stream_key = stream_template.format(account_id=account_id)
         redis_client = self._redis()
@@ -1780,8 +1811,10 @@ class BigQmtRpcClient:
         return event
 
     def save_quote_subscription(self, seq, payload, active=True):
-        # MySQL、SHM 和混合 ZMQ 继续保留既有 Redis subscription metadata 行为。
+        # MySQL 和混合 ZMQ 继续保留既有 Redis subscription metadata 行为。
         if self.transport_name == "zmq" and not bool(self.zmq_config.get("redis_discovery_enabled", False)):
+            return
+        if self.transport_name == "shm" and not self._redis_explicit:
             return
         account_id = str(self.account_id or "")
         key = "bigqmt:quote_subscriptions:%s" % account_id
@@ -5232,8 +5265,9 @@ class BigQmtXtTrader:
                 self._event_loop_poll()
 
     def _exec_transport_uses_push_channel(self):
-        # zmq and pipe both carry exec events on their push channel (#76, #408).
-        return str(getattr(self.client, "transport_name", "redis") or "redis").lower() in ("zmq", "pipe")
+        # zmq / pipe / shm carry exec events on their push channel.
+        return str(getattr(self.client, "transport_name", "redis") or "redis").lower() in (
+            "zmq", "pipe", "shm")
 
     def _exec_events_redis_or_none(self):
         """A REACHABLE Redis client for the exec-event channels, or None.
@@ -6578,12 +6612,12 @@ class BigQmtXtTrader:
     def _has_push_channel(self):
         """Whether exec events can reach this client at all (#345).
 
-        redis carries them on pub/sub, zmq on the PUB socket; pipe / mysql /
-        shm have no push path, so nothing the server emits after the reply
-        ever arrives.
+        redis carries them on pub/sub, zmq on the PUB socket and shm on its
+        broadcast ring; pipe / mysql have no exec-event push path here, so
+        nothing the server emits after the reply ever arrives.
         """
         transport_name = str(getattr(self.client, "transport_name", "redis") or "redis").lower()
-        return transport_name in ("redis", "", "default", "zmq")
+        return transport_name in ("redis", "", "default", "zmq", "shm")
 
     def _submit_async_single(self, seq, args, kwargs):
         """Submit one job and enqueue its outcome. Runs on the order worker."""

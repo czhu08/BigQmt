@@ -30,7 +30,7 @@ import sys
 
 
 ACCOUNT_TYPES = ("STOCK", "CREDIT", "FUTURE", "STOCK_OPTION", "HUGANGTONG", "SHENGANGTONG")
-TRANSPORTS = ("redis", "zmq")
+TRANSPORTS = ("redis", "zmq", "shm")
 DEPLOYMENTS = ("package", "single_file", "single_file_no_redis")
 
 DEPLOYMENT_LABELS = {
@@ -150,6 +150,11 @@ def render_server_config(answers):
             "    # server bind all interfaces; restrict that port with a firewall.",
             '    "zmq": {"bind_address": "tcp://%s:%d"},' % (bind_host, port),
         ])
+    if str(answers["transport"]) == "shm":
+        lines.extend([
+            "    # Same-host shared memory: no socket, no redis, no extra package.",
+            '    "shm": {"base_name": "bigqmt_shm"},',
+        ])
     if answers["allow_order_methods"]:
         lines.append("    # Remote order/cancel is ON. Turn it off if you only need queries.")
     else:
@@ -219,6 +224,8 @@ def render_client_config(answers):
             '        "connect_address": "tcp://%s:%d",' % (str(answers["host"]), port),
             "    },",
         ])
+    if transport == "shm":
+        lines.append('    "shm": {"base_name": "bigqmt_shm"},')
     lines.extend([
         "}",
         "",
@@ -285,6 +292,8 @@ def render_single_file_config_block(answers):
             "    # block is the only place the bind address can come from (#153).",
             '    "zmq": {"bind_address": "tcp://%s:%d"},' % (bind_host, port),
         ])
+    if transport == "shm":
+        lines.append('    "shm": {"base_name": "bigqmt_shm"},')
     lines.extend([
         '    "rpc_allow_order_methods": %r,' % bool(answers["allow_order_methods"]),
         '    "rpc_process_in_listener": True,',
@@ -400,6 +409,10 @@ def prompt_answers(write, read, read_secret=None):
         answers["password"] = _ask(
             write, read, "Redis 密码（无则回车，输入不回显）", "",
             secret=True, read_secret=read_secret)
+    elif answers["transport"] == "shm":
+        answers["host"] = "127.0.0.1"
+        answers["port"] = 0
+        write("  共享内存是同机传输：服务端和客户端必须运行在同一台机器。\n")
     else:
         answers["host"] = _ask(
             write, read,

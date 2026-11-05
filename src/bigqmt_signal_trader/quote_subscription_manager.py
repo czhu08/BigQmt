@@ -398,6 +398,8 @@ def build_quote_subscription_service(
     time_func=None,
     account_ids=None,
     pipe_name=None,
+    shm_base_name=None,
+    shm_push_bytes=None,
 ):
     """Assemble the server-side whole-quote service: a ContextInfo-backed source,
     a push channel matching the RPC transport, and a QuoteSubscriptionManager
@@ -434,8 +436,29 @@ def build_quote_subscription_service(
         events_address = pipe_events_path(pipe_name, account_id)
         channel = PipeQuotePushChannel(bind_address=events_address)
         push_endpoint = events_address
+    elif transport_name == "shm":
+        # Same-host shared memory: one broadcast ring per served account.
+        # Clients derive the same name from their shm block, so no discovery
+        # and no socket are involved.
+        from .transports.shm_transport import (
+            ShmQuotePushChannel, shm_push_name,
+        )
+
+        base_name = shm_base_name or "bigqmt_shm"
+        bind_address = shm_push_name(base_name, account_id)
+        extra = [
+            shm_push_name(base_name, other)
+            for other in served
+            if other != str(account_id or "")
+        ]
+        channel = ShmQuotePushChannel(
+            bind_address=bind_address,
+            extra_bind_addresses=extra,
+            push_bytes=shm_push_bytes or 64 * 1024 * 1024,
+        )
+        push_endpoint = bind_address
     elif redis_client is None:
-        # pipe（或 redis 被关掉的部署）没有推送线——静默空通道，而不是
+        # redis 被关掉、又没有专用推送线的部署——静默空通道，而不是
         # RedisQuotePushChannel(None) 每条事件一行 AttributeError。
         channel = NullQuotePushChannel()
         push_endpoint = ""

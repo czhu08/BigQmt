@@ -48,6 +48,15 @@ BIGQMT_REDIS_CONFIG = {
     #     # "port": 5560,                   # 可显式指定
     #     # 端口冲突时自动找空闲端口 + 通过 Redis 服务发现告知客户端
     # },
+    # Shared memory (Windows, same host only): no socket, no redis, no extra
+    # package. Must match the client's base_name and ring sizes.
+    # "transport": "shm",
+    # "shm": {
+    #     "base_name": "bigqmt_shm",
+    #     # "request_bytes": 8 * 1024 * 1024,
+    #     # "response_bytes": 16 * 1024 * 1024,
+    #     # "push_bytes": 64 * 1024 * 1024,
+    # },
     # Keep order RPC disabled unless you explicitly want remote order/cancel.
     "rpc_allow_order_methods": True,
     # 未指定 strategy_name 的委托带的 投资备注，默认 "bigqmt_rpc"。

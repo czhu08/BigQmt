@@ -284,7 +284,7 @@ class PushlessClientTest(unittest.TestCase):
 
     def test_which_transports_have_a_push_path(self):
         for name, expected in (("redis", True), ("", True), ("zmq", True),
-                               ("pipe", False), ("mysql", False), ("shm", False)):
+                               ("pipe", False), ("mysql", False), ("shm", True)):
             self.assertEqual(expected, self._trader(name)._has_push_channel(), name)
 
     def test_an_async_order_waits_for_the_settlement_when_nothing_can_push(self):

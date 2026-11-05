@@ -2,6 +2,30 @@
 
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/) 和 [语义化版本](https://semver.org/)。
 
+## [Unreleased]
+
+### 新增
+
+- **SHM 传输落地（Windows 同机共享内存）**：`transport="shm"` 不再是 stub。
+  用 `mmap` + 命名 mutex/event 实现零第三方依赖的同机 RPC：不建 socket、不连
+  redis、不需要 pip。请求走一条共享请求环，每个客户端实例创建自己的响应环，
+  服务端按请求里的 `_shm_reply` 路由回包，因此多个客户端进程不会互抢响应。
+  环形队列是长度前缀的字节环，支持跨进程、并发请求、超时和停止唤醒。
+- **SHM 行情/委托推送通道**：`ShmQuotePushChannel` 使用每个账号一条广播环，
+  订阅者各自维护本地游标，支持多订阅者、topic 前缀过滤和服务端重启后的代际重同步。
+- **SHM 支持 adjust drain**：实现 `drain_request_queue`，默认
+  `rpc_background_threads=False` 由 QMT adjust 线程直接收包；显式 `True` 仍可
+  使用后台接收线程 + 工作线程池。
+- **多账号 SHM**：副账号按自己的 `account_id` 派生独立请求环和推送环；pipe/mysql
+  仍因没有按账号寻址而拒建副账号。
+- **配置入口**：`bigqmt-init` 增加 `shm` 选项，服务端/客户端示例配置和
+  `docs/RPC_TRANSPORTS.md` 补充 `shm` 块与环大小说明。
+
+### 测试
+
+- 新增 `tests/bigqmt_signal_trader/test_shm_transport.py`：同进程往返、drain、
+  超时、双客户端隔离、小环回绕、广播推送/过滤、工厂配置。
+
 ## [0.3.78] - 2026-10-27
 
 ### 修复

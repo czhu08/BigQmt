@@ -677,7 +677,8 @@ def _native_xtdata_enabled(rpc_config):
     rpc_config = dict(rpc_config or {})
     enabled = rpc_config.get("native_xtdata_enabled")
     if enabled is None:
-        enabled = str(rpc_config.get("transport") or "redis").lower() != "pipe"
+        enabled = str(rpc_config.get("transport") or "redis").lower() not in (
+            "pipe", "shm")
     return bool(enabled)
 
 
@@ -764,6 +765,9 @@ def _build_quote_subscription_service(context_info, config, transport_name, acco
     pipe_name = dict(config.get("rpc") or {}).get("pipe", {}).get("pipe_name")
     if pipe_name is None:
         pipe_name = dict(config.get("pipe") or {}).get("pipe_name")
+    shm_config = dict(dict(config.get("rpc") or {}).get("shm") or {})
+    if not shm_config:
+        shm_config = dict(config.get("shm") or {})
     return _qsm.build_quote_subscription_service(
         context_info,
         transport_name=transport_name,
@@ -773,6 +777,8 @@ def _build_quote_subscription_service(context_info, config, transport_name, acco
         enabled=True,
         heartbeat_timeout_seconds=heartbeat_timeout,
         pipe_name=pipe_name,
+        shm_base_name=shm_config.get("base_name"),
+        shm_push_bytes=shm_config.get("push_bytes"),
     )
 
 

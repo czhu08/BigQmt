@@ -1,6 +1,6 @@
 # 可插拔 RPC 传输层
 
-更新时间：2026-07-29
+更新时间：2026-11-05
 
 ## 目标
 
@@ -11,6 +11,8 @@
 | **`redis`（默认）** | **~10ms** | ✅ | redis-py | 生产默认，也是实测最快的 |
 | `zmq` | ~95ms（drain）| ✅（tcp） | pyzmq | 没有 redis 时的同机方案 |
 | `mysql` | ~50ms+ | ✅ | DBUtils + 驱动 | 兼容兜底（Redis/ZMQ 都不可用时）|
+| `shm` | ~0.4ms（跨进程 echo） | ❌ 同机 | 无（mmap + kernel32） | Windows 同机、禁 socket / 禁 pip |
+| `pipe` | ~0.03ms（裸传输） | ❌ 同机 | 无（kernel32） | Windows 同机、禁 socket / 禁 pip |
 
 切换传输**只改一个配置字段 `transport`**，业务代码（handlers / `to_jsonable` / `process_request`）零改动。
 
@@ -35,7 +37,7 @@
                         └───┬────────┬─────────┬─────────┘
                  ┌──────────▼┐  ┌────▼───┐  ┌──▼─────┐  ┌──────┐
                  │  Redis     │  │  ZMQ   │  │ MySQL  │  │ SHM  │
-                 │  (默认)    │  │ (低延迟)│  │(兼容)  │  │(stub)│
+                 │  (默认)    │  │ (低延迟)│  │(兼容)  │  │(同机) │
                  └────────────┘  └────────┘  └────────┘  └──────┘
 ```
 
@@ -55,7 +57,7 @@
 
 ```python
 BIGQMT_REDIS_CONFIG = {
-    "transport": "zmq",          # 默认 "redis"。可选: redis/zmq/mysql
+    "transport": "zmq",          # 默认 "redis"。可选: redis/zmq/mysql/shm/pipe
     "zmq": {
         "bind_address": "tcp://127.0.0.1:5560",  # Windows 同机使用 TCP 回环
     },
@@ -68,7 +70,8 @@ BIGQMT_REDIS_CONFIG = {
 > **注意（ZMQ）**：ZMQ 支持由 QMT 官方 `adjust` 回调排空请求。低延迟实盘建议设置
 > `rpc_background_threads=False`，并把 `schedule_adjust_interval` 设置为
 > `100nMilliSecond`，避免后台 Python 线程受 QMT 进程 GIL 调度影响。
-> MySQL/SHM 仍会自动启用后台接收线程。
+> MySQL 仍会自动启用后台接收线程；SHM 实现了 `drain_request_queue`，默认走
+> adjust drain，显式 `rpc_background_threads=True` 仍可保留接收线程。
 > 端口不写时按账号自动派生 `tcp://127.0.0.1:{15560 + 账号%100}`（同机回环）。
 > Linux 同机也可使用 `ipc:///tmp/bigqmt_rpc.sock`。
 
@@ -86,6 +89,32 @@ BIGQMT_REDIS_CONFIG["mysql"] = {
 }
 ```
 
+### SHM（Windows 同机共享内存）
+
+`transport="shm"` 用 Windows 命名共享内存做同机桥接：不建 socket、不依赖
+redis/pyzmq、不需要 pip 安装。服务端创建请求环，每个客户端实例创建自己的响应环，
+服务端按请求里的 `_shm_reply` 路由回包；行情/委托事件走独立的广播环。多个客户端
+进程可以同时连接，不会互相抢响应。
+
+服务端和客户端必须配置相同的 `base_name` 与环大小：
+
+```python
+BIGQMT_REDIS_CONFIG = {
+    "transport": "shm",
+    "shm": {
+        "base_name": "bigqmt_shm",       # 两侧一致；实际名字再拼 account_id
+        "request_bytes": 8 * 1024 * 1024,
+        "response_bytes": 16 * 1024 * 1024,
+        "push_bytes": 64 * 1024 * 1024,
+    },
+    "rpc_background_threads": False,     # 默认 drain；True 则起接收线程
+}
+```
+
+限制：Windows only、同机 only。环名按账号派生，所以同一台机器上的实盘/模拟账号
+不会共用一条线。若某次响应的载荷超过 `response_bytes`，会明确报错而不是截断；
+按需调大该值即可。
+
 **不指定 `transport` = `"redis"` = 完全保持现状。**
 
 ### 客户端
@@ -99,6 +128,9 @@ BIGQMT_REDIS_CONFIG = {
     # ...
 }
 ```
+
+`transport="shm"` 时客户端只需给出与 QMT 端相同的 `shm` 块（`base_name` 和环大小），
+没有地址/端口可配；环名会按 `account_id` 自动派生。
 
 或环境变量：`export BIGQMT_RPC_TRANSPORT=zmq`
 

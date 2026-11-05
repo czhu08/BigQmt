@@ -43,18 +43,17 @@ class BackgroundThreadResolutionTest(unittest.TestCase):
         self.assertFalse(_resolve_background_threads("mysql", False))
         self.assertTrue(_resolve_background_threads("mysql", True))
 
-    def test_drainless_transports_ignore_the_override(self):
-        # shm has no drain_request_queue: without the receiver thread requests
-        # would never be picked up, so even an explicit False cannot turn it
-        # off here.
-        self.assertTrue(_resolve_background_threads("shm", None))
-        self.assertTrue(_resolve_background_threads("shm", False))
+    def test_shm_can_opt_into_the_adjust_drain(self):
+        # shm implements drain_request_queue, so the drain is the default and
+        # an explicit True still asks for the receiver thread.
+        self.assertFalse(_resolve_background_threads("shm", None))
+        self.assertFalse(_resolve_background_threads("shm", False))
         self.assertTrue(_resolve_background_threads("shm", True))
 
     def test_is_redis_transport(self):
         for name in ("redis", "", "default", None, "REDIS", "Default"):
             self.assertTrue(_is_redis_transport(name), name)
-        for name in ("zmq", "mysql", "shm", "ZMQ"):
+        for name in ("zmq", "mysql", "shm", "pipe", "ZMQ"):
             self.assertFalse(_is_redis_transport(name), name)
 
 

@@ -43,6 +43,16 @@ BIGQMT_REDIS_CONFIG = {
     #     # "host": "127.0.0.1",
     #     # "port": 15563,
     # },
+    # Shared memory (Windows, same host only). The client and server must use
+    # the same base_name and ring sizes; everything else is derived from the
+    # account id.
+    # "transport": "shm",
+    # "shm": {
+    #     "base_name": "bigqmt_shm",
+    #     # "request_bytes": 8 * 1024 * 1024,
+    #     # "response_bytes": 16 * 1024 * 1024,
+    #     # "push_bytes": 64 * 1024 * 1024,
+    # },
 }
 
 # Default direct mode calls get_full_tick through RPC. Set enabled=True only when

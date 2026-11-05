@@ -5,7 +5,7 @@ Covers:
 * ``FakeTransport`` round-trip (validates the abstract contract).
 * ZMQ transport round-trip on tcp loopback (the main low-latency path).
 * MySQL transport round-trip against an in-memory sqlite3 DB (driver-agnostic).
-* Factory dispatch: name → transport class, unknown-name rejection, shm raising.
+* Factory dispatch: name → transport class, unknown-name rejection.
 """
 
 import os
@@ -173,10 +173,11 @@ class FactoryTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             build_transport("nonsense", {}, account_id="x")
 
-    def test_shm_raises_on_use(self):
+    def test_shm_is_a_known_transport(self):
         shm = build_transport("shm", {}, account_id="x")
-        with self.assertRaises(TransportError):
-            shm.send_request(_build_request(), 1.0)
+        self.assertEqual("shm", shm.name)
+        self.assertIn("x", shm.request_name)
+        shm.stop()
 
     def test_redis_factory_with_injected_clients(self):
         sentinel_listen = object()

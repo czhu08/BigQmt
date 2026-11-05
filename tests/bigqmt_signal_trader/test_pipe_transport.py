@@ -97,7 +97,7 @@ class ServiceContractTest(unittest.TestCase):
 
     def test_every_transport_the_factory_builds_can_be_drained(self):
         """同一个坑不要在下一个传输上重犯。"""
-        for name in ("redis", "zmq", "pipe"):
+        for name in ("redis", "zmq", "pipe", "shm"):
             try:
                 transport = build_transport(name, {}, account_id="acct")
             except Exception:
@@ -214,13 +214,12 @@ class BackgroundThreadResolutionTest(unittest.TestCase):
     def test_a_transport_without_a_real_drain_keeps_its_thread(self):
         """没实现 drain 的传输必须保留接收线程，否则一条请求都收不到。"""
         from bigqmt_signal_trader_strategy import _resolve_background_threads
-        self.assertTrue(_resolve_background_threads("shm", False))
+        self.assertTrue(_resolve_background_threads("nonesuch", False))
 
     def test_the_decision_asks_the_transport_not_a_list(self):
         from bigqmt_signal_trader_strategy import _transport_can_drain
-        for name in ("zmq", "mysql", "pipe"):
+        for name in ("zmq", "mysql", "pipe", "shm"):
             self.assertTrue(_transport_can_drain(name), name)
-        self.assertFalse(_transport_can_drain("shm"))
         self.assertFalse(_transport_can_drain("nonesuch"))
 
     def test_unset_means_the_adjust_drain(self):
