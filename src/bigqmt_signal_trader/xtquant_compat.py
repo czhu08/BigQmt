@@ -1530,7 +1530,12 @@ class BigQmtRpcClient:
         formula_config = dict(client_config.get("formula_server_config") or {})
         formula_config.update(redis_config.get("formula_server") or {})
         if "enabled" not in formula_config:
-            formula_config["enabled"] = _env_bool("BIGQMT_FORMULA_ENABLED", True)
+            # Off by default here: 国金终端的策略防火墙把外部连到
+            # 127.0.0.1:58600 的客户端判为「非法IP」，2 秒内直接停掉运行中的
+            # 策略，之后所有 RPC 都 30s 超时（实测 2026-11-06）。需要这条
+            # ~0.07ms 读快路径的部署显式打开 enabled=True 或设
+            # BIGQMT_FORMULA_ENABLED=1；不开时全部走 RPC，功能不受影响。
+            formula_config["enabled"] = _env_bool("BIGQMT_FORMULA_ENABLED", False)
         self.formula_server_config = formula_config
         self._formula_router_instance = None  # lazily built by _formula_router()
 
