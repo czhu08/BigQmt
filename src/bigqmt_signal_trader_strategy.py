@@ -34,6 +34,7 @@ except NameError:
 
 if _load_bridge_module is not None:
     _adapter_factory = _load_bridge_module("bigqmt_signal_trader.adapter_factory")
+    _context_info_guard = _load_bridge_module("bigqmt_signal_trader.context_info_guard")
     _runner = _load_bridge_module("bigqmt_signal_trader.runner")
     _runtime_bigqmt = _load_bridge_module("bigqmt_signal_trader.runtime_bigqmt")
     _order_watch = _load_bridge_module("bigqmt_signal_trader.order_watch")
@@ -47,6 +48,7 @@ if _load_bridge_module is not None:
     BigQmtRuntimeAdapter = _runtime_bigqmt.BigQmtRuntimeAdapter
 else:
     from bigqmt_signal_trader.adapter_factory import build_app as _default_build_app
+    from bigqmt_signal_trader import context_info_guard as _context_info_guard
     from bigqmt_signal_trader.runner import (
         forward_order_event,
         forward_trade_event,
@@ -1329,6 +1331,7 @@ def _apply_gil_tuning():
 
 
 def init(ContextInfo):
+    _install_context_info_guard(ContextInfo)
     detected_account_id = _detect_account_id(ContextInfo)
     if detected_account_id and not _account_id:
         set_account_id(detected_account_id)
@@ -1377,6 +1380,14 @@ def init(ContextInfo):
     except Exception as exc:
         _log_startup_error("context warmup failed to start: %s" % exc)
     return app
+
+
+def _install_context_info_guard(context_info):
+    """Keep QMT's per-bar ContextInfo deepcopy off our live subMap."""
+    try:
+        _context_info_guard.install_thread_safe_submap(context_info)
+    except Exception as exc:
+        print("[bigqmt_signal_trader] context_info guard failed: %s" % exc)
 
 
 def _log_startup_error(message):
