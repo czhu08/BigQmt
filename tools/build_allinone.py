@@ -14,9 +14,9 @@ This script:
   4. compiles the result and deploys it to the QMT python dir
 
 Usage:
-    python D:\\delta43\\build_allinone.py
-    python D:\\delta43\\build_allinone.py --no-sync
-    python D:\\delta43\\build_allinone.py --no-deploy
+    python D:\\delta43\\BigQmt\\tools\\build_allinone.py
+    python D:\\delta43\\BigQmt\\tools\\build_allinone.py --no-sync
+    python D:\\delta43\\BigQmt\\tools\\build_allinone.py --no-deploy
 """
 
 import argparse
